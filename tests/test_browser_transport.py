@@ -9,7 +9,10 @@ import unittest
 import uuid
 from pathlib import Path
 
+from unittest.mock import patch
+
 from computer_use import extension_transport as t
+from computer_use.browser_api import BrowserSurface
 from computer_use.extension_hub import ExtensionHub
 
 
@@ -178,6 +181,47 @@ class NamedPipeRoundTripTests(unittest.TestCase):
         finally:
             client.close()
             listener.stop()
+
+
+class ExtensionHubStartupTests(unittest.TestCase):
+    def test_hub_starts_by_default_when_env_unset(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("COMPUTER_USE_EXTENSION", None)
+            os.environ.pop("COMPUTER_USE_EXTENSION_PORT", None)
+            with patch.object(ExtensionHub, "start") as mock_start:
+                surface = BrowserSurface()
+                mock_start.assert_called_once_with(8765)
+
+    def test_hub_does_not_start_when_opted_out(self) -> None:
+        for opt_out in ("0", "false", "no", "False", "NO", "0 "):
+            with self.subTest(val=opt_out):
+                with patch.dict(os.environ, {"COMPUTER_USE_EXTENSION": opt_out}, clear=False):
+                    with patch.object(ExtensionHub, "start") as mock_start:
+                        surface = BrowserSurface()
+                        mock_start.assert_not_called()
+
+    def test_hub_starts_when_opted_in(self) -> None:
+        for opt_in in ("1", "true", "yes", "True", "YES"):
+            with self.subTest(val=opt_in):
+                with patch.dict(os.environ, {"COMPUTER_USE_EXTENSION": opt_in}, clear=False):
+                    os.environ.pop("COMPUTER_USE_EXTENSION_PORT", None)
+                    with patch.object(ExtensionHub, "start") as mock_start:
+                        surface = BrowserSurface()
+                        mock_start.assert_called_once_with(8765)
+
+    def test_hub_respects_custom_port(self) -> None:
+        with patch.dict(os.environ, {"COMPUTER_USE_EXTENSION_PORT": "9876"}, clear=False):
+            os.environ.pop("COMPUTER_USE_EXTENSION", None)
+            with patch.object(ExtensionHub, "start") as mock_start:
+                surface = BrowserSurface()
+                mock_start.assert_called_once_with(9876)
+
+    def test_hub_start_oserror_silently_ignored(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("COMPUTER_USE_EXTENSION", None)
+            with patch.object(ExtensionHub, "start", side_effect=OSError("Address already in use")):
+                surface = BrowserSurface()
+                self.assertIsNotNone(surface.hub)
 
 
 if __name__ == "__main__":

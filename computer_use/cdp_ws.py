@@ -1,4 +1,17 @@
-"""Minimal CDP JSON-RPC over WebSocket (Chrome DevTools Protocol)."""
+"""Minimal CDP JSON-RPC over WebSocket (Chrome DevTools Protocol).
+
+The direct-CDP path (Chrome launched with `--remote-debugging-port`) speaks WebSocket,
+which needs the third-party `websocket-client` package. The plugin's *primary* browser
+channel on Linux is the Chrome extension bridge (ExtensionHub, 127.0.0.1:8765), which needs
+no such package -- so a missing `websocket-client` must degrade this one path instead of
+killing the whole engine at import time. It used to be a module-level `import websocket`,
+and on a machine without the package `browser_api.default_browser()` -> `cdp_browser` ->
+`cdp_ws` raised `ModuleNotFoundError` while the sidecar was starting, so the ExtensionHub
+never bound and every browser tool was dead (observed 2026-09-17, python3.14 without pip).
+
+The import is therefore lazy and the failure is a `CdpUnavailable` carrying the exact fix.
+Nothing else in the engine (extension channel, tab catalog, non-CDP operations) is affected.
+"""
 
 from __future__ import annotations
 
@@ -6,13 +19,41 @@ import json
 import time
 from typing import Any
 
-import websocket
+#: What the operator must install to use the direct-CDP path. Kept in one place so the
+#: error text, the tests and the docs cannot drift apart.
+WEBSOCKET_CLIENT_HINT = (
+    "the direct-CDP (WebSocket) path needs the 'websocket-client' package: "
+    "python3 -m pip install --user websocket-client, or apt install python3-websocket-client. "
+    "The Chrome-extension channel (ExtensionHub on 127.0.0.1:8765) works without it."
+)
+
+
+class CdpUnavailable(RuntimeError):
+    """The WebSocket transport cannot be used in this interpreter."""
+
+
+def load_websocket():
+    """Import `websocket-client` on demand, or explain exactly what is missing.
+
+    Returns the module so callers can use `websocket.create_connection`. Raises
+    `CdpUnavailable` -- never `ModuleNotFoundError` -- so an RPC handler reports a
+    readable failure instead of a bare traceback.
+
+    @returns {module}
+    """
+    try:
+        import websocket  # noqa: PLC0415 - deliberate: the import IS the failure point
+    except ImportError as exc:  # pragma: no cover - exercised through the guard test
+        raise CdpUnavailable(
+            f"cannot open a CDP WebSocket connection: {WEBSOCKET_CLIENT_HINT}"
+        ) from exc
+    return websocket
 
 
 class CdpConn:
     def __init__(self, url: str, timeout: float = 20) -> None:
         self.url = url
-        self.ws = websocket.create_connection(url, timeout=timeout)
+        self.ws = load_websocket().create_connection(url, timeout=timeout)
         self._id = 0
         self._seq = 0
         self.events: list[dict[str, Any]] = []

@@ -199,7 +199,9 @@ class BrowserSurface:
         #: Documents read this session (BR-18).
         self._docs_read: set[str] = set()
         self.setup("codex-app")
-        if os.environ.get("COMPUTER_USE_EXTENSION", "").strip().lower() in {"1", "true", "yes"}:
+        # DSH 插件场景扩展是标配通道：默认启动 ExtensionHub（仅监听 127.0.0.1 回环，暴露面最小）；
+        # 仅在显式设置 COMPUTER_USE_EXTENSION=0/false/no 时关闭（保留端口 COMPUTER_USE_EXTENSION_PORT 语义）。
+        if os.environ.get("COMPUTER_USE_EXTENSION", "").strip().lower() not in {"0", "false", "no"}:
             try:
                 self.hub.start(int(os.environ.get("COMPUTER_USE_EXTENSION_PORT") or 8765))
             except OSError:

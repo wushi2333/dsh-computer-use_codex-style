@@ -2,12 +2,12 @@
 
 # DeepSeek Harness · Computer Use
 
-**让 DeepSeek Harness 直接操作 Windows 桌面应用与 Chromium 标签页。**
+**让 DeepSeek Harness 直接操作 Windows / Linux (X11) 桌面应用与 Chromium 标签页。**
 **参考Codex 的 `window2` 工具面**，**在DSH上体验Codex版的Computer Use**
 
 [English](README.md) | 中文
 
-![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20x64-0078D4?style=flat-square)
+![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20%2B%20Linux%20X11-0078D4?style=flat-square)
 ![protocol](https://img.shields.io/badge/DSH-bundle%20%C2%B7%20cordis.patch.yml-4B5563?style=flat-square)
 ![surface](https://img.shields.io/badge/surface-13%20window2%20%2B%20extensions-2563EB?style=flat-square)
 ![baseline](https://img.shields.io/badge/Codex%20baseline-26.903.61454-6B7280?style=flat-square)
@@ -24,6 +24,7 @@
 
 - [它能做什么](#它能做什么)
 - [快速开始](#快速开始)
+  - [Linux (X11) 快速上手](#linux-x11-快速上手)
 - [工作原理](#工作原理)
 - [工具面](#工具面)
 - [观察—动作—刷新循环](#观察动作刷新循环)
@@ -43,6 +44,8 @@
 
 ## 它能做什么
 
+> **💡 双平台支持**：支持 **Windows 10/11 (x64)** 与 **Linux (X11)** 双平台。Windows 基于 UI Automation + Windows.Graphics.Capture + SendInput；Linux 基于纯 Rust x11rb + AT-SPI2 + XTest。两端均完整提供 Codex 官方 `window2` 的全部 13 个桌面工具，保持一致的交互体验。
+
 | | |
 |---|---|
 | **完整的官方工具面** | Codex官方 `window2` 的全部 13 个方法 —— `list_windows`、`get_window`、`list_apps`、`launch_app`、`get_window_state`、`click`、`press_key`、`type_text`、`scroll`、`set_value`、`drag`、`perform_secondary_action`、`activate_window` —— 名称、参数、默认值、返回体与错误串都与Codex一致。 |
@@ -61,11 +64,44 @@
 
 | | |
 |---|---|
-| 操作系统 | Windows 10 1809+ 或 Windows 11，**x64** |
+| 操作系统 | Windows 10 1809+ 或 Windows 11（**x64**）；或 Linux（X11 会话，**x64**） |
 | Harness | DeepSeek Harness（源码 checkout 或已安装的 `dsh` CLI） |
 | Node | 20 或更高 |
 | Python | 3.10+ —— 仅浏览器目录需要；13 个桌面工具是 Rust + Node |
-| Rust | 仅在你重新编译 helper 时需要（`helper-rs/bin/win32-x64/` 已随包提供 release 二进制） |
+| Rust | Windows 已随包提供 release 二进制（仅重新编译时需要）；Linux 需构建一次 helper（`cargo build -p helper-linux --release`） |
+
+### Linux (X11) 快速上手
+
+如果你在 Linux (X11) 环境下使用，准备工作只需前两步，随后的**插件安装、Preset 配置与技能同步与 Windows 完全通用**（见下方第 1~4 步）：
+
+#### 1. 前提条件
+- **必须是 X11 会话**：目前仅支持 X11 会话（暂不支持 Wayland 原生操作）。可在终端运行 `echo $XDG_SESSION_TYPE` 确认，输出应为 `x11`。
+- **开启系统无障碍服务（AT-SPI2）**：
+  - *为什么必须开启*：不开就没有无障碍控件树，Agent 无法读取按钮文字和输入框结构，只能退化为靠截图“盲猜坐标”，又慢且容易点偏。
+  - **KDE Plasma**：「系统设置」→「辅助功能」中启用「屏幕阅读器」支持（若 Qt 应用仍不暴露控件树，可设置环境变量 `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`）。
+  - **GNOME**：在终端执行一行命令即可：
+    ```sh
+    gsettings set org.gnome.desktop.interface toolkit-accessibility true
+    ```
+  - 请确保系统已安装 `at-spi2-core`（主流发行版通常默认已自带）。
+
+#### 2. 构建 helper
+Linux 端的桌面辅助进程基于纯 Rust（`x11rb` 实现，不需要安装 C 语言 X11 开发库）。首次运行前需本地编译一次：
+```sh
+cargo build -p helper-linux --release
+```
+编译产物位于 `helper-linux/target/release/dsh-computer-use`。插件启动时会自动优先从该路径加载 helper，无需手动移动文件或配置环境变量（如需指定自定义路径，也可设置 `DSH_COMPUTER_USE_HELPER=/path/to/binary`）。
+
+#### 3. 安装三步（与 Windows 完全一致）
+完成上述准备后，直接按下方通用步骤安装即可，Linux 同样完全适用：
+- **步骤 1**：[安装 bundle](#1-安装-bundle)（`dsh plugin --profile web add ...`）
+- **步骤 2**：[把工具行加进 agent preset](#2-把工具行加进-agent-preset)（在 `agent.cordis.yml` 添加 `tool-computer-use`）
+- **步骤 3**：[投递技能](#3-投递技能)（运行 `sync-skills.mjs --write --defaults`）
+
+#### 4. 已知差异与使用贴士
+- **体验层（状态药丸与合成光标）**：在 KWin 等现代 X11 窗口管理器/合成器下表现完整。药丸会在 Agent 观察或执行操作时清晰显示，并伴有合成光标跟随。
+- **物理按键 Esc 中断**：任何时候按下 **Esc** 均可中断 Agent 当前回合。如果桌面合成器（例如 KWin 的全局快捷键）占用了单键 Esc，底层的全局 KeyGrab 可能会提示被拒绝（Refused），但基于 XInput2 原始按键事件的监听仍会生效，依然能在约 150ms 内响应中断。
+- **Electron 应用（VS Code / QQ 等）**：部分 Electron 应用默认不向无障碍总线暴露深层控件树（树显得较浅）。启动应用时附加 `--force-renderer-accessibility` 参数即可强制暴露；若追求极致的 DOM 级精准操控，也可参考 [docs/helper-linux.zh.md](docs/helper-linux.zh.md) 中的 CDP 调试通道说明。
 
 ### 1. 安装 bundle
 
@@ -146,15 +182,13 @@ flowchart TB
       K["skills<br/>computer-use · computer-use-browser"]
     end
   end
-  S <-->|"stdio 上的 JSON-RPC，一行一个 JSON"| H["dsh-computer-use.exe<br/>Rust helper"]
-  H -->|SendInput| APP["目标 Windows 应用"]
-  H -->|UI Automation| APP
-  H -->|Windows.Graphics.Capture| APP
+  S <-->|"stdio 上的 JSON-RPC，一行一个 JSON"| H["Rust helper<br/>Windows: dsh-computer-use.exe<br/>Linux: dsh-computer-use"]
+  H -->|Windows: SendInput / UIA / WGC<br/>Linux: XTest / AT-SPI / XShm| APP["目标应用"]
   T --> S
   P["Python 引擎（可选）<br/>CDP · Playwright · 浏览器目录"] <--> S
 ```
 
-**一个进程一个 helper，同一时刻一个回合。** sidecar 惰性拉起 `dsh-computer-use.exe` 并常驻；每个请求都带会话 + 回合身份，回合作用域变化时发送 `end_turn` —— 它会冲刷观察租约、隐藏覆盖层并恢复系统光标。这与官方一致：官方的 `Stop` / `Interrupt` / `SubagentStop` 钩子都调用 `turn_ended`。
+**一个进程一个 helper，同一时刻一个回合。** sidecar 惰性拉起 helper（Windows 下为 `dsh-computer-use.exe`，Linux 下为 `dsh-computer-use`）并常驻；每个请求都带会话 + 回合身份，回合作用域变化时发送 `end_turn` —— 它会冲刷观察租约、隐藏覆盖层并恢复系统光标。这与官方一致：官方的 `Stop` / `Interrupt` / `SubagentStop` 钩子都调用 `turn_ended`。
 
 **新鲜度靠身份，不靠时间。** 没有 TTL：窗口身份、包围盒与人机输入监视器一致时观察才有效。只要有人碰了被观察的窗口，下一次输入就会以 `user input was detected in this window; call get_window_state before continuing` 被拒绝。
 
@@ -187,6 +221,7 @@ flowchart TB
 | 工具 | 默认 | 用途 |
 |---|---|---|
 | `batch_actions` | 开启 | 一次调用执行一串确定性动作，然后做一次 `get_window_state` |
+| `computer_use_wait_for` | 始终 | 等待特定 UI 状态（文本出现/消失、元素出现），消灭模型轮询式观察往返 |
 | `computer_use_health` | 始终 | 后端、允许列表、文档门禁、环境审计、经验层状态 |
 | `computer_use_experience` | 始终 | 读取、记录与更新本机经验笔记 |
 | `click_element`、`scroll_element` | 需显式开启 | 旧版 window-v1 别名 |
@@ -362,12 +397,22 @@ pwsh -File parity/verify-all.ps1
 # JavaScript 插件：无需构建，纯 ESM
 node src/exports-check.mjs
 
-# Rust helper：构建、测试，并发布插件随包的二进制
+# Rust helper (Windows)：构建、测试，并发布插件随包的二进制
 pwsh -File scripts/ship-helper.ps1
+
+# Rust helper (Linux)：纯 Rust x11rb，无需系统 C 依赖
+cargo build -p helper-linux --release
 
 # Python 引擎（可选浏览器面）
 python -m pip install -e .
+
+# 可选：Python 引擎里的 CDP 直连（WebSocket）路径
+python -m pip install --user websocket-client   # 或：apt install python3-websocket-client
 ```
+
+Chrome/Edge **扩展**通道不需要任何第三方 Python 包：引擎会在 `127.0.0.1:8765` 上绑定
+ExtensionHub，扩展轮询它即可。只有 CDP 直连路径（`--remote-debugging-port` + WebSocket）
+需要 `websocket-client`；缺它时引擎照常启动，仅在真正执行 CDP 操作时报出明确错误。
 
 `scripts/ship-helper.ps1` 会跑 `cargo build --release`、helper 测试套件，把 `dsh-computer-use.exe` 复制到 `helper-rs/bin/<platform>-<arch>/` 并打印 SHA-256。因为该二进制已被跟踪，全新 checkout 无需 Rust 工具链也能直接运行。
 
@@ -395,8 +440,9 @@ src/
 skills/
   computer-use/         桌面技能及其参考文档
   computer-use-browser/ 浏览器技能及其参考文档
-helper-rs/              Rust helper（输入、UIA、截图、覆盖层、光标）
+helper-rs/              Rust helper（Windows：输入、UIA、截图、覆盖层、光标）
   bin/<platform>-<arch>/  随包发布的 release 二进制
+helper-linux/           Rust helper（Linux X11：纯 Rust x11rb、AT-SPI、XTest、覆盖层）
 helper-swift/           macOS helper 源码（尚未提供二进制）
 computer_use/           Python 引擎（CDP、Playwright、浏览器目录）
 parity/                 验证套件与夹具

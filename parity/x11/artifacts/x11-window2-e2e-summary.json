@@ -1,0 +1,329 @@
+{
+  "status": "PASS",
+  "checks": [
+    {
+      "check": "tools advertises 13 window2 methods",
+      "ok": true,
+      "detail": "got 13"
+    },
+    {
+      "check": "tools advertises exactly the official 13",
+      "ok": true,
+      "detail": "missing=[] extra=[]"
+    },
+    {
+      "check": "tools names the window2 surface",
+      "ok": true,
+      "detail": "surface=window2"
+    },
+    {
+      "check": "list_windows finds the xterm window",
+      "ok": true,
+      "detail": "saw 1 window(s)"
+    },
+    {
+      "check": "list_windows reports a numeric stable handle",
+      "ok": true,
+      "detail": "id=2097164"
+    },
+    {
+      "check": "list_windows reports the app name",
+      "ok": true,
+      "detail": "app=XTerm"
+    },
+    {
+      "check": "get_window accepts the listed id",
+      "ok": true,
+      "detail": "None"
+    },
+    {
+      "check": "get_window reports the native backend",
+      "ok": true,
+      "detail": "backend=x11-native"
+    },
+    {
+      "check": "list_apps groups windows under an app",
+      "ok": true,
+      "detail": "apps=['XTerm']"
+    },
+    {
+      "check": "get_window_state succeeds",
+      "ok": true,
+      "detail": "None"
+    },
+    {
+      "check": "capture reports a native X11 method",
+      "ok": true,
+      "detail": "method=composite (expected one of composite/direct/shm)"
+    },
+    {
+      "check": "capture did NOT use xdg-desktop-portal",
+      "ok": true,
+      "detail": "method=composite"
+    },
+    {
+      "check": "exactly one standalone image part is attached",
+      "ok": true,
+      "detail": "images=1"
+    },
+    {
+      "check": "image part declares image/png",
+      "ok": true,
+      "detail": "mimeType=image/png"
+    },
+    {
+      "check": "image part is a valid PNG",
+      "ok": true,
+      "detail": "5383 byte(s), magic=b'\\x89PNG\\r\\n\\x1a\\n'"
+    },
+    {
+      "check": "PNG dimensions match the declared window dimensions",
+      "ok": true,
+      "detail": "png=(484, 316) declared=(484, 316)"
+    },
+    {
+      "check": "the JSON value embeds no image payload",
+      "ok": true,
+      "detail": "data-url payloads=[0, 0] longest base64 run=0"
+    },
+    {
+      "check": "an observable probe window is mapped",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "check": "the probe window is enumerated by list_windows",
+      "ok": true,
+      "detail": "id=8388608 listed=[2097164, 8388608]"
+    },
+    {
+      "check": "click returns the native X11 backend",
+      "ok": true,
+      "detail": "{\"backend\": \"x11-native\", \"clicked\": \"coordinate\", \"note\": \"clicked Left button 1 time(s) "
+    },
+    {
+      "check": "window observed a real ButtonPress",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "check": "ButtonPress arrives at the requested window-relative coordinate",
+      "ok": true,
+      "detail": "observed (40, 30), requested (40, 30)"
+    },
+    {
+      "check": "ButtonPress is the left button",
+      "ok": true,
+      "detail": "detail=1"
+    },
+    {
+      "check": "xterm clicks land inside the target window",
+      "ok": true,
+      "detail": "under pointer=0x20000c family=None"
+    },
+    {
+      "check": "the pointer delta equals the requested window-relative delta",
+      "ok": true,
+      "detail": "delta=[20, 10] requested=[20, 10]"
+    },
+    {
+      "check": "press_key succeeds",
+      "ok": true,
+      "detail": "{\"backend\": \"x11-native\", \"note\": \"pressed Return (0 modifier(s)) with raised by"
+    },
+    {
+      "check": "type_text succeeds",
+      "ok": true,
+      "detail": "{\"backend\": \"x11-native\", \"note\": \"typed 3 character(s) into the focused element"
+    },
+    {
+      "check": "scroll succeeds with the window2 parameter shape",
+      "ok": true,
+      "detail": "{\"backend\": \"x11-native\", \"note\": \"scrolled 1 vertical and 0 horizontal notch(es"
+    },
+    {
+      "check": "drag succeeds",
+      "ok": true,
+      "detail": "{\"backend\": \"x11-native\", \"dragged\": {\"from\": {\"x\": 5, \"y\": 5}, \"to\": {\"x\": 25, "
+    },
+    {
+      "check": "activate_window succeeds",
+      "ok": true,
+      "detail": "{\"activated\": 2097164, \"backend\": \"x11-native\", \"note\": \"raised by mapping, rest"
+    },
+    {
+      "check": "launch_app refuses with the window2 registry explanation",
+      "ok": true,
+      "detail": "\"{\\\"alternative\\\":\\\"start the application yourself (for example from a terminal or the desktop menu), then sel"
+    },
+    {
+      "check": "set_value reaches the window2 element handler",
+      "ok": true,
+      "detail": "\"{\\\"alternative\\\":\\\"type_text into the focused element, or choose an element whose tree line is marked (editab"
+    },
+    {
+      "check": "perform_secondary_action reaches the window2 element handler",
+      "ok": true,
+      "detail": "\"{\\\"alternative\\\":\\\"call get_window_state again and pass one of the action labels listed on the element\\\",\\\"er"
+    },
+    {
+      "check": "all 13 window2 methods were invoked over the real binary",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "check": "a window2-tagged click reaches the native handler",
+      "ok": true,
+      "detail": "{\"backend\": \"x11-native\", \"clicked\": \"coordinate\", \"note\": \"clicked Left button 1 time(s) "
+    },
+    {
+      "check": "an untagged click keeps the P1 sky.window handler",
+      "ok": true,
+      "detail": "{\"action\": \"click\", \"implemented\": true, \"message\": \"Action sent through the uinput absolu"
+    },
+    {
+      "check": "an untagged scroll keeps the P1 sky.window handler",
+      "ok": true,
+      "detail": "{\"action\": \"scroll\", \"implemented\": true, \"message\": \"ydotool executable was not found in "
+    }
+  ],
+  "window2": {
+    "advertised": [
+      "list_windows",
+      "get_window",
+      "list_apps",
+      "launch_app",
+      "get_window_state",
+      "click",
+      "press_key",
+      "type_text",
+      "scroll",
+      "set_value",
+      "drag",
+      "perform_secondary_action",
+      "activate_window"
+    ],
+    "windows": [
+      {
+        "app": "XTerm",
+        "id": 2097164,
+        "title": "li@li-nitroan1641: /mnt/e/dsh-computer-use-linux/wt-fix-experience"
+      }
+    ],
+    "window_id": 2097164,
+    "get_window_detail": {
+      "backend": "x11-native",
+      "focused": false,
+      "hidden": false,
+      "overrideRedirect": false,
+      "pid": 276879,
+      "windowType": null,
+      "wmClass": "XTerm",
+      "wmInstance": "xterm",
+      "workspace": null
+    },
+    "apps": [
+      {
+        "displayName": "XTerm",
+        "id": "XTerm",
+        "isRunning": true,
+        "windows": [
+          {
+            "app": "XTerm",
+            "id": 2097164,
+            "title": "li@li-nitroan1641: /mnt/e/dsh-computer-use-linux/wt-fix-experience"
+          }
+        ]
+      }
+    ],
+    "screenshot_entry": {
+      "height": 316,
+      "id": "0x20000c:0",
+      "method": "composite",
+      "originX": 1,
+      "originY": 1,
+      "url": "data:image/png;base64,",
+      "width": 484,
+      "zIndex": 0
+    },
+    "png_dimensions": [
+      484,
+      316
+    ],
+    "declared_dimensions": [
+      484,
+      316
+    ],
+    "value_data_url_payload_lengths": [
+      0,
+      0
+    ],
+    "probe_window_id": 8388608,
+    "click_value": {
+      "backend": "x11-native",
+      "clicked": "coordinate",
+      "note": "clicked Left button 1 time(s) at root (662, 452)",
+      "x": 40,
+      "y": 30
+    },
+    "click_observation": {
+      "event_x": 40,
+      "event_y": 30,
+      "button": 1
+    },
+    "xterm_click_translation": {
+      "delta": [
+        20,
+        10
+      ],
+      "steps": [
+        [
+          10,
+          10
+        ],
+        [
+          30,
+          20
+        ]
+      ],
+      "error": null,
+      "pointer_positions": [
+        [
+          11,
+          11
+        ],
+        [
+          31,
+          21
+        ]
+      ],
+      "under_pointer": "0x20000c",
+      "pointer_is_target": true
+    },
+    "launch_app_error": "{\"alternative\":\"start the application yourself (for example from a terminal or the desktop menu), then select its window from list_windows()\",\"error\":\"unsupported\",\"method\":\"launch_app\",\"reason\":\"launching \\\"xterm\\\" is not supported by the X11 backend: an app id cannot be resolved to a program without the desktop shell's application registry\"}",
+    "methods_invoked": [
+      "list_windows",
+      "get_window",
+      "list_apps",
+      "launch_app",
+      "get_window_state",
+      "click",
+      "press_key",
+      "type_text",
+      "scroll",
+      "set_value",
+      "drag",
+      "perform_secondary_action",
+      "activate_window"
+    ]
+  },
+  "environment": {
+    "display": ":99",
+    "binary": "/mnt/e/dsh-computer-use-linux/wt-fix-experience/helper-linux/target/debug/dsh-computer-use"
+  },
+  "residual_risks": [
+    "No compositor on Xvfb: the XComposite path is exercised only in its unredirected form, so a real compositor's redirect semantics are not covered.",
+    "No window manager: EWMH activation and frame-extent maths fall back to the WM-less branches, so real-WM reparenting is not covered.",
+    "No AT-SPI toolkit bridge for xterm: set_value/perform_secondary_action are asserted to REACH the window2 element handler, not to mutate a real widget."
+  ]
+}

@@ -350,9 +350,10 @@ def serve_stdio(
     allowed_apps: list[str] | None = None,
     parent_pid: int = 0,
 ) -> int:
-    from computer_use.win_dpi import enable_dpi_awareness
+    if sys.platform == "win32":
+        from computer_use.win_dpi import enable_dpi_awareness
 
-    enable_dpi_awareness()
+        enable_dpi_awareness()
     if parent_pid:
         _watch_parent(parent_pid)
     server = ComputerUseServer(

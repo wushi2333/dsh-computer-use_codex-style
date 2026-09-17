@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from computer_use.browser_export import ASSETS_JS, FETCH_AS_B64_JS, WEBMCP_JS, YOUTUBE_TRANSCRIPT_JS, gsuite_export_url
-from computer_use.cdp_ws import CdpConn
+from computer_use.cdp_ws import CdpConn, load_websocket
 from computer_use.driver import ComputerUse
 from computer_use.executor import ToolExecutor
 from computer_use.extension_hub import ExtensionHub
@@ -50,7 +50,11 @@ class LiveStrengthenTests(unittest.TestCase):
             def close(self) -> None:
                 return None
 
-        with patch("computer_use.cdp_ws.websocket.create_connection", return_value=FakeWs()):
+        # `load_websocket()` is the lazy transport import (see cdp_ws): patching the
+        # module it returns keeps this test independent of whether `websocket-client` is
+        # installed on the machine, which is the whole point of that indirection.
+        transport = type("T", (), {"create_connection": staticmethod(lambda url, timeout=20: FakeWs())})()
+        with patch("computer_use.cdp_ws.load_websocket", return_value=transport):
             conn = CdpConn("ws://127.0.0.1:1/devtools/page/x")
             conn.call("Runtime.enable")
         dialog = conn.last_event("Page.javascriptDialogOpening")

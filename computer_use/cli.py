@@ -14,7 +14,7 @@ from computer_use.surfaces import tools_for_surface
 
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="computer-use", description="LLM-agnostic Computer Use driver")
-    parser.add_argument("--backend", choices=("fake", "live", "windows", "helper"), default="fake")
+    parser.add_argument("--backend", choices=("fake", "live", "windows", "helper", "linux"), default="fake")
     parser.add_argument("--surface", choices=("computer", "mac", "browser", "all", "desktop", "gated"), default="computer")
     parser.add_argument("--no-steal-focus", action="store_true", help="mac-style: do not activate_window before app-targeted clicks")
     parser.add_argument("--max-image-edge", type=int, default=1280, help="Downscale captured PNGs to this long edge for DSH vision")
@@ -48,9 +48,10 @@ def call_payload(executor: ToolExecutor, name: str, raw_args: str) -> dict[str, 
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    from computer_use.win_dpi import enable_dpi_awareness
+    if sys.platform == "win32":
+        from computer_use.win_dpi import enable_dpi_awareness
 
-    enable_dpi_awareness()
+        enable_dpi_awareness()
     args = parse_args(argv)
     if args.system_cursor_manager:
         from computer_use.cursor_manager import run_manager

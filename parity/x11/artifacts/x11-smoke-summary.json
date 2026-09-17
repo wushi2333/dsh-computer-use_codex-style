@@ -1,0 +1,141 @@
+{
+  "timestamp": "2026-09-16T16:33:52.332364+00:00",
+  "status": "PASS",
+  "environment": {
+    "display": ":99",
+    "session_type": "x11",
+    "xvfb_path": "/usr/bin/Xvfb",
+    "openbox_path": null,
+    "wm_running": false,
+    "ewmh_limited": true
+  },
+  "helper": {
+    "exit_code": 0,
+    "surface": "sky.window",
+    "tool_count": 7,
+    "tools": [
+      "list_apps",
+      "get_app_state",
+      "screenshot",
+      "click",
+      "scroll",
+      "press_key",
+      "type_text"
+    ]
+  },
+  "protocol_contract": {
+    "health_ok": true,
+    "tools_ok": true,
+    "prompt_ok": true,
+    "prompt_chars": 8028,
+    "refusals_ok": true,
+    "lifecycle_ok": true
+  },
+  "tools_7_status": {
+    "list_apps": {
+      "ok": true,
+      "apps_count": 38,
+      "accessible_apps_count": 15,
+      "accessibility_error": null
+    },
+    "get_app_state": {
+      "ok": true,
+      "backend": "linux-atspi",
+      "blockers_count": 2,
+      "blockers": [
+        "AT-SPI accessibility is disabled; enable org.a11y.Status IsEnabled or org.gnome.desktop.interface toolkit-accessibility for tree extraction.",
+        "Development keyboard input is unavailable; enable XDG RemoteDesktop portal input on Wayland, xdotool with DISPLAY on X11, or ydotool with a connectable ydotoold socket. Read/write /dev/uinput alone provides only absolute pointer input."
+      ]
+    },
+    "screenshot": {
+      "ok": true,
+      "source": "xdg-desktop-portal",
+      "width": 1920,
+      "height": 1200,
+      "bytes": 1496120,
+      "format": "png",
+      "has_image": true,
+      "base64_chars": 1994828
+    },
+    "click": {
+      "ok": true,
+      "action": "click",
+      "implemented": true,
+      "message": "Action sent through the uinput absolute pointer."
+    },
+    "scroll": {
+      "ok": true,
+      "action": "scroll",
+      "implemented": true,
+      "message": "ydotool executable was not found in PATH"
+    },
+    "press_key": {
+      "ok": true,
+      "action": "press_key",
+      "implemented": true,
+      "message": "ydotool executable was not found in PATH"
+    },
+    "type_text": {
+      "ok": true,
+      "action": "type_text",
+      "implemented": true,
+      "message": "ydotool executable was not found in PATH"
+    }
+  },
+  "diagnostics": {
+    "at_spi_bus": {
+      "detail": "s \"unix:path=/run/user/1000/at-spi/bus_0,guid=0e55c8af809f479183b3d51d6aaaad2a\"",
+      "ok": true
+    },
+    "at_spi_enabled": {
+      "detail": "b false",
+      "ok": true
+    },
+    "capabilities": {
+      "accessibility": [
+        "at_spi"
+      ],
+      "input": [
+        "abs_pointer"
+      ],
+      "isolation": [
+        "shared"
+      ],
+      "preferred": {
+        "input": "abs_pointer",
+        "screenshot": "portal",
+        "window_control": "kwin"
+      },
+      "screenshot": [
+        "portal"
+      ],
+      "window_control": [
+        "kwin"
+      ]
+    },
+    "degraded_count": 21,
+    "degraded": [
+      "input.xdotool: exit status exit status: 127",
+      "input.ydotool: ydotool executable was not found in PATH",
+      "input.ydotool_socket: no connectable ydotool socket (missing: /run/user/1000/.ydotool_socket; missing: /tmp/.ydotool_socket)",
+      "input.ydotoold: exit status exit status: 1",
+      "platform.gnome_screenshot: No such file or directory (os error 2)",
+      "platform.gnome_shell_version: No such file or directory (os error 2)",
+      "portals.mutter_remote_desktop: Failed to get credentials: No such device or address",
+      "portals.mutter_screencast: Failed to get credentials: No such device or address",
+      "windowing.backends.cosmic-wayland: /mnt/e/dsh-computer-use-linux/wt-fix-experience/helper-linux/target/debug/codex-computer-use-cosmic probe failed: Error: failed to connect to Wayland display\n\nCaused by:\n    Could not find wayland compositor",
+      "windowing.backends.gnome-shell-extension: Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name com.openai.Codex.WindowControl was not provided by any .service files",
+      "windowing.backends.gnome-shell-introspect: Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name org.gnome.Shell was not provided by any .service files",
+      "windowing.backends.hyprland: HYPRLAND_INSTANCE_SIGNATURE not set! (is hyprland running?)",
+      "windowing.backends.i3: No such file or directory (os error 2)",
+      "windowing.backends.niri: No such file or directory (os error 2)",
+      "windowing.backends.x11: wmctrl unavailable: failed to probe X11 windows",
+      "windowing.codex_gnome_shell_extension: Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name com.openai.Codex.WindowControl was not provided by any .service files",
+      "windowing.codex_gnome_shell_extension_screenshot: Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name com.openai.Codex.WindowControl was not provided by any .service files",
+      "windowing.cosmic_helper: /mnt/e/dsh-computer-use-linux/wt-fix-experience/helper-linux/target/debug/codex-computer-use-cosmic probe failed: Error: failed to connect to Wayland display\n\nCaused by:\n    Could not find wayland compositor",
+      "windowing.gnome_shell_introspect: Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name org.gnome.Shell was not provided by any .service files",
+      "windowing.hyprland: HYPRLAND_INSTANCE_SIGNATURE not set! (is hyprland running?)",
+      "windowing.niri: No such file or directory (os error 2)"
+    ]
+  }
+}

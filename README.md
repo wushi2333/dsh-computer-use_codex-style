@@ -2,12 +2,12 @@
 
 # Computer Use for DeepSeek Harness
 
-**Drive Windows desktop apps and Chromium tabs from DeepSeek Harness.**
+**Drive Windows and Linux (X11) desktop apps and Chromium tabs from DeepSeek Harness.**
 **Based on the Codex `window2` tool surface** — **the Codex-style Computer Use experience on DeepSeek Harness.**
 
 English | [中文](README.zh-CN.md)
 
-![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20x64-0078D4?style=flat-square)
+![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20%2B%20Linux%20X11-0078D4?style=flat-square)
 ![protocol](https://img.shields.io/badge/DSH-bundle%20%C2%B7%20cordis.patch.yml-4B5563?style=flat-square)
 ![surface](https://img.shields.io/badge/surface-13%20window2%20%2B%20extensions-2563EB?style=flat-square)
 ![baseline](https://img.shields.io/badge/Codex%20baseline-26.903.61454-6B7280?style=flat-square)
@@ -24,6 +24,7 @@ English | [中文](README.zh-CN.md)
 
 - [What you get](#what-you-get)
 - [Quick start](#quick-start)
+  - [Linux (X11) quick start](#linux-x11-quick-start)
 - [How it works](#how-it-works)
 - [Tool surface](#tool-surface)
 - [The act-and-refresh loop](#the-act-and-refresh-loop)
@@ -43,6 +44,8 @@ English | [中文](README.zh-CN.md)
 
 ## What you get
 
+> **💡 Cross-platform support**: Full support for both **Windows 10/11 (x64)** and **Linux (X11)**. On Windows, it uses UI Automation + Windows.Graphics.Capture + SendInput; on Linux, it uses pure Rust x11rb + AT-SPI2 + XTest. Both platforms provide the complete 13-tool Codex `window2` desktop surface with a unified experience.
+
 | | |
 |---|---|
 | **The full Codex surface** | All 13 official Codex `window2` methods — `list_windows`, `get_window`, `list_apps`, `launch_app`, `get_window_state`, `click`, `press_key`, `type_text`, `scroll`, `set_value`, `drag`, `perform_secondary_action`, `activate_window` — with the same names, parameters, defaults, return shapes and error strings as Codex. |
@@ -61,11 +64,44 @@ English | [中文](README.zh-CN.md)
 
 | | |
 |---|---|
-| OS | Windows 10 1809+ or Windows 11, **x64** |
+| OS | Windows 10 1809+ / Windows 11 (**x64**), or Linux (X11 session, **x64**) |
 | Harness | DeepSeek Harness (a source checkout or an installed `dsh` CLI) |
 | Node | 20 or newer |
 | Python | 3.10+ — only for the optional browser catalog; the 13 desktop tools are Rust + Node |
-| Rust | only if you rebuild the helper (a release binary already ships in `helper-rs/bin/win32-x64/`) |
+| Rust | Windows includes a prebuilt release binary; Linux requires building the helper once (`cargo build -p helper-linux --release`) |
+
+### Linux (X11) Quick Start
+
+If you are running on Linux (X11), setup only requires two preparatory steps before following the **exact same installation, preset configuration, and skill sync steps as Windows** (steps 1–4 below):
+
+#### 1. Prerequisites
+- **X11 session required**: Only X11 sessions are supported at this time (Wayland is not supported). Verify with `echo $XDG_SESSION_TYPE` in your terminal — the output must be `x11`.
+- **Enable system accessibility (AT-SPI2)**:
+  - *Why it is required*: Without accessibility enabled, there is no UI element tree. The agent cannot read button labels or input fields and has to blindly guess coordinates from screenshots — slow and error-prone.
+  - **KDE Plasma**: Go to "System Settings" → "Accessibility" and enable Screen Reader support (if Qt apps still do not expose an element tree, set `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`).
+  - **GNOME**: Run one command in your terminal:
+    ```sh
+    gsettings set org.gnome.desktop.interface toolkit-accessibility true
+    ```
+  - Ensure `at-spi2-core` is installed (shipped by default on most Linux distributions).
+
+#### 2. Build the helper
+The Linux desktop driver is built with pure Rust (`x11rb`, requiring no system C X11 headers or development packages). Build it once before your first run:
+```sh
+cargo build -p helper-linux --release
+```
+The compiled binary will be placed at `helper-linux/target/release/dsh-computer-use`. The plugin sidecar automatically prefers this build path on startup without any manual copying or configuration (or point `DSH_COMPUTER_USE_HELPER=/path/to/binary` to a custom location).
+
+#### 3. Three-step setup (Same as Windows)
+After building the helper, follow the standard steps below — they apply equally to Linux:
+- **Step 1**: [Install the bundle](#1-install-the-bundle) (`dsh plugin --profile web add ...`)
+- **Step 2**: [Add the tool row to an agent preset](#2-add-the-tool-row-to-an-agent-preset) (add `tool-computer-use` to `agent.cordis.yml`)
+- **Step 3**: [Deliver the skills](#3-deliver-the-skills) (run `sync-skills.mjs --write --defaults`)
+
+#### 4. Known differences and tips
+- **Experience layer (Status pill and synthetic cursor)**: Works smoothly under KWin and modern X11 compositors. The pill indicates observation and action states, while the synthetic cursor follows actions.
+- **Physical Escape interrupt**: Pressing **Esc** immediately halts the turn. If your window manager or compositor (such as KWin's built-in shortcuts) already holds a global shortcut for Escape, the raw global key grab may report refused, but the underlying XInput2 raw key listener remains active and still catches interrupts within ~150ms.
+- **Electron applications (VS Code, QQ, Slack, etc.)**: Many Electron applications do not expose deep accessibility trees by default. Launch them with the `--force-renderer-accessibility` flag to expose the full AT-SPI tree; for DOM-level control, see the CDP channel section in [docs/helper-linux.zh.md](docs/helper-linux.zh.md).
 
 ### 1. Install the bundle
 
@@ -146,15 +182,13 @@ flowchart TB
       K["skills<br/>computer-use · computer-use-browser"]
     end
   end
-  S <-->|"JSON-RPC over stdio, one JSON object per line"| H["dsh-computer-use.exe<br/>Rust helper"]
-  H -->|SendInput| APP["target Windows app"]
-  H -->|UI Automation| APP
-  H -->|Windows.Graphics.Capture| APP
+  S <-->|"JSON-RPC over stdio, one JSON object per line"| H["Rust helper<br/>Windows: dsh-computer-use.exe<br/>Linux: dsh-computer-use"]
+  H -->|Windows: SendInput / UIA / WGC<br/>Linux: XTest / AT-SPI / XShm| APP["target app"]
   T --> S
   P["Python engine (optional)<br/>CDP · Playwright · browser catalog"] <--> S
 ```
 
-**One helper per process, one turn at a time.** The sidecar spawns `dsh-computer-use.exe` lazily and keeps it; every request carries a session + turn identity, and a turn scope change sends `end_turn`, which flushes the observation lease, hides the overlay and restores the system cursor. That mirrors the official plugin, whose `Stop` / `Interrupt` / `SubagentStop` hooks all call `turn_ended`.
+**One helper per process, one turn at a time.** The sidecar spawns the helper (`dsh-computer-use.exe` on Windows, `dsh-computer-use` on Linux) lazily and keeps it; every request carries a session + turn identity, and a turn scope change sends `end_turn`, which flushes the observation lease, hides the overlay and restores the system cursor. That mirrors the official plugin, whose `Stop` / `Interrupt` / `SubagentStop` hooks all call `turn_ended`.
 
 **Freshness is identity-based, not time-based.** There is no TTL: an observation stays valid while the window identity, its bounds and the human-input monitor agree. The moment a person touches the observed window, the next input is refused with `user input was detected in this window; call get_window_state before continuing`.
 
@@ -187,6 +221,7 @@ flowchart TB
 | Tool | Default | Purpose |
 |---|---|---|
 | `batch_actions` | enabled | Deterministic actions in one call, then one `get_window_state` |
+| `computer_use_wait_for` | always | Wait until a UI condition (text appears/disappears, element appears), eliminating polling observation round trips |
 | `computer_use_health` | always | Backend, allow list, documentation gate, environment audit, experience store |
 | `computer_use_experience` | always | Read, record and update the local experience notes |
 | `click_element`, `scroll_element` | opt-in | Legacy window-v1 aliases |
@@ -362,12 +397,23 @@ It expects a prepared desktop (a `Parity Target` window, Word and Explorer for t
 # JavaScript plugin: nothing to build, it is plain ESM
 node src/exports-check.mjs
 
-# Rust helper: build, test, and publish the binary the plugin ships
+# Rust helper (Windows): build, test, and publish the binary the plugin ships
 pwsh -File scripts/ship-helper.ps1
+
+# Rust helper (Linux): pure Rust x11rb, no system C dependencies
+cargo build -p helper-linux --release
 
 # Python engine (optional browser surface)
 python -m pip install -e .
+
+# Optional: the direct-CDP (WebSocket) path inside the Python engine
+python -m pip install --user websocket-client   # or: apt install python3-websocket-client
 ```
+
+The Chrome/Edge **extension** channel needs no third-party Python package: the engine binds
+its ExtensionHub on `127.0.0.1:8765` and the extension polls it. Only the direct-CDP path
+(`--remote-debugging-port` + WebSocket) needs `websocket-client`; without it the engine
+still starts and says so when a CDP operation is attempted.
 
 `scripts/ship-helper.ps1` runs `cargo build --release`, the helper test suite, copies `dsh-computer-use.exe` into `helper-rs/bin/<platform>-<arch>/` and prints its SHA-256. A fresh checkout runs without a Rust toolchain because that binary is tracked.
 
@@ -395,8 +441,9 @@ src/
 skills/
   computer-use/         the desktop skill + its reference documents
   computer-use-browser/ the browser skill + its reference documents
-helper-rs/              the Rust helper (input, UIA, capture, overlay, cursor)
+helper-rs/              the Rust helper (Windows: input, UIA, capture, overlay, cursor)
   bin/<platform>-<arch>/  the shipped release binary
+helper-linux/           the Rust helper (Linux X11: pure Rust x11rb, AT-SPI, XTest, overlay)
 helper-swift/           the macOS helper source (not shipped as a binary)
 computer_use/           the Python engine (CDP, Playwright, browser catalog)
 parity/                 the verification suite and its fixtures

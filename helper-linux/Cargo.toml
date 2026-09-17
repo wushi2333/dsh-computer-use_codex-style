@@ -1,0 +1,72 @@
+[package]
+name = "dsh-computer-use"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "DSH Computer Use Linux helper: fork of ilysenko/codex-desktop-linux computer-use-linux, driven by the plugin stdio JSONL helper protocol."
+publish = false
+
+[lib]
+name = "dsh_computer_use"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dsh-computer-use"
+path = "src/main.rs"
+
+[[bin]]
+name = "codex-chrome-extension-host"
+path = "src/bin/codex-chrome-extension-host.rs"
+
+[[bin]]
+name = "codex-computer-use-cosmic"
+path = "src/bin/codex-computer-use-cosmic.rs"
+
+# The AT-SPI discovery step on its own, so the gated Xvfb suites can assert which
+# accessibility bus a process resolves to without opening a connection to it.
+[[bin]]
+name = "a11y-probe"
+path = "src/bin/a11y-probe.rs"
+
+[dev-dependencies]
+# The X11 integration test drives the server directly (XTEST injection, window
+# tree inspection) so the assertions are real round trips rather than mocks.
+x11rb = { version = "0.13", default-features = false, features = ["xtest", "xinput"] }
+
+[dependencies]
+mimalloc = { version = "0.1", default-features = false }
+anyhow = "1.0.102"
+# atspi without its "connection" feature: that feature pulls atspi-connection
+# with default features, which include "p2p" — and p2p peer enumeration during
+# connect() calls GetInterfaces on every a11y-bus peer, so a single
+# AppArmor-confined peer (e.g. snap-packaged Slack) aborts the whole
+# AccessibilityConnection. Upstream never uses P2P routing.
+atspi = { version = "0.29.0", default-features = false, features = ["proxies", "wrappers", "tokio"] }
+atspi-connection = { version = "0.13.0", default-features = false, features = ["wrappers"] }
+base64 = "0.22.1"
+evdev = "0.13.2"
+cosmic-protocols = { version = "0.2.0", default-features = false, features = ["client"] }
+futures-util = "0.3.32"
+getrandom = "0.4.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+libc = "0.2"
+rmcp = { version = "1.5.0", features = ["transport-io"] }
+schemars = "1.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.11.0"
+tokio = { version = "1.51.1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
+wayland-client = "0.31.11"
+wayland-protocols = { version = "0.32.9", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+# Pure-Rust X11: the default features never link libxcb, which this machine has no
+# development files for, and SHM/XTest/XFixes/XComposite come from x11rb-protocol
+# wire definitions, so no X11 development package is needed at build time. The
+# feature set is the union of both window2 lines: xtest/xinput/xfixes serve the
+# input and element paths (src/x11/input.rs, src/x11_experience/), shm backs the
+# fast capture path, and `composite` is what makes an occluded window capturable
+# (see src/x11/capture.rs).
+x11rb = { version = "0.13", default-features = false, features = ["shm", "xtest", "xfixes", "composite", "xinput"] }
+xkeysym = "0.2.1"
+zbus = "5.14.0"

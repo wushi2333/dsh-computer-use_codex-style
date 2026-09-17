@@ -28,19 +28,27 @@ export const BASE_ENV_ALLOWLIST = [
  *
  * @param {object} [extra] values the caller adds (already-known keys)
  * @param {string[]} [extraAllowlist] additional names to forward from the host
+ * @param {string[]} [extraDenylist] names to withhold even when a forwarding rule
+ *   would have let them through. A knob the plugin owns must not be settable by a
+ *   stray variable in the host environment: otherwise "the user never opted in"
+ *   and "the helper is capped anyway" stop being distinguishable.
  * @returns {{ env: object, injected: string[], excluded: string[] }}
  */
-export function sanitizedEnvironment(extra = {}, extraAllowlist = []) {
+export function sanitizedEnvironment(extra = {}, extraAllowlist = [], extraDenylist = []) {
   const allow = new Set(
     BASE_ENV_ALLOWLIST.concat(Array.isArray(extraAllowlist) ? extraAllowlist : [])
       .map(name => String(name).toLowerCase()),
+  )
+  const deny = new Set(
+    (Array.isArray(extraDenylist) ? extraDenylist : []).map(name => String(name).toLowerCase()),
   )
   const env = {}
   const excluded = []
   for (const [name, value] of Object.entries(process.env)) {
     if (value === undefined) continue
     const lower = name.toLowerCase()
-    if (allow.has(lower) || lower.startsWith('dsh_') || name.startsWith('DSH_COMPUTER_USE_')) env[name] = value
+    if (deny.has(lower)) excluded.push(name)
+    else if (allow.has(lower) || lower.startsWith('dsh_') || name.startsWith('DSH_COMPUTER_USE_')) env[name] = value
     else excluded.push(name)
   }
   for (const [name, value] of Object.entries(extra)) {
@@ -312,7 +320,7 @@ function pathJoin(...parts) {
     .join('\\')
 }
 
-const NATIVE_CALLS = new Set([
+export const NATIVE_CALLS = new Set([
   'list_windows',
   'get_window',
   'list_apps',
@@ -346,23 +354,197 @@ const NATIVE_CALLS = new Set([
   'window',
 ])
 
+export const LINUX_CALLS = new Set([
+  'list_apps',
+  'get_app_state',
+  'screenshot',
+  'click',
+  'scroll',
+  'press_key',
+  'type_text',
+])
+
+export const WINDOW2_CALLS = new Set([
+  'list_windows',
+  'get_window',
+  'list_apps',
+  'launch_app',
+  'get_window_state',
+  'click',
+  'press_key',
+  'type_text',
+  'scroll',
+  'set_value',
+  'drag',
+  'perform_secondary_action',
+  'activate_window',
+])
+
+/**
+ * The DSH extension method that rides the window2 face on the Linux helper.
+ *
+ * Kept in its own set rather than appended to `WINDOW2_CALLS`: that set is the official
+ * thirteen and its exact size (13) is asserted by the routing tests, so folding an extension
+ * into it would make "the official surface" and "what this backend serves" the same list
+ * again -- which is the distinction the parity tests exist to keep.
+ */
+export const WINDOW2_EXTENSION_CALLS = new Set(['wait_for'])
+
+/** Whether a `call` name is served by the native window2 dispatcher on Linux. */
+export function isWindow2Call(name) {
+  return WINDOW2_CALLS.has(name) || WINDOW2_EXTENSION_CALLS.has(name)
+}
+
+/**
+ * The helper's `wait_for` method name and the JS tool name that exposes it.
+ *
+ * The transport budget below is derived from these, so they live with it. `tool.js` imports
+ * this contract rather than restating it: the schema the model reads and the budget the
+ * transport enforces must describe the same wait.
+ */
+export const WAIT_FOR_METHOD = 'wait_for'
+export const WAIT_FOR_TOOL_NAME = 'computer_use_wait_for'
+
+/**
+ * The ceiling the helper enforces on `timeout_ms` (see `helper-linux/src/x11/waitfor.rs`).
+ *
+ * Mirrored here because the transport has to size its own budget against it, and pinned to the
+ * Rust constant by a test so the two cannot drift apart.
+ */
+export const WAIT_FOR_MAX_TIMEOUT_MS = 20_000
+
+/** The helper's default wait when the caller names no `timeout_ms`. */
+export const WAIT_FOR_DEFAULT_TIMEOUT_MS = 5_000
+
+/**
+ * Extra transport budget on top of the wait itself, for one tree read and the round trip.
+ *
+ * Deliberately small: the resulting worst case must stay under the harness's own ~25 s tool
+ * budget, since the harness aborting a call is a heavier event than a clean timeout.
+ */
+export const WAIT_FOR_BUDGET_MARGIN_MS = 2_000
+
+/**
+ * Whether a surface name denotes the window2 face (the official 13-method surface).
+ *
+ * `windows`/`window2` are the host's other spellings for the same face; `all` is handled
+ * by the caller, which resolves it to a concrete surface first.
+ * @param {string} surface
+ * @returns {boolean}
+ */
+export function isWindow2Surface(surface) {
+  const name = String(surface || '').toLowerCase()
+  return name === 'computer' || name === 'windows' || name === 'window2'
+}
+
 export function pythonCatalog(surface) {
   const name = String(surface || '')
   if (name === 'browser' || name === 'all') return true
   if (name === 'mac') return process.platform !== 'darwin'
+  if (name === 'linux') return false
   return false
 }
 
-export function usesPython(method, params = {}) {
-  if (method === 'tools') return pythonCatalog(params.surface)
-  if (method !== 'call') return false
+/**
+ * The single routing decision point: which engine serves one request.
+ *
+ * Desktop faces (P1 `linux`/sky.window and the window2 13-method face) stay on the native
+ * helper; the browser catalog (`tab_*`, `create_tab`, `browser_setup`, ...), `mac` and the
+ * merged `all`/harness extras are served by the Python engine. Every caller goes through
+ * here, so a table-driven test can pin the whole routing surface instead of one name at a
+ * time.
+ *
+ * @param {string} method sidecar method (`tools`, `call`, ...)
+ * @param {object} [params]
+ * @param {string} [backend] configured backend ('linux' pins the two native faces)
+ * @returns {'native'|'python'}
+ */
+export function engineFor(method, params = {}, backend) {
+  if (method === 'tools') return pythonCatalog(params.surface) ? 'python' : 'native'
+  if (method !== 'call') return 'native'
   const name = String(params.name || '')
-  if (!name) return false
+  if (!name) return 'native'
+  if (backend === 'linux' && (LINUX_CALLS.has(name) || isWindow2Call(name))) return 'native'
   if (name === 'batch_actions') {
     const actions = params.arguments && Array.isArray(params.arguments.actions) ? params.arguments.actions : []
-    if (actions.some(item => item && item.name && !NATIVE_CALLS.has(String(item.name)))) return true
+    if (actions.some(item => item && item.name && !NATIVE_CALLS.has(String(item.name)))) return 'python'
   }
-  return !NATIVE_CALLS.has(name)
+  return NATIVE_CALLS.has(name) ? 'native' : 'python'
+}
+
+/**
+ * Back-compat boolean wrapper over {@link engineFor}. Kept because the exports-check and
+ * several tests pin this name and its exact semantics.
+ *
+ * @param {string} method
+ * @param {object} [params]
+ * @param {string} [backend]
+ * @returns {boolean}
+ */
+export function usesPython(method, params = {}, backend) {
+  return engineFor(method, params, backend) === 'python'
+}
+
+/**
+ * Surfaces the Python engine's own `--surface` parser accepts (computer_use/cli.py:18).
+ * `linux` is deliberately absent: it is the *native* P1 face, not a Python catalog, and
+ * passing it made argparse exit 2 -- which is why the Python channel never came up on
+ * Linux (see {@link pythonSurfaceFor}).
+ */
+export const PYTHON_SURFACES = new Set(['computer', 'mac', 'browser', 'all', 'desktop', 'gated'])
+
+/**
+ * The `--surface` value the Python engine is spawned with.
+ *
+ * A DSH request always carries its own explicit surface (`listTools` builds the payload,
+ * `call` needs none), so this argument only names the catalog the engine reports by
+ * default. Windows keeps the configured value byte-for-byte (the engine there is the
+ * original primary). On Linux the configured surface is the *native* face
+ * (`linux`/`sky.window`) or window2 `computer`, none of which is the Python engine's job
+ * there, so the engine declares itself `browser`: the one catalog the native helper does
+ * not serve on Linux.
+ *
+ * @param {object} [config]
+ * @returns {string}
+ */
+export function pythonSurfaceFor(config = {}) {
+  const configured = String(config.surface || '')
+  // Windows/fake keep the configured value byte for byte: there the engine is the
+  // original primary and every face it can be given is its own.
+  if (String(config.backend || '').toLowerCase() !== 'linux') return configured || 'computer'
+  // On Linux the Python child exists for exactly one reason: the browser catalog the
+  // native helper does not serve. Declaring any other face there would either be refused
+  // by argparse (`linux`) or misdescribe the child (`computer`/`all`, whose desktop half
+  // belongs to the native helper).
+  return 'browser'
+}
+
+/**
+ * When the sidecar must open the Python engine as a *second*, browser-only channel next
+ * to a healthy native helper.
+ *
+ * - `disabled`: the configured opt-out, a non-Linux backend (on Windows the Python
+ *   engine is already reachable lazily and must never be double-started), or `fake`
+ *   (Python is already the primary there).
+ * - `eager`: Linux with a surface whose catalog the native helper cannot fully serve
+ *   (`computer` carries no browser tools, `browser`/`all` need them by definition).
+ *   P1's `linux` keeps its lazy `ensurePython` path, unchanged.
+ *
+ * @param {object} [config]
+ * @returns {'eager'|'disabled'}
+ */
+export function browserChannelMode(config = {}) {
+  const choice = String(config.browserChannel || 'auto').toLowerCase()
+  if (choice === 'off' || choice === 'false' || choice === '0' || choice === 'disabled') return 'disabled'
+  const backend = String(config.backend || '').toLowerCase()
+  const surface = String(config.surface || '').toLowerCase()
+  if (choice === 'on' || choice === 'true' || choice === '1' || choice === 'eager' || choice === 'always') {
+    // An explicit opt-in still refuses the two cases that would break behaviour:
+    // `fake` (Python is the primary) and a non-Linux backend (no double start).
+    return backend === 'fake' || (backend !== '' && backend !== 'linux') ? 'disabled' : 'eager'
+  }
+  if (backend !== 'linux') return 'disabled'
+  return surface === 'browser' || surface === 'all' || surface === 'computer' ? 'eager' : 'disabled'
 }
 
 export function mergeToolLists(native, py, surface) {
@@ -378,10 +560,49 @@ export function mergeToolLists(native, py, surface) {
   }
 }
 
+/**
+ * Tag a `call` with the surface it belongs to.
+ *
+ * The same physical action can be spelled by both surfaces (`click`, `press_key`,
+ * `type_text`, `scroll`, `list_apps`), and their parameter shapes differ: window2 takes a
+ * window object plus an `element_index`, P1 takes the crate's own app/window form. The
+ * helper cannot tell them apart from the name alone, so a window2 turn declares itself and
+ * the helper routes the name to its native window2 handler. P1 sends no tag and keeps its
+ * handler, so this adds no field for a P1 caller.
+ *
+ * `surface` is an ordinary request parameter, not a new protocol method. The effective
+ * surface is the per-request override the caller passed, else the configured one; `all`
+ * resolves the way `listTools` resolves it, because `all` is not itself a face.
+ * @param {string} method
+ * @param {object} params
+ * @param {object} config
+ * @returns {object}
+ */
+export function callParamsFor(method, params, config = {}) {
+  if (method !== 'call' || !params || typeof params !== 'object') return params
+  // An explicit tag on the request always wins; it is the caller's own declaration.
+  if (params.surface !== undefined && params.surface !== '') return params
+  const backend = String(config.backend || '').toLowerCase()
+  // Only the Linux helper has two faces to disambiguate; every other backend keeps its
+  // request shape untouched.
+  if (backend !== 'linux') return params
+  let surface = String(config.surface || '').toLowerCase()
+  if (surface === 'all') {
+    // `all` is a union, not a face: it means the window2 face unless the config pinned
+    // P1's `linux`, which is the same resolution `listTools` uses.
+    surface = config.surface === 'linux' ? 'linux' : 'computer'
+  }
+  if (!isWindow2Surface(surface)) return params
+  return { ...params, surface: 'computer' }
+}
+
 export class Sidecar {
   constructor(config) {
-    this.config = config
-    const preserve = config.preserveHelperOnTimeout === true
+    this.config = config || {}
+    if (!this.config.surface && String(this.config.backend || '').toLowerCase() === 'linux') {
+      this.config = { ...this.config, surface: 'linux' }
+    }
+    const preserve = this.config.preserveHelperOnTimeout === true
     this.primary = new HelperProcess(preserve, code => this.noteHelperExit(code))
     this.python = new HelperProcess(preserve)
     this.chain = Promise.resolve()
@@ -405,6 +626,13 @@ export class Sidecar {
      * (MCP-08 audit trail surfaced through `computer_use_health`).
      */
     this.envReport = null
+    /**
+     * The browser-only Python channel's real state, reported verbatim (never a guess):
+     * `disabled` (nothing to open on this backend/surface), `primary` (Python is the
+     * primary engine, e.g. `fake`, so there is no second channel), `started`, or
+     * `failed` with the reason. Surfaced through `computer_use_health`.
+     */
+    this.pythonChannel = { state: 'disabled', surface: null, endpoint: null, error: null, pid: null }
   }
 
   /**
@@ -451,6 +679,72 @@ export class Sidecar {
     return String(this.config.backend || '').toLowerCase() === 'fake'
   }
 
+  /**
+   * Open the browser-only Python channel next to a healthy native helper.
+   *
+   * On Linux the native helper owns the desktop faces and serves no browser catalog at
+   * all: the `tab_*` tools live in the Python engine, whose ExtensionHub owns the
+   * Chrome/Edge bridge (127.0.0.1:8765). Without this channel a Linux session has no live
+   * browser route -- the tool catalog could be listed, but every `tab_*` call would fail
+   * and nothing would be listening for the extension.
+   *
+   * It never throws and never changes the desktop face: a failure is recorded in
+   * `pythonChannel` for the operator, and the native helper that just proved healthy
+   * stays the desktop engine.
+   *
+   * @param {string} engineRoot
+   * @returns {Promise<{state: string, surface: string|null, endpoint: string|null, error: string|null, pid: number|null}>}
+   */
+  async openBrowserChannel(engineRoot) {
+    this.pythonChannel = { state: 'disabled', surface: null, endpoint: null, error: null, pid: null }
+    if (this.primary.kind === 'python') {
+      // Python is already the primary (`fake`): there is no second channel to open.
+      this.pythonChannel = { ...this.pythonChannel, state: 'primary' }
+      return this.pythonChannel
+    }
+    if (browserChannelMode(this.config) === 'disabled') return this.pythonChannel
+    const surface = pythonSurfaceFor(this.config)
+    let session
+    try {
+      session = await this.ensurePython()
+    } catch (error) {
+      this.pythonChannel = {
+        state: 'failed',
+        surface,
+        endpoint: null,
+        error: String(error.message || error),
+        pid: null,
+      }
+      return this.pythonChannel
+    }
+    this.pythonChannel = {
+      state: 'started',
+      surface,
+      endpoint: `http://127.0.0.1:${this.extensionPort()}`,
+      error: null,
+      pid: session.child?.pid ?? null,
+    }
+    // Liveness, not optimism: a channel whose engine died is reported as failed with the
+    // exit status instead of continuing to claim 8765 is served. `ensurePython` respawns
+    // on the next browser call, which overwrites this with the new truth.
+    session.child?.once?.('exit', (code, signal) => {
+      if (this.pythonChannel.state === 'started' && this.pythonChannel.pid === (session.child?.pid ?? null)) {
+        this.pythonChannel = {
+          ...this.pythonChannel,
+          state: 'failed',
+          error: `computer-use python engine exited (${code ?? signal ?? 'unknown'})`,
+        }
+      }
+    })
+    return this.pythonChannel
+  }
+
+  /** The ExtensionHub port the Python engine is told to bind (8765 unless configured). */
+  extensionPort() {
+    const port = Number(this.config.extensionPort)
+    return Number.isFinite(port) && port > 0 ? Math.trunc(port) : 8765
+  }
+
   async start() {
     this.dispose()
     const engineRoot = this.config.engineRoot || defaultEngineRoot()
@@ -460,6 +754,11 @@ export class Sidecar {
       try {
         await this.spawnNative(engineRoot, exe)
         await this.primary.rawRequest('health', {}, undefined, this.config.timeoutMs || 10_000)
+        // The helper proved healthy: the desktop faces are up. On Linux that is only half
+        // the job -- the browser catalog lives in the Python engine, so open the
+        // browser-only second channel before reporting success. A failure here is
+        // recorded, never fatal (see openBrowserChannel).
+        await this.openBrowserChannel(engineRoot)
         return
       } catch (error) {
         errors.push(`${exe}: ${error.message}`)
@@ -470,6 +769,16 @@ export class Sidecar {
       try {
         await this.spawnPython(engineRoot, invocation, this.primary)
         await this.primary.rawRequest('health', {}, undefined, this.config.timeoutMs || 10_000)
+        // Python is the primary engine here (no native helper, or `fake`): there is no
+        // second channel to open, and saying so is more useful than reporting a channel
+        // that was never needed.
+        this.pythonChannel = {
+          state: 'primary',
+          surface: pythonSurfaceFor(this.config),
+          endpoint: `http://127.0.0.1:${this.extensionPort()}`,
+          error: null,
+          pid: this.primary.child?.pid ?? null,
+        }
         return
       } catch (error) {
         errors.push(`${invocation.command}: ${error.message}`)
@@ -505,8 +814,31 @@ export class Sidecar {
     if (['mask', 'wda', 'off'].includes(exclusion)) {
       extra.DSH_CU_OVERLAY_CAPTURE_EXCLUSION = exclusion
     }
-    const { env, injected, excluded } = sanitizedEnvironment(extra, this.config.envAllowlist)
-    const child = spawn(exe, args, {
+    // DSH-only knob: cap the longest edge of a returned screenshot. The official helper has
+    // no max-edge concept at all (parity/official-constants.json: 0 hits across its
+    // 19,738-string table), so this is an opt-in extension, exactly like cursorScale. It
+    // travels through the environment because the official helper's argv parser aborts on
+    // unknown flags.
+    //
+    // Only a finite positive value is exported. 0 and an unset config both mean "no cap",
+    // and the variable is withheld from inheritance in that case: a stray export in the
+    // host shell must not silently cap a helper the user never capped, which would be
+    // precisely the "official behaviour changed behind your back" failure D-E forbids.
+    const maxImageEdge = Number(this.config.maxImageEdge)
+    const capped = Number.isFinite(maxImageEdge) && maxImageEdge > 0
+    if (capped) extra.DSH_COMPUTER_USE_MAX_IMAGE_EDGE = String(maxImageEdge)
+    const { env, injected, excluded } = sanitizedEnvironment(
+      extra,
+      this.config.envAllowlist,
+      capped ? [] : ['DSH_COMPUTER_USE_MAX_IMAGE_EDGE'],
+    )
+    let cmd = exe
+    let cmdArgs = args
+    if (exe.endsWith('.js') || exe.endsWith('.mjs')) {
+      cmd = process.execPath
+      cmdArgs = [exe, ...args]
+    }
+    const child = spawn(cmd, cmdArgs, {
       cwd: engineRoot,
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -517,7 +849,19 @@ export class Sidecar {
     this.primary.attach(child, 'native')
   }
 
-  async spawnPython(engineRoot, { command, prefixArgs }, target) {
+  /**
+   * @param {string} engineRoot
+   * @param {{command: string, prefixArgs: string[]}} invocation
+   * @param {HelperProcess} target
+   * @param {object} [options]
+   * @param {string} [options.surface] overrides the configured surface for this child only.
+   *   The browser-only channel passes `browser`; every other caller keeps the configured
+   *   value, so the Windows/fake primary is spawned exactly as before.
+   */
+  async spawnPython(engineRoot, { command, prefixArgs }, target, options = {}) {
+    const surface = options.surface !== undefined && options.surface !== ''
+      ? String(options.surface)
+      : pythonSurfaceFor(this.config)
     const args = [
       ...prefixArgs,
       '-u',
@@ -526,7 +870,7 @@ export class Sidecar {
       '--backend',
       this.config.backend || 'windows',
       '--surface',
-      this.config.surface || 'computer',
+      surface,
       '--max-image-edge',
       // `|| 1280` silently turned the new 0 (official, no cap) back into a downscale.
       String(this.config.maxImageEdge ?? 0),
@@ -544,6 +888,12 @@ export class Sidecar {
       PYTHONPATH: engineRoot + (process.env.PYTHONPATH ? `${pathSep()}${process.env.PYTHONPATH}` : ''),
       COMPUTER_USE_CDP: live ? '1' : (process.env.COMPUTER_USE_CDP || '0'),
       COMPUTER_USE_EXTENSION: live ? '1' : (process.env.COMPUTER_USE_EXTENSION || '0'),
+    }
+    // Pin the ExtensionHub port the engine binds (browser_api.py reads
+    // COMPUTER_USE_EXTENSION_PORT, default 8765). Only written when configured, so the
+    // default spawn keeps exactly the environment it had.
+    if (Number(this.config.extensionPort) > 0) {
+      extra.COMPUTER_USE_EXTENSION_PORT = String(Math.trunc(Number(this.config.extensionPort)))
     }
     const { env, injected, excluded } = sanitizedEnvironment(extra, this.config.envAllowlist)
     const child = spawn(command, args, {
@@ -648,6 +998,19 @@ export class Sidecar {
    */
   timeoutFor(method, params) {
     const base = Number(this.config.timeoutMs) > 0 ? Number(this.config.timeoutMs) : 10_000
+    if (method === 'call' && params && params.name === 'wait_for') {
+      // A wait is *supposed* to take as long as its own timeout_ms, so the flat 10 s
+      // transport budget would kill the helper while it was still doing exactly what it was
+      // asked to do -- and a transport timeout destroys the warm helper. The budget is
+      // therefore derived from the wait itself, plus a margin for the tree read and the round
+      // trip. The helper clamps timeout_ms to 20 s (x11/waitfor.rs), so this stays under the
+      // harness's own ~25 s tool budget; the margin is deliberately small for that reason.
+      const asked = Number(params.arguments && params.arguments.timeout_ms)
+      const wait = Number.isFinite(asked) && asked > 0
+        ? Math.min(asked, WAIT_FOR_MAX_TIMEOUT_MS)
+        : WAIT_FOR_DEFAULT_TIMEOUT_MS
+      return wait + WAIT_FOR_BUDGET_MARGIN_MS
+    }
     if (method === 'call' && params && params.name === 'launch_app') {
       const launch = Number(this.config.launchAppTimeoutMs)
       return launch > 0 ? launch : 15_000
@@ -686,12 +1049,14 @@ export class Sidecar {
       if (method === 'tools') return this.listTools(params, signal, timeoutMs)
       // A catalog build that outruns its budget must not cost the warm catalog.
       const keepAlive = method === 'call' && params?.name === 'list_apps'
-      const session = usesPython(method, params) ? await this.ensurePython() : this.primary
+      const session = engineFor(method, params, this.config.backend) === 'python'
+        ? await this.ensurePython()
+        : this.primary
       // Turn bookkeeping lives on the Sidecar (it owns the previous turn scope), not
       // on the helper process. Calling it on `session` threw a TypeError and made
       // every Computer Use tool call fail before it ever reached the helper.
       if (method === 'call') await this.ensureTurn(params?.meta || {}, timeoutMs)
-      return session.rawRequest(method, params, signal, timeoutMs, undefined, keepAlive)
+      return session.rawRequest(method, callParamsFor(method, params, this.config), signal, timeoutMs, undefined, keepAlive)
     }
     const task = this.chain.then(run, run)
     this.chain = task.then(() => undefined, () => undefined)
@@ -703,12 +1068,17 @@ export class Sidecar {
   }
 
   async listTools(params = {}, signal, timeoutMs) {
-    const surface = String(params.surface || this.config.surface || 'computer')
+    const defaultSurface = this.config.backend === 'linux' ? 'linux' : 'computer'
+    const surface = String(params.surface || this.config.surface || defaultSurface)
     const payload = { ...params, surface }
     if (surface === 'browser' || surface === 'mac') {
       return (await this.ensurePython()).rawRequest('tools', payload, signal, timeoutMs)
     }
-    const nativeSurface = surface === 'all' ? 'desktop' : surface
+    const nativeSurface = surface === 'all'
+      ? (this.config.backend === 'linux'
+          ? (this.config.surface === 'linux' ? 'linux' : 'computer')
+          : 'desktop')
+      : surface
     const native = await this.primary.rawRequest('tools', { ...payload, surface: nativeSurface }, signal, timeoutMs)
     if (surface !== 'all' && native?.deferred !== 'python') return native
     try {
@@ -730,6 +1100,8 @@ export class Sidecar {
     this.turnMeta = null
     this.python.dispose()
     this.primary.dispose()
+    // Both engines are gone, so no channel is open. `start()` sets the real state again.
+    this.pythonChannel = { state: 'disabled', surface: null, endpoint: null, error: null, pid: null }
   }
 }
 

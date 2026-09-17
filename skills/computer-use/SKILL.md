@@ -1,12 +1,13 @@
 ---
 name: computer-use
-description: Drive Windows desktop apps from DeepSeek Harness with Codex-parity window2 tools. Use for clicking, typing, screenshots, and native UI automation. For Chromium tabs, load computer-use-browser first.
+description: Drive Windows and Linux desktop apps from DeepSeek Harness with native UI automation tools. Use for clicking, typing, screenshots, and desktop app interaction. For Chromium tabs, load computer-use-browser first.
 ---
 
 # Computer Use
 
-Use this skill to automate the UI of Microsoft Windows apps. It uses SendInput, UI Automation, and
-Windows.Graphics.Capture screenshots that work even when windows are occluded.
+Use this skill to automate the UI of desktop apps across Microsoft Windows and Linux.
+On Windows, it uses SendInput, UI Automation, and Windows.Graphics.Capture (window2 13-tool surface).
+On Linux (P1), it uses `helper-linux` exposing the 7-tool sky.window surface (via XDG Desktop Portal and AT-SPI).
 
 If these tools are available, read this entire `SKILL.md` once before Windows automation work, before
 saying Computer Use is unavailable, and before falling back to other Windows automation.
@@ -16,12 +17,27 @@ need the topic they cover:
 
 - `references/guidance.md`: core runtime behaviour, target-window workflow, screenshot handling, and
   recovery guidance. You MUST read this before controlling Windows apps.
-- `references/api.md`: the full tool surface with every parameter, default and doc comment. Read this when
-  you need a signature or an object shape.
+- `references/api.md`: the Windows window2 13-tool surface with every parameter, default, and doc comment.
+- `references/api-linux.md`: the Linux P1 sky.window 7-tool surface (`list_apps`, `get_app_state`, `screenshot`, `click`, `scroll`, `press_key`, `type_text`) with string-based `app` and `linux-window:<id>` targeting.
+- `references/api-linux-window2.md`: the Linux P2 window2 13-tool surface (Codex parity on X11, complete 13 methods, element indexing, overlay pill, synthetic cursor, and Wayland degradation mode).
 - `references/confirmations.md`: you MUST read this before deciding whether a Windows UI action needs
   confirmation.
 - `references/dsh-header.md`: the session contract and the non-negotiable Windows Automation Safety block
   (also always in your system prompt).
+
+## Linux Platform Surface (P1 sky.window)
+
+When running on Linux, Computer Use operates via `helper-linux`. It provides a focused **7-tool surface**:
+`list_apps`, `get_app_state`, `screenshot`, `click`, `scroll`, `press_key`, `type_text`.
+
+Key characteristics on Linux:
+1. **Targeting by identifier**: Tools accept `app` as either a canonical application identifier (e.g. `"firefox"`, `"gedit"`) or a specific window target formatted as `"linux-window:<id>"`.
+2. **Coordinate-based input (no element_index)**: All click and scroll actions operate on window-relative coordinates `{ x, y }`. Accessibility element indexes (`element_index`), `drag`, and direct `set_value` are Windows window2 capabilities not present in Linux P1.
+3. **Session permissions (Portal)**: Under Wayland, the first call to `screenshot` or input tools will display an OS-level XDG Desktop Portal permission prompt. The user must grant screen capture / remote desktop access.
+4. **AT-SPI accessibility**: `get_app_state` reads AT-SPI accessibility trees. If disabled in the desktop session, `text` will be omitted or empty, and actions should rely on visual screenshots.
+5. **Electron applications (QQ, WeChat, VS Code, etc.)**: On a desktop with AT-SPI enabled, Electron apps usually DO expose usable trees (verified on QQ: hundreds of named nodes) — always TRY the tree first with `include_text: true`. Never conclude "this app has no accessibility tree" from a call that didn't request text, and expect many unnamed `panel` nodes (normal for Electron; look for named buttons/statics). Only when the requested tree genuinely comes back empty is the visual screenshot + coordinate-click path the expected fallback.
+
+For full type definitions and examples, see `references/api-linux.md`.
 
 ## If the tools are missing
 
@@ -39,10 +55,12 @@ If `list_windows` / `launch_app` / `computer_use_health` are not in your functio
 Call `computer_use_health` first when you need the backend, the allow list, or whether browser tools
 are unlocked. Then select exactly one target window:
 
-1. `list_apps` (installed apps plus their open targetable windows) and/or `list_windows` (currently open windows).
+1. **Enumerate before acting (先枚举再行动)**: Always call `list_windows` (and/or `list_apps`) before interacting with any application.
+   - If the target app is already running, pick its window and call `activate_window({window})` to bring it forward and reuse the existing instance. **Never launch a second instance or restart an already-running app.**
 2. Pick **exactly one** returned window object. Never invent `app` / `id`, and never reconstruct a window
    from guessed fields. `get_window({id, app})` rehydrates a binding you already hold.
-3. If the target app has no open window, call `launch_app({app})`, refresh `list_apps`, then select a returned window.
+3. **Launch only when absent**: Call `launch_app({app})` only after enumeration confirms that no open window exists for the app. Then refresh `list_apps` / `list_windows` and select a returned window.
+   - **Never launch GUI applications via bash/shell commands** (e.g. `qq &`, `nohup ...`, `code`): running desktop apps through the shell bypasses window tracking and risks spawning duplicate instances or corrupted login states.
 4. `activate_window({window})`, then `get_window_state({window})`.
 
 `get_window_state({window})` defaults to screenshot on and `accessibility: null`. Set
@@ -81,6 +99,10 @@ again solely for inspection.
 
 ## Guidelines
 
+- **Locating a specific target (查找特定对象)**: When asked to find a specific object inside an application (such as a contact in QQ/WeChat, a file in a file manager, or a setting), read [Efficiency tactics (高效战术)](#efficiency-tactics-高效战术) first. Never default to visual scrolling when search mechanisms exist.
+- **Enumerate before acting**: Always check `list_windows` before attempting to open any app. If the target window already exists, activate and reuse it via `activate_window`; never attempt to launch it again.
+- **Never launch GUI apps through the shell**: Do not use bash/shell commands to launch GUI applications; use `launch_app` only when `list_windows` confirms the app is not already running.
+- **Electron applications (e.g. QQ, WeChat, VS Code)**: try the accessibility tree first (`include_text: true`) — it is often richer than expected on AT-SPI-enabled desktops. Visual screenshot inspection + coordinate clicking (`click({window, screenshotId, x, y})`) is the fallback for when the tree is genuinely empty, not the default assumption.
 - Treat `get_window_state` as an expensive point-in-time snapshot. Batch related inputs, then capture a new state when you need to verify progress or when focus, layout, modality, or element indexes may have changed.
 - Element indexes are valid only for the accessibility state that produced them. Refresh accessibility state after any action that may change the visible element tree.
 - By default `get_window_state({window})` captures and displays a screenshot and returns `accessibility: null`. This is the best default for desktop apps with weak accessibility trees.
@@ -95,6 +117,45 @@ again solely for inspection.
 - For text entry into a document, slide, sheet, editor, or canvas, click a stable point inside the editable work surface, refresh to verify focus, then type.
 - For drawing, handwriting, canvas, or 3D viewport manipulation, use `drag` strokes directly on the canvas.
 - For browser work prefer the `computer-use-browser` skill over pixels.
+- **Backup observation channel (备选观察通道)**: the desktop OCR/vision tools (e.g. `mcp__nuphus-mcp__desktop_perceive` / `desktop_vision`) may be used as a SECONDARY way to read the screen when the `get_window_state` screenshot channel is malfunctioning (empty or blank images), or when tiny elements in an Electron app are unreadable in a downscaled screenshot. Reading only — every action still goes through Computer Use tools, and coordinate actions need the `screenshotId` from a real CU observation, so re-observe with `get_window_state` before clicking. A broken screenshot channel is a bug: report it instead of settling into OCR mode.
+
+## Efficiency tactics (高效战术)
+
+When automating tasks that involve locating a specific object or driving desktop apps (e.g. QQ, WeChat, file managers, settings), apply these efficiency tactics instead of blindly scanning or clicking:
+
+### Search & text input (搜索与输入)
+- **Search before scroll (先搜索再滚动)**: When the target is searchable, click the search box, `type_text` the name or keyword, and press `Return`. Screen-by-screen visual scanning is strictly prohibited when a search field exists.
+- **App search shortcuts (应用级搜索快捷键)**: In desktop apps like QQ/WeChat, press `Ctrl+F` directly to focus the search box instead of hunting for search icons across UI pixels.
+- **Clear-before-type (键入前清空残留)**: Send `Ctrl+A` followed by `Backspace` before typing into any search or text field to clear stale input.
+- **First-result Return (回车直达首选结果)**: Press `Return` immediately after typing a search query to activate the first match without an extra observation round-trip to pick from dropdowns.
+- **Clipboard paste for CJK/long text (剪贴板粘贴长文本与CJK)**: For Chinese, emoji, or strings >20 characters, prefer writing to the clipboard and sending `Ctrl+V` to prevent IME composition desync.
+
+### Keyboard & micro-targets (键盘导航与微小目标)
+- **Keyboard beats pixels (快捷键优于像素查找)**: Always prioritize application hotkeys and standard navigation (`Ctrl+F`, `Ctrl+S`, `Tab`, arrows) over hunting UI coordinates with clicks.
+- **Sub-16px targets via keyboard (微小目标用键盘操作)**: For micro-targets (<16px, e.g. close buttons, expand chevrons), use `Tab` / `Shift+Tab` to move focus and `Space` / `Return` to trigger rather than pixel clicking.
+- **Type-ahead list navigation (焦点前缀键入直达)**: In list views (contacts, file pickers), focus the list and type initial characters to jump directly to matching entries instead of scrolling visually.
+
+### Scrolling discipline (滚动纪律)
+- **Scroll only as fallback (仅在无搜索手段时回退滚动)**: Fall back to scrolling only when no search, filter, or keyboard navigation exists; use large strides (~pane height) and stop immediately once visible.
+- **Pointer anchoring before scroll (滚动前指针锚定)**: Move the mouse pointer inside the target container boundary before issuing `scroll` so wheel events route to the intended pane.
+- **Scroll boundary detection (滚动边界探测)**: Compare consecutive screenshots; when container content stops changing across scrolls, the boundary is reached—halt scrolling immediately.
+
+### Cadence & batching (执行节奏与批处理)
+- **Text-tree observation first (文本树观察优先)**: When the AT-SPI accessibility tree is available (non-empty `accessibility` / `text` in `get_window_state`), prioritize text-tree observation (`include_text: true, include_screenshot: false` — text is opt-in, without `include_text` the tree comes back null) and locate targets via `element_index`. Capture screenshots only when the text tree is absent or ambiguous, or when visual verification is required (e.g. verifying the chat header before sending a message). Text-only observation round-trips are an order of magnitude smaller and faster than screenshots, making this the primary speedup technique.
+- **Batch deterministic sequences (全确定序列单回合批处理)**: Combine fully deterministic sequences (e.g. click search -> clear -> paste -> Return) into one `batch_actions` call; capture screenshots only at visual decision boundaries.
+- **Settle async rendering (异步渲染等待沉淀)**: After triggering network queries or async UI updates (e.g. Electron search results), wait 0.5–1.5s (`waitMs` in `batch_actions`) before the next observation.
+
+### Verification & IM safety (视觉核验与 IM 纪律)
+- **Visual diff verification (行动后视觉差分核实)**: Confirm expected visual changes (cursor focus, tab selection, modal dismissal) in the post-action screenshot; if the screen did not change, the action failed—never assume success.
+- **Tree-diff verification (树差分核验)**: When the accessibility tree is available, verify action outcomes by diffing two text-tree observations instead of capturing a screenshot — which nodes appeared/changed/disappeared is cheaper and less ambiguous than comparing pixels. Reserve screenshot verification for visual-only signals (colors, images, layout) and the IM recipient check.
+- **Wait, don't poll (等待而非轮询)**: When waiting for a UI state (a window opening, search results loading, a contact's chat appearing), prefer the helper-side `computer_use_wait_for` primitive (Linux; waits up to 20s for text/element to appear or disappear without model round-trips) or a single settled re-observation after a `waitMs` pause over repeated screenshot polling — every poll is a model round-trip with an image attached.
+- **IM send discipline (IM 发送与换行纪律)**: In IM clients (QQ/WeChat), `Return` sends the message while `Shift+Return` inserts a line break.
+- **IM recipient double-check (IM 发送前双重核对)**: Electron IM trees can be partial, so before sending always verify the active chat header matches the intended recipient — via the tree when it names the header, otherwise a screenshot.
+
+### Recovery & convergence (脱困与收敛)
+- **Escape from traps (Escape 键脱困)**: Press `Escape` first whenever unexpected popups, autocomplete dropdowns, or context menus trap keyboard focus.
+- **Loop-breaking circuit breaker (防死循环断路器)**: If consecutive screenshots show no progress, do not repeat the same call or coordinates; immediately switch modalities (click -> keyboard, search -> enumeration).
+- **Fast convergence on absence (快速收敛不可行)**: If a target remains unfound after one focused search and one bounded scroll, conclude it does not exist and report back honestly—never click randomly or hallucinate.
 
 ## Reading the accessibility tree
 
@@ -170,6 +231,8 @@ those tools are not registered.
 - Do not spawn `codex-computer-use.exe`: Codex is not required and must not be used.
 - Do not edit or delete shipped DeepSeek Harness presets (`standard`, `cordis`, `minimal`, `ptc`). User presets live under `$DSH_HOME/.agent-presets/`.
 - Do not reconstruct window handles after they may have closed; list again.
+- Do not launch or restart an app without checking `list_windows` first; always activate and reuse an existing window if present.
+- Do not launch GUI applications via bash/shell/terminal commands; use `launch_app` only after confirming no window exists.
 
 Your system prompt carries the always-on session contract, the two-cell loop, recovery, and the complete
 Windows Automation Safety block. The three reference documents above hold everything else — read them from

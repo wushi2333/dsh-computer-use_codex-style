@@ -36,3 +36,13 @@
         # identity + bounds + the human-input monitor. There is deliberately no
         # expiry knob here (PSG-9): the official contract has no such field.
         allowedApps: []
+        # DSH-only, Linux only. On Linux the native helper serves the desktop faces and
+        # no browser catalog, so the sidecar opens the Python engine a second time as a
+        # browser-only channel (it owns the ExtensionHub on 127.0.0.1:8765 that the
+        # Chrome/Edge extension polls). `auto` opens it when the configured surface needs
+        # browser tools (computer/browser/all) and never on Windows, where the Python
+        # engine is the primary and must not be started twice. `off` restores the old
+        # single-engine behaviour; Python then comes up lazily on the first tab_* call.
+        browserChannel: auto
+        # Optional port override for that ExtensionHub (0 = the engine default 8765).
+        extensionPort: 0

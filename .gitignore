@@ -12,6 +12,13 @@ helper-rs/target/
 *.pdb
 *.dSYM/
 
+# --- Linux Rust helper build output (helper-linux/) -----------------------
+# The Linux helper is built from helper-linux/ with the same `cargo build`; only its build
+# cache is ignored. Nothing is committed under bin/ for Linux: the JS side reads
+# helper-linux/target/{release,debug}/dsh-computer-use, so a checkout without a Rust
+# toolchain has no Linux helper until one is built.
+helper-linux/target/
+
 # --- Python engine ---------------------------------------------------------
 __pycache__/
 *.pyc
@@ -37,6 +44,7 @@ analysis/
 # observations.jsonl (facts), pending.jsonl and manual.jsonl. Decision D-1 keeps the store
 # inside the plugin folder, so it must never be committed or packed.
 .experience/
+.cu/
 
 # --- Machine-local app catalog cache (helper runtime state) ----------------
 # The Rust helper keeps the installed-app catalog in

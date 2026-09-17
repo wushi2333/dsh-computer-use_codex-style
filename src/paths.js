@@ -55,6 +55,15 @@ export function nativeHelperCandidates(engineRoot) {
       path.join(shipped, 'dsh-computer-use'),
       path.join(root, 'dsh-computer-use'),
     )
+  } else if (process.platform === 'linux') {
+    const shippedLinux = path.join(root, 'helper-linux', 'bin', `${process.platform}-${process.arch}`)
+    names.push(
+      path.join(root, 'helper-linux', 'target', 'release', 'dsh-computer-use'),
+      path.join(root, 'helper-linux', 'target', 'debug', 'dsh-computer-use'),
+      path.join(shippedLinux, 'dsh-computer-use'),
+      path.join(root, 'helper-linux', 'bin', 'linux-x64', 'dsh-computer-use'),
+      path.join(root, 'dsh-computer-use'),
+    )
   } else {
     names.push(
       path.join(root, 'helper-rs', 'target', 'release', 'dsh-computer-use.exe'),

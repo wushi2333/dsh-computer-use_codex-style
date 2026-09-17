@@ -38,7 +38,7 @@
     "officialEvidence": "0 hits for maxEdge/max_edge/maxImageEdge/imageEdge/1280/1568 across the 19,738-string table",
     "dshExtension": 0,
     "kind": "dsh-extension",
-    "note": "maxImageEdge is a DSH-only downscale on the Python/plugin surface (CW-15). The Rust helper has no such concept. Desktop screenshots must only undergo the official DPI normalisation above. 0 = disabled = official behaviour (decision D-E); a positive value is opt-in token saving."
+    "note": "maxImageEdge is a DSH-only downscale. CW-15 introduced it on the Python/plugin surface; D-E was later revised so it also reaches the desktop Rust path, because the measured pain was a full-resolution 1920x1200 desktop screenshot and the built-in 1920 default never bit (1200 < 1920). It is still never applied by default: 0 or unset changes nothing on any path, and the plugin only exports DSH_COMPUTER_USE_MAX_IMAGE_EDGE when the user explicitly configures a finite positive value. Desktop screenshots still undergo the official DPI normalisation above; 0 = disabled = official behaviour; a positive value is opt-in token saving."
   },
   "windowFilter": {
     "predicateFunction": "FUN_140038342",
@@ -166,6 +166,6 @@
     ],
     "gdiFallbackReason": "Official is WGC-only and fails loudly. DSH keeps GDI fallbacks for availability and surfaces the chosen path in captureState.path so the model can tell a frame may not reflect occlusion.",
     "maxImageEdge": 0,
-    "maxImageEdgeReason": "Python/plugin-only; 0 disables it (official, no cap -- decision D-E); must never be applied to the desktop Rust path."
+    "maxImageEdgeReason": "Never applied by default, on any path: 0 or unset is the official no-cap behaviour (decision D-E, revised -- it previously read \"must never be applied to the desktop Rust path\"). It reaches the desktop Rust path only when the user explicitly configures maxImageEdge > 0, which the plugin carries as the DSH_COMPUTER_USE_MAX_IMAGE_EDGE environment variable because the official helper's argv parser rejects unknown flags."
   }
 }
