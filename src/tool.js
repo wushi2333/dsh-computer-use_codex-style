@@ -13,6 +13,7 @@ import { execFileSync } from 'node:child_process'
 import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { computerUsePrompt, documentationSummary, promptAssetStatus, BROWSER_REQUIRED_FOR } from './prompt.js'
+import { getUiaHost, closeUiaHost } from './uiahost-client.js'
 
 export const name = 'tool-computer-use'
 export const inject = ['tools', 'dshComputerUse', 'systemPrompt']
@@ -291,6 +292,9 @@ async function registerDesktop(ctx, state, config) {
   registerTool(ctx, state, waitUntilTool(ctx, state))
   registerTool(ctx, state, documentsTool(ctx, state))
   registerTool(ctx, state, uiaActTool(ctx, state))
+  // P0-3 / P0-4: read and set tick states through the persistent UIA host.
+  registerTool(ctx, state, readOptionsTool(ctx, state))
+  registerTool(ctx, state, setOptionsTool(ctx, state))
   const exposed = desktops.concat(extras)
   for (const spec of exposed) {
     try {
@@ -1871,6 +1875,89 @@ export function judgeActStep(before, after, ok) {
     }
   }
   return { applied: true }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent-UIA options tools (P0-2/3/4).
+//
+// These go through scripts/uiahost.ps1 (see src/uiahost-client.js) rather than the
+// helper, because the work they do — locating a checkbox by scanning pixels and reading
+// its tick state — is neither a UIA pattern nor a coordinate click the helper can verify.
+// Keeping a PowerShell process alive turns the old 1.5-2 s per read into ~180 ms.
+// ---------------------------------------------------------------------------
+
+/** `computer_use_read_options` — question + per-option {letter, text, checked, x, y}. */
+export function readOptionsTool(ctx, state) {
+  return defineTool({
+    name: 'computer_use_read_options',
+    description:
+      'Read a multiple-choice page: returns the question text and, for each option, its letter, label, '
+      + 'whether it is TICKED, and the real checkbox position. Tick state is read from PIXELS (a tick is a '
+      + 'red square), so it works on WebView2/WMPF pages whose options expose no UIA pattern at all — the '
+      + 'one place where neither element names nor a read of the tree can tell you what is selected. '
+      + 'Runs against the persistent UIA host (≈180 ms, vs 1.5-2 s for a fresh process).',
+    parameters: { window: WIN_PARAM },
+    output: { schema: OUTPUT_SCHEMA, render(_a, v) { return renderValue(v) } },
+    async execute(args) {
+      const win = args && args.window
+      const hwnd = Number(win && win.id)
+      if (!Number.isInteger(hwnd) || hwnd <= 0) throw new Error('window.id is required')
+      const host = getUiaHost()
+      const res = await host.read(hwnd)
+      if (res.ok !== true) throw new Error(String(res.error || 'could not read the page'))
+      return {
+        value: {
+          question: String(res.question || ''),
+          options: Array.isArray(res.options) ? res.options : [],
+          ticked: String(res.ticked || ''),
+          ms: res.ms,
+        },
+      }
+    },
+    isConcurrencySafe() { return false },
+    presentCall(a) { return { card: 'generic', title: 'computer_use_read_options', rawInput: a && typeof a === 'object' ? a : {} } },
+  })
+}
+
+/** `computer_use_set_options` — make the ticked set exactly `target`, verified by re-reading. */
+export function setOptionsTool(ctx, state) {
+  return defineTool({
+    name: 'computer_use_set_options',
+    description:
+      'Make a multiple-choice question\'s ticked options EXACTLY the letters in `target` (e.g. "ACDE"), '
+      + 'then verify by re-reading every tick from pixels. It clicks ONE differing option per round and '
+      + 're-reads the row positions each time, because these pages reflow after every tick — batching a set '
+      + 'of coordinates is what makes this class of page silently wrong. Returns '
+      + '{before, after, target, matched} so success is a fact, not an assumption.',
+    parameters: {
+      window: WIN_PARAM,
+      target: { type: 'string', description: 'The exact set of letters that should be ticked, e.g. "ACDE" (no separators). Use "" to clear all.' },
+    },
+    output: { schema: OUTPUT_SCHEMA, render(_a, v) { return renderValue(v) } },
+    async execute(args) {
+      const win = args && args.window
+      const hwnd = Number(win && win.id)
+      if (!Number.isInteger(hwnd) || hwnd <= 0) throw new Error('window.id is required')
+      const target = String((args && args.target) || '').toUpperCase().replace(/[^A-E]/g, '')
+      const host = getUiaHost()
+      const res = await host.set(hwnd, target)
+      if (res.ok !== true) throw new Error(String(res.error || 'could not set the options'))
+      return {
+        value: {
+          question: String(res.question || ''),
+          before: String(res.before || ''),
+          after: String(res.after || ''),
+          target: String(res.target || target),
+          matched: res.matched === true,
+          rounds: res.rounds,
+          log: Array.isArray(res.log) ? res.log : [],
+          ms: res.ms,
+        },
+      }
+    },
+    isConcurrencySafe() { return false },
+    presentCall(a) { return { card: 'generic', title: 'computer_use_set_options', rawInput: a && typeof a === 'object' ? a : {} } },
+  })
 }
 
 /** `computer_use_uia_act` — act by element name (UIA patterns, then a click fallback), then optionally re-observe. */

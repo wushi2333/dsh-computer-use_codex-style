@@ -187,6 +187,8 @@ flowchart TB
 | `batch_actions` | 开启 | 一次调用执行一串确定性动作，然后做一次 `get_window_state` |
 | `computer_use_health` | 始终 | 后端、允许列表、文档门禁、环境审计 |
 | `computer_use_uia_act` | 开启 | 按**元素名**用 UIA pattern（`SelectionItem`/`Invoke`/`LegacyIAccessible`）操作控件：不需要截图、不需要坐标，因此在 WGC 截不到的静态窗口上也能用；用 `"A、选项|下一题"` 链式多步，返回动作后的文本树。**注意**：若目标是**完全没有任何 pattern 的裸 `Text` 节点**（微信小程序考试选项），兜底点击只代表"点发出去了"，页面可能根本不响应，必须另行验证（见下文 `scripts/uia-ticks.ps1`） |
+| `computer_use_read_options` | 开启 | 读一道多选题：题干 + 每个选项的字母、文本、**是否已勾选**、以及真实勾选框坐标。勾选状态来自**像素**（勾=红方块），所以这是微信小程序/WebView2 这类选项无任何 UIA pattern 的页面上唯一能知道"选中了什么"的手段。由常驻 UIA 服务提供，约 180ms（新起进程要 1.5-2 s） |
+| `computer_use_set_options` | 开启 | 把勾选集合做成**恰好等于** `target`（如 `"ACDE"`），并从像素逐项复核。每轮只点一个差异项、每轮重新定位行（因为这类页面每勾一次就重排）；返回 `{before, after, target, matched}`，成功是事实不是假设 |
 | `computer_use_wait` | 开启 | 固定等待（可选顺带重新观察），不占一次 helper 往返 |
 | `computer_use_wait_until` | 开启 | 轮询到文本出现 / 截图变化 / 超时为止 |
 | `computer_use_scroll_to` | 开启 | 用多次顺序滚轮脉冲滚到底/顶/约百分比（脉冲间 70ms，因为应用会合并快速脉冲） |
