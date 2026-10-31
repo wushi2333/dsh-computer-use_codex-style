@@ -108,9 +108,23 @@ using System;
 using System.Runtime.InteropServices;
 public static class CuMouse {
   [DllImport("user32.dll", SetLastError=true)] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint d, IntPtr e);
   [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+  [DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint n, INPUT[] p, int cb);
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct MOUSEINPUT {
+    public int dx;
+    public int dy;
+    public uint mouseData;
+    public uint dwFlags;
+    public uint time;
+    public UIntPtr dwExtraInfo;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct INPUT {
+    public uint type;
+    public MOUSEINPUT mi;
+  }
 }
 "@ -ErrorAction SilentlyContinue
 
@@ -118,15 +132,35 @@ public static class CuMouse {
 # = 0x4453_4855_0000_0001) on the injected events. The helper's low-level mouse hook
 # compares dwExtraInfo against that tag and skips its "a human touched this window"
 # bookkeeping, so a computer_use_uia_act click no longer poisons the observation lease.
-$SyntheticTag = [IntPtr]::new([int64]0x4453485500000001)
+#
+# SendInput is used rather than the legacy mouse_event: measured live, a mouse_event
+# click still reached the hook with an untagged dwExtraInfo (health showed
+# inputMonitor.generation bumping to 1 with every mouse-down injected), which left the
+# window permanently flagged as "user input detected" on pages Windows Graphics Capture
+# cannot frame — the exact deadlock P1-4 was meant to remove.
+$SyntheticTag = [UIntPtr]::new([uint64]0x4453485500000001)
+$MOUSEEVENTF_LEFTDOWN = 0x0002
+$MOUSEEVENTF_LEFTUP = 0x0004
+$INPUT_MOUSE = 0
 
 function Click-At([int]$x, [int]$y) {
   $p = New-Object CuMouse+POINT
   [void][CuMouse]::GetCursorPos([ref]$p)
   [void][CuMouse]::SetCursorPos($x, $y)
   Start-Sleep -Milliseconds 40
-  [CuMouse]::mouse_event(0x0002, 0, 0, 0, $SyntheticTag)   # LEFT DOWN
-  [CuMouse]::mouse_event(0x0004, 0, 0, 0, $SyntheticTag)   # LEFT UP
+  $events = New-Object 'CuMouse+INPUT[]' 2
+  for ($i = 0; $i -lt 2; $i++) {
+    $events[$i].type = $INPUT_MOUSE
+    $events[$i].mi.dx = 0
+    $events[$i].mi.dy = 0
+    $events[$i].mi.mouseData = 0
+    $events[$i].mi.time = 0
+    $events[$i].mi.dwExtraInfo = $SyntheticTag
+  }
+  $events[0].mi.dwFlags = $MOUSEEVENTF_LEFTDOWN
+  $events[1].mi.dwFlags = $MOUSEEVENTF_LEFTUP
+  $sent = [CuMouse]::SendInput(2, $events, [System.Runtime.InteropServices.Marshal]::SizeOf($events[0]))
+  if ($sent -lt 2) { Write-Verbose "SendInput sent $sent of 2 events" }
   Start-Sleep -Milliseconds 40
   [void][CuMouse]::SetCursorPos($p.X, $p.Y)                 # leave the pointer where it was
 }
