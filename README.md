@@ -442,6 +442,8 @@ Two related behaviours from the same pass:
 
 A window **larger than the desktop** can never be composited. The capture helper reports both the screen and the window rectangles, so the guidance states that outright instead of leaving you to guess; resize the window to fit the screen.
 
+A window that is **covered by another window** fails the same way — the helper refuses to hand over pixels that belong to the covering window. The same ladder runs: the target is activated first, then re-captured; if it is still covered, `PrintWindow` renders the target's *own* surface (verified on a covered 782x735 window), so the observation succeeds as `path: "wgc-after-activate"` or `path: "gdi-printwindow"` instead of failing.
+
 ---
 
 ## License and attribution
