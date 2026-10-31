@@ -14,6 +14,7 @@ import {
   captureGuidance,
   frameObservation,
   friendlyActionError,
+  parseJsonLine,
   recallFrame,
   rememberFrame,
   runBatchActions,
@@ -227,4 +228,31 @@ test('P3-8 a closed window clears the cached observation', () => {
 
 test('P3-8 an unrecognised short message is left to the caller', () => {
   assert.equal(friendlyActionError({}, {}, 'click requires x'), null)
+})
+
+test('P0-1 captureGuidance names the covered-window recovery too', () => {
+  const covered = captureGuidance({ path: 'wgc-after-activate' })
+  assert.match(covered, /covering the target/)
+  assert.match(covered, /Call activate_window before observing/)
+})
+
+// ---------------------------------------------------------------------------
+// Script stdout: a failing helper script still printed its verdict
+// ---------------------------------------------------------------------------
+
+test('parseJsonLine reads the verdict a failing helper script printed before exiting', () => {
+  // Verified live: `uia-act.ps1` prints this and exits 2, so execFileSync throws and
+  // the payload only survives on error.stdout.
+  const stdout = 'PS noise\n{"ok":false,"error":"no element matching 这个控件不存在xyz"}\n'
+  const parsed = parseJsonLine(stdout)
+  assert.equal(parsed.ok, false)
+  assert.match(parsed.error, /no element matching/)
+})
+
+test('parseJsonLine tolerates non-JSON and empty output', () => {
+  assert.equal(parseJsonLine(''), null)
+  assert.equal(parseJsonLine(undefined), null)
+  assert.equal(parseJsonLine('just text\nno braces'), null)
+  assert.equal(parseJsonLine('{"broken":'), null)
+  assert.deepEqual(parseJsonLine('{"ok":true,"width":782}'), { ok: true, width: 782 })
 })

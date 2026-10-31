@@ -744,21 +744,30 @@ export function runCaptureScript(hwnd, options = {}) {
   const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', GDI_CAPTURE_SCRIPT, '-Hwnd', String(hwnd)]
   if (options.nudgeOnly) args.push('-NudgeOnly')
   else if (options.outPath) args.push('-OutPath', String(options.outPath))
-  const parse = (text) => {
-    const line = String(text || '').split(/\r?\n/).find((l) => l.trim().startsWith('{'))
-    if (!line) return null
-    try { return JSON.parse(line) } catch { return null }
-  }
   try {
     const raw = execFileSync('powershell.exe', args, {
       encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024,
     })
-    return parse(raw) || { ok: false, error: String(raw || '').trim() || 'no output' }
+    return parseJsonLine(raw) || { ok: false, error: String(raw || '').trim() || 'no output' }
   } catch (error) {
-    const parsed = parse(error && error.stdout)
-    if (parsed) return parsed
-    return { ok: false, error: String(error && error.message ? error.message : error) }
+    return parseJsonLine(error && error.stdout)
+      || { ok: false, error: String(error && error.message ? error.message : error) }
   }
+}
+
+/**
+ * Parse the single JSON line a helper script prints.
+ *
+ * `gdi-capture.ps1` and `uia-act.ps1` both print their verdict as one JSON line and
+ * THEN exit non-zero on failure, so `execFileSync` throws with the payload sitting on
+ * `error.stdout`. Reading only `error.message` threw that away and surfaced
+ * `Command failed: powershell.exe …` instead of "no element matching …", which is the
+ * one sentence the model needs to fix its call.
+ */
+export function parseJsonLine(text) {
+  const line = String(text || '').split(/\r?\n/).find((l) => l.trim().startsWith('{'))
+  if (!line) return null
+  try { return JSON.parse(line) } catch { return null }
 }
 
 /** Force a repaint so the helper's own WGC capture session can produce a frame. */
@@ -928,6 +937,10 @@ export function captureGuidance(degraded) {
   const oversize = Boolean(geometry && geometry.oversize)
   const screen = geometry && geometry.screen ? ` (screen ${geometry.screen.width}x${geometry.screen.height})` : ''
   const win = geometry && geometry.window ? ` window ${geometry.window.width}x${geometry.window.height}` : ''
+  if (degraded && degraded.path === 'wgc-after-activate') {
+    return 'Another window was covering the target, so Windows Graphics Capture had no trustworthy pixels. The target was activated and captured again — that frame is valid, and coordinates work. '
+      + 'Call activate_window before observing a background window to skip this round trip.'
+  }
   if (degraded && degraded.path === 'wgc-after-nudge') {
     return 'Static window: the capture needed a 1 px repaint nudge and then succeeded, so coordinates are valid. The window is now nudged before each observation automatically.'
   }
@@ -1368,6 +1381,10 @@ export function uiaActFallback(hwnd, name, action) {
     const line = raw.split(/\r?\n/).find((l) => l.trim().startsWith('{'))
     return line ? JSON.parse(line) : { ok: false, error: raw || 'no output' }
   } catch (err) {
+    // The script prints its verdict and THEN exits 2/3, so the payload is on stdout;
+    // err.message alone is `Command failed: powershell.exe …` and loses the reason.
+    const parsed = parseJsonLine(err && err.stdout)
+    if (parsed) return parsed
     return { ok: false, error: String(err && err.message ? err.message : err) }
   }
 }
@@ -1936,15 +1953,28 @@ function makeSidecarTool(ctx, spec, config, state, options) {
             result = await attempt()
           } catch (thrown) {
             const thrownMsg = thrown && thrown.message ? thrown.message : String(thrown)
-            if (spec.name === 'get_window_state' && /capture timed out|window capture timed out/i.test(thrownMsg)) {
-              // P0-1: WGC only frames a window that repaints, so a static page always
-              // times out. Degrade instead of failing the whole observation:
-              // nudge→retry (keeps the helper's own frame), then PrintWindow, then the
-              // last good frame flagged stale, then text-only as before.
+            // `covered by another window` is the same class of failure as a timeout: the
+            // helper refuses to hand over pixels that belong to a covering window, so the
+            // observation would die with no frame. PrintWindow renders the TARGET's own
+            // surface (verified: a covered 782x735 window yields a 71 KB PNG), so it is a
+            // valid recovery here too.
+            const timedOut = /capture timed out|window capture timed out/i.test(thrownMsg)
+            const covered = /covered by another window|no trustworthy frame/i.test(thrownMsg)
+            if (spec.name === 'get_window_state' && (timedOut || covered)) {
+              // P0-1: degrade instead of failing the whole observation:
+              // nudge (+ activate when the window was covered) → retry keeps the helper's
+              // own frame; then PrintWindow; then the last good frame; then text-only.
               captureFailed = true
+              const retry = async () => {
+                if (covered && input && input.window) {
+                  try { await ctx.dshComputerUse.call('activate_window', { window: input.window }, exec.signal, turnMeta) } catch { /* retry reports it */ }
+                }
+                return attempt()
+              }
               const degraded = wantShot
-                ? await captureFallback(state, hwndForCapture, attempt)
+                ? await captureFallback(state, hwndForCapture, retry)
                 : { result: null, path: null, stale: false, geometry: null }
+              if (degraded.path === 'wgc-after-nudge' && covered) degraded.path = 'wgc-after-activate'
               captureDegraded = degraded
               if (degraded.result) result = degraded.result
               else result = { ok: true, value: { accessibility: null }, images: [] }
