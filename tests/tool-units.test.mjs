@@ -344,7 +344,9 @@ test('a viewer that ignores both wheel and keys reports the stall instead of lyi
   )
   assert.equal(out.page.from, 4)
   assert.equal(out.page.to, 4)
-  assert.equal(out.page.key, null)
+  assert.equal(out.page.key, 'none')
+  assert.equal(out.moved, 'none')
+  assert.match(String(out.guidance), /computer_use_uia_act/)
   // It tried Page_Down, Right and Next, then gave up: 3 keys × (10-4+1) presses.
   assert.equal(calls.filter(c => c.name === 'press_key').length, 21)
   // …then it swept: one horizontal swipe per remaining page, and reported the stall.
