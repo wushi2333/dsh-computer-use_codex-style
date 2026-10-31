@@ -1027,15 +1027,15 @@ export function readPageIndicator(hwnd) {
  *
  * @returns {Promise<{from: number, to: number, total: number, key: string|null}>}
  */
-async function pageThroughByKeys(ctx, win, start, exec, turnMeta, probe) {
+async function pageThroughByKeys(ctx, win, start, exec, turnMeta, probe, opts = {}) {
   const hwnd = Number(win && win.id)
   const out = { from: start.current, to: start.current, total: start.total, key: null }
   const gap = () => new Promise((resolve) => setTimeout(resolve, 90))
+  const budget = () => Math.min(start.total - start.current + 1, 40)
   for (const key of ['Page_Down', 'Right', 'Next']) {
     let cur = out.to
     let moved = 0
-    const budget = Math.min(start.total - start.current + 1, 40)
-    for (let i = 0; i < budget; i += 1) {
+    for (let i = 0; i < budget(); i += 1) {
       try {
         await ctx.dshComputerUse.call('press_key', { window: win, key }, exec.signal, turnMeta)
       } catch {
@@ -1052,7 +1052,42 @@ async function pageThroughByKeys(ctx, win, start, exec, turnMeta, probe) {
       }
       if (now.current >= now.total) break
     }
-    if (moved > 0) break
+    if (moved > 0 || out.to >= out.total) return out
+  }
+  // Last resort: a horizontal SWIPE. Measured on the moxueyuan image gallery, the wheel
+  // and Page_Down/Right/Next are all ignored, but a left drag advances exactly one image
+  // (2/10 -> 3/10). Galleries and carousels are drag-driven, not keyboard-driven.
+  const w = Number(opts.width) > 0 ? Number(opts.width) : 784
+  const h = Number(opts.height) > 0 ? Number(opts.height) : 1628
+  const cy = Number.isFinite(opts.y) ? opts.y : Math.round(h / 2)
+  const forward = opts.direction !== 'top'
+  const leftX = Math.round(w * 0.78)
+  const rightX = Math.round(w * 0.2)
+  const fromX = forward ? leftX : rightX
+  const toX = forward ? rightX : leftX
+  let cur = out.to
+  for (let i = 0; i < budget(); i += 1) {
+    try {
+      await ctx.dshComputerUse.call(
+        'drag',
+        { window: win, from_x: fromX, from_y: cy, to_x: toX, to_y: cy },
+        exec.signal,
+        turnMeta,
+      )
+    } catch {
+      break
+    }
+    await gap()
+    const now = probe(hwnd)
+    if (!now) break
+    const advanced = forward ? now.current > cur : now.current < cur
+    if (advanced) {
+      cur = now.current
+      out.key = 'swipe'
+      out.to = cur
+    }
+    const done = forward ? now.current >= now.total : now.current <= 1
+    if (done) break
   }
   return out
 }
@@ -1117,13 +1152,19 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps, probe = 
   // gallery ignored 52 pulses and stayed at 4/10. If the window exposes a page counter
   // and the wheel left it short of the last page, drive the pager with keys instead.
   const hwnd = Number(win && win.id)
-  if (to === 'bottom' && done >= 2 && Number.isInteger(hwnd)) {
+  const atTargetEnd = (ind) => (to === 'bottom' ? ind.current >= ind.total : ind.current <= 1)
+  if (done >= 2 && Number.isInteger(hwnd)) {
     let ind = null
     try { ind = probe(hwnd) } catch { ind = null }
-    if (ind && ind.current < ind.total) {
-      const paged = await pageThroughByKeys(ctx, win, ind, exec, turnMeta, probe)
+    if (ind && !atTargetEnd(ind)) {
+      const paged = await pageThroughByKeys(ctx, win, ind, exec, turnMeta, probe, {
+        width: Number(state && state.lastShotMeta && state.lastShotMeta.width) || undefined,
+        height: Number(state && state.lastShotMeta && state.lastShotMeta.height) || undefined,
+        y,
+        direction: to,
+      })
       result.page = { ...paged, wheelStoppedAt: ind.current }
-      result.stepsDoneByKey = paged.to - paged.from
+      result.stepsDoneByKey = to === 'bottom' ? paged.to - paged.from : paged.from - paged.to
     } else if (ind) {
       result.page = { from: ind.current, to: ind.current, total: ind.total, key: null, wheelStoppedAt: ind.current }
     }

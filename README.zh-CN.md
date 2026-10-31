@@ -430,7 +430,7 @@ DSH官方的Computer Use采用设计思路不大一致。如果希望使用Codex
 
 - `batch_actions` 现在由插件**逐步执行**，而不是一整个丢给 helper：每一步的 `shot-N` 截图 id 都像顶层调用一样翻译；连续两个坐标动作之间会补一次"只带截图"的观察；遇到 `user input was detected in this window` 会先补观察再重试这一步，而不是整批中止。
 - `computer_use_uia_act` 的点击兜底（给没有任何 UIA pattern 的节点）在注入事件上打了 helper 的 `SYNTHETIC_TAG`（`dwExtraInfo`），所以它自己的点击不会再被当成"人工输入"。
-- `computer_use_scroll_to` / `computer_use_reach_last_page` 不再只信滚轮：滚完之后读窗口的「当前/总页」指示（PDF `2/13`、图集 `4/10`），如果还没到最后就改用 `Page_Down` → `Right` → `Next` 翻页，每按一次都回读页码。图集预览**完全不响应滚轮**（实测 52 个脉冲后仍是 `4/10`），靠这条才能真正"一把到底"。`value.page` 会报 `{from, to, total, key, wheelStoppedAt}`。
+- `computer_use_scroll_to` / `computer_use_reach_last_page` 不再只信滚轮：滚完之后读窗口的「当前/总页」指示（PDF `2/13`、图集 `4/10`），如果还没到最后就依次尝试 `Page_Down` → `Right` → `Next`，**最后是横向 swipe（拖拽）**，每次尝试后都回读页码。图集类页面既不吃滚轮也不吃键盘（实测 52 个滚轮脉冲仍停在 `4/10`，三个键全是空响，而一次向左拖拽就 `2/10 → 3/10`），靠这条才能真正"一把到底"。`value.page` 会报 `{from, to, total, key: "Page_Down"|"Right"|"Next"|"swipe"|null, wheelStoppedAt}`。
 
 另外，**比桌面还大**的窗口永远合成不了。捕获脚本会同时报出屏幕与窗口矩形，所以提示会**直接说明**这件事，并把窗口缩到屏幕内即可。
 

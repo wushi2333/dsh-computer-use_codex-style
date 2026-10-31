@@ -347,4 +347,31 @@ test('a viewer that ignores both wheel and keys reports the stall instead of lyi
   assert.equal(out.page.key, null)
   // It tried Page_Down, Right and Next, then gave up: 3 keys × (10-4+1) presses.
   assert.equal(calls.filter(c => c.name === 'press_key').length, 21)
+  // …then it swept: one horizontal swipe per remaining page, and reported the stall.
+  assert.equal(calls.filter(c => c.name === 'drag').length, 7)
+})
+
+test('a gallery that ignores wheel and keys is paged by swipe', async () => {
+  // Measured live: moxueyuan's image preview moved 2/10 -> 3/10 only after a left drag.
+  let page = 4
+  const { ctx, calls } = fakeSidecar({
+    scroll: { ok: true },
+    press_key: { ok: true },
+    drag: () => { page = Math.min(page + 1, 10); return { ok: true } },
+  })
+  const out = await runScrollTo(
+    ctx,
+    { shotMap: new Map() },
+    { window: { app: 'a', id: 7 }, steps: 2 },
+    {},
+    12,
+    () => ({ current: page, total: 10 }),
+  )
+  assert.equal(out.page.from, 4)
+  assert.equal(out.page.to, 10)
+  assert.equal(out.page.key, 'swipe')
+  assert.equal(out.stepsDoneByKey, 6)
+  // Three key strategies × 7 presses each found nothing; the six swipes did the work.
+  assert.equal(calls.filter(c => c.name === 'press_key').length, 21)
+  assert.equal(calls.filter(c => c.name === 'drag').length, 6)
 })
