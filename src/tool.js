@@ -942,7 +942,20 @@ export async function observeWithLadder(ctx, state, exec, turnMeta, window, opti
   const params = { window, include_screenshot: true, include_text: Boolean(options.include_text) }
   const attempt = () => ctx.dshComputerUse.call('get_window_state', params, exec.signal, turnMeta)
   try {
-    return await attempt()
+    const first = await attempt()
+    // `wait` / `wait_until` have no tool spec, so they cannot run the approval retry
+    // makeSidecarTool performs. Returning the refusal as if it were an observation is
+    // the worst outcome (measured: wait(observe:true) handed back an approvalRequest as
+    // its "observation"), so turn it into one actionable sentence instead.
+    if (first && first.approvalRequest) {
+      const app = String(first.approvalRequest.app || (window && window.app) || '')
+      throw new Error(
+        `this tool needs ${app || 'the target app'} approved before it can observe. `
+        + 'Call get_window_state once for this window — that runs the approval flow (a full-access '
+        + 'session grants it automatically) — then retry this call.',
+      )
+    }
+    return first
   } catch (thrown) {
     const msg = String(thrown && thrown.message ? thrown.message : thrown)
     if (!/capture timed out|window capture timed out|covered by another window|no trustworthy frame/i.test(msg)) throw thrown
