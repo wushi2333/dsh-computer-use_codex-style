@@ -977,7 +977,87 @@ export function collectDocumentUrls(nodes) {
 }
 
 /** Shared sequential-scroll loop for scroll_to / reach_last_page. */
-export async function runScrollTo(ctx, state, args, exec, defaultSteps) {
+/**
+ * Read a "current/total" page indicator out of a window's UIA text.
+ *
+ * `scroll_to` / `reach_last_page` are wheel-driven, but wheel is not universal: the
+ * moxueyuan image gallery (`/image/preview?...img-1.jpg…img-10.jpg`) ignores it
+ * completely — 52 pulses ran and the indicator stayed at `4/10`. A page counter is the
+ * cheap universal signal that paging has NOT happened, and it is present in exactly
+ * those viewers (PDF `2/13`, gallery `4/10`, slide decks).
+ *
+ * Candidates inside a longer slash run (a URL such as `…/2026/01/12/…`) are rejected:
+ * the match must not be preceded or followed by a digit or another slash.
+ *
+ * @param {string} text any text (usually the UIA fallback tree dump)
+ * @returns {{current: number, total: number}|null} the widest plausible indicator
+ */
+export function parsePageIndicator(text) {
+  const src = String(text || '')
+  let best = null
+  for (const m of src.matchAll(/(^|[^\d/])(\d{1,3})\s*\/\s*(\d{1,3})(?![\d/])/g)) {
+    const current = Number(m[2])
+    const total = Number(m[3])
+    if (!Number.isFinite(current) || !Number.isFinite(total)) continue
+    if (total < 2 || total > 999 || current < 1 || current > total) continue
+    if (!best || total > best.total) best = { current, total }
+  }
+  return best
+}
+
+/** Ask the window for its page indicator via the .NET UIA walk (best effort, ~150 ms). */
+export function readPageIndicator(hwnd) {
+  if (!Number.isInteger(hwnd) || hwnd <= 0) return null
+  try {
+    const nodes = uiaTreeFallback(hwnd, 600)
+    if (!Array.isArray(nodes) || nodes.length === 0) return null
+    const text = nodes.map(n => [n.name, n.value].filter(Boolean).join(' ')).join('\n')
+    return parsePageIndicator(text)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Drive pagination with keys when the wheel did not move the page counter.
+ *
+ * Tries the document-friendly key first, then the arrow key most galleries bind, and
+ * re-reads the indicator after every press so it stops as soon as the counter reaches
+ * the last page (or the viewer stops responding).
+ *
+ * @returns {Promise<{from: number, to: number, total: number, key: string|null}>}
+ */
+async function pageThroughByKeys(ctx, win, start, exec, turnMeta, probe) {
+  const hwnd = Number(win && win.id)
+  const out = { from: start.current, to: start.current, total: start.total, key: null }
+  const gap = () => new Promise((resolve) => setTimeout(resolve, 90))
+  for (const key of ['Page_Down', 'Right', 'Next']) {
+    let cur = out.to
+    let moved = 0
+    const budget = Math.min(start.total - start.current + 1, 40)
+    for (let i = 0; i < budget; i += 1) {
+      try {
+        await ctx.dshComputerUse.call('press_key', { window: win, key }, exec.signal, turnMeta)
+      } catch {
+        break
+      }
+      await gap()
+      const now = probe(hwnd)
+      if (!now) break
+      if (now.current > cur) {
+        moved += 1
+        cur = now.current
+        out.key = key
+        out.to = cur
+      }
+      if (now.current >= now.total) break
+    }
+    if (moved > 0) break
+  }
+  return out
+}
+
+export async function runScrollTo(ctx, state, args, exec, defaultSteps, probe = readPageIndicator) {
   const win = args && args.window
   const percent = args && args.percent !== undefined ? Math.min(Math.max(Number(args.percent) || 0, 0), 100) : null
   const to = percent !== null ? (percent >= 50 ? 'bottom' : 'top') : (args.to === 'top' ? 'top' : 'bottom')
@@ -1032,7 +1112,23 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps) {
     // tight loop only moves a handful of pages. A short gap lets each pulse register.
     if (i + 1 < steps) await new Promise((resolve) => setTimeout(resolve, 70))
   }
-  return { tool: 'computer_use_scroll_to', to, percent, stepsDone: done, perStep, at: { x, y } }
+  const result = { tool: 'computer_use_scroll_to', to, percent, stepsDone: done, perStep, at: { x, y } }
+  // Wheel-only paging is not universal (see parsePageIndicator): the moxueyuan image
+  // gallery ignored 52 pulses and stayed at 4/10. If the window exposes a page counter
+  // and the wheel left it short of the last page, drive the pager with keys instead.
+  const hwnd = Number(win && win.id)
+  if (to === 'bottom' && done >= 2 && Number.isInteger(hwnd)) {
+    let ind = null
+    try { ind = probe(hwnd) } catch { ind = null }
+    if (ind && ind.current < ind.total) {
+      const paged = await pageThroughByKeys(ctx, win, ind, exec, turnMeta, probe)
+      result.page = { ...paged, wheelStoppedAt: ind.current }
+      result.stepsDoneByKey = paged.to - paged.from
+    } else if (ind) {
+      result.page = { from: ind.current, to: ind.current, total: ind.total, key: null, wheelStoppedAt: ind.current }
+    }
+  }
+  return result
 }
 
 export function scrollToTool(ctx, state) {

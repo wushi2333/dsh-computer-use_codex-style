@@ -15,6 +15,7 @@ import {
   frameObservation,
   friendlyActionError,
   parseJsonLine,
+  parsePageIndicator,
   recallFrame,
   rememberFrame,
   runBatchActions,
@@ -272,7 +273,7 @@ test('runScrollTo clears the input monitor and retries a refused wheel', async (
     clear_user_input: { cleared: true },
     get_window_state: { ok: true, value: { accessibility: null, screenshots: [{ id: 'screenshot-0', width: 784, height: 1628 }] } },
   })
-  const out = await runScrollTo(ctx, { shotMap: new Map() }, { window: { app: 'a', id: 1 }, steps: 2, delta: 1000 }, {}, 12)
+  const out = await runScrollTo(ctx, { shotMap: new Map() }, { window: { app: 'a', id: 1 }, steps: 2, delta: 1000 }, {}, 12, () => null)
   assert.equal(out.stepsDone, 2)
   const order = calls.map(c => c.name)
   assert.deepEqual(order.slice(0, 3), ['scroll', 'clear_user_input', 'get_window_state'])
@@ -287,7 +288,63 @@ test('runScrollTo still self-heals stale viewport geometry', async () => {
       return { ok: true }
     },
   })
-  const out = await runScrollTo(ctx, { shotMap: new Map() }, { window: { app: 'a', id: 1 }, steps: 1 }, {}, 12)
+  const out = await runScrollTo(ctx, { shotMap: new Map() }, { window: { app: 'a', id: 1 }, steps: 1 }, {}, 12, () => null)
   assert.equal(out.stepsDone, 1)
   assert.deepEqual(out.at, { x: 384, y: 806 })
+})
+
+// ---------------------------------------------------------------------------
+// Wheel does not page a gallery: fall back to keys, driven by the page counter
+// ---------------------------------------------------------------------------
+
+test('parsePageIndicator reads 4/10 and 2/13 but ignores URL date runs', () => {
+  assert.deepEqual(parsePageIndicator('Text 4/10 {x:380}'), { current: 4, total: 10 })
+  assert.deepEqual(parsePageIndicator('ListItem 2/13'), { current: 2, total: 13 })
+  assert.equal(parsePageIndicator('https://cos-cdn/doc/uploads/2026/01/12/x.jpg'), null)
+  assert.equal(parsePageIndicator('img-1.jpg img-2.jpg img-10.jpg'), null)
+  assert.equal(parsePageIndicator('0/10'), null)
+  assert.equal(parsePageIndicator('99/10'), null)
+  assert.equal(parsePageIndicator(''), null)
+  // The widest plausible counter wins when the tree mentions several.
+  assert.deepEqual(parsePageIndicator('Text 1/3\nText 4/10'), { current: 4, total: 10 })
+})
+
+test('a gallery that ignores the wheel is paged with keys until the last page', async () => {
+  let page = 4
+  const { ctx, calls } = fakeSidecar({
+    scroll: { ok: true },
+    press_key: () => { page = Math.min(page + 1, 10); return { ok: true } },
+  })
+  const out = await runScrollTo(
+    ctx,
+    { shotMap: new Map() },
+    { window: { app: 'a', id: 7 }, steps: 3, delta: 4000 },
+    {},
+    12,
+    () => ({ current: page, total: 10 }),
+  )
+  assert.equal(out.stepsDone, 3)
+  assert.equal(out.page.from, 4)
+  assert.equal(out.page.to, 10)
+  assert.equal(out.page.total, 10)
+  assert.equal(out.page.key, 'Page_Down')
+  assert.equal(out.stepsDoneByKey, 6)
+  assert.equal(calls.filter(c => c.name === 'press_key').length, 6)
+})
+
+test('a viewer that ignores both wheel and keys reports the stall instead of lying', async () => {
+  const { ctx, calls } = fakeSidecar({ scroll: { ok: true }, press_key: { ok: true } })
+  const out = await runScrollTo(
+    ctx,
+    { shotMap: new Map() },
+    { window: { app: 'a', id: 7 }, steps: 2 },
+    {},
+    12,
+    () => ({ current: 4, total: 10 }),
+  )
+  assert.equal(out.page.from, 4)
+  assert.equal(out.page.to, 4)
+  assert.equal(out.page.key, null)
+  // It tried Page_Down, Right and Next, then gave up: 3 keys × (10-4+1) presses.
+  assert.equal(calls.filter(c => c.name === 'press_key').length, 21)
 })
