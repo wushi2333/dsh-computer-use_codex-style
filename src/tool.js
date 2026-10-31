@@ -485,12 +485,7 @@ function waitTool(ctx, state) {
       const out = { waitedMs: ms }
       if (args?.observe && args?.window) {
         const turnMeta = turnMetaFor(ctx.dshComputerUse, exec)
-        const res = await ctx.dshComputerUse.call(
-          'get_window_state',
-          { window: args.window, include_screenshot: true, include_text: Boolean(args.include_text) },
-          exec.signal,
-          turnMeta,
-        )
+        const res = await observeWithLadder(ctx, state, exec, turnMeta, args.window, { include_text: Boolean(args.include_text) })
         if (res && res.ok === false && res.error) throw new Error(String(res.error))
         const value = res && res.value !== undefined ? res.value : res
         if (value?.accessibility?.tree) {
@@ -931,6 +926,42 @@ export async function captureFallback(state, hwnd, retry) {
   return { result: null, path: null, stale: false, geometry, error: 'capture timed out and no frame could be recovered' }
 }
 
+/**
+ * Observe through the capture-degradation ladder.
+ *
+ * The plugin's own helpers (`computer_use_wait`, `computer_use_wait_until`, the paging
+ * probe) used to call `get_window_state` directly, so they failed with
+ * `window capture timed out` on exactly the windows `makeSidecarTool` had learned to
+ * recover (static page, bigger than the desktop, covered). This wraps the same
+ * nudge→PrintWindow→stale-frame ladder around them.
+ *
+ * @returns {Promise<object>} the sidecar result (a degraded frame when the live capture failed)
+ */
+export async function observeWithLadder(ctx, state, exec, turnMeta, window, options = {}) {
+  const hwnd = Number(window && window.id)
+  const params = { window, include_screenshot: true, include_text: Boolean(options.include_text) }
+  const attempt = () => ctx.dshComputerUse.call('get_window_state', params, exec.signal, turnMeta)
+  try {
+    return await attempt()
+  } catch (thrown) {
+    const msg = String(thrown && thrown.message ? thrown.message : thrown)
+    if (!/capture timed out|window capture timed out|covered by another window|no trustworthy frame/i.test(msg)) throw thrown
+    const degraded = await captureFallback(state, hwnd, attempt)
+    if (!degraded.result) throw thrown
+    const value = degraded.result.value && typeof degraded.result.value === 'object' ? degraded.result.value : {}
+    degraded.result.value = value
+    if (!value.capture) {
+      value.capture = {
+        failed: true,
+        path: degraded.path,
+        stale: Boolean(degraded.stale),
+        guidance: captureGuidance(degraded),
+      }
+    }
+    return degraded.result
+  }
+}
+
 /** The sentence that explains a degraded capture, including an oversize window (P2-7). */
 export function captureGuidance(degraded) {
   const geometry = degraded && degraded.geometry ? degraded.geometry : null
@@ -1277,10 +1308,9 @@ export function waitUntilTool(ctx, state) {
         if (wantChange) {
           // Need a screenshot hash; text (if also asked) comes from the fallback for
           // Chromium hosts, so only ask the helper for text on non-Chromium windows.
-          const res = await ctx.dshComputerUse.call(
-            'get_window_state',
-            { window: win, include_screenshot: true, include_text: wantText && !chromium },
-            exec.signal, turnMeta,
+          const res = await observeWithLadder(
+            ctx, state, exec, turnMeta, win,
+            { include_text: wantText && !chromium },
           )
           val = res && res.value !== undefined ? res.value : res
           const img = (res && Array.isArray(res.images) ? res.images : [])[0]
