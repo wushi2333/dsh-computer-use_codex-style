@@ -702,6 +702,13 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
             state.lock().map_err(|_| Error::other("state lock"))?.require_fresh()?;
             fill_form(state, params)
         }
+        // DSH extension: satisfy the "call get_window_state before continuing" contract
+        // without paying for a capture. The plugin uses it to un-wedge the human-input
+        // monitor on windows Windows Graphics Capture can never frame.
+        "clear_user_input" => {
+            crate::interrupt::clear();
+            Ok(json!({ "cleared": true }))
+        }
         "start_audio_recording" => {
             let duration = StartAudioRecordingParams::from_map(params)?.duration_ms()?;
             audio::start(duration)?;
@@ -1163,6 +1170,15 @@ fn get_window_state(state: &Mutex<HelperState>, params: &Map<String, Value>) -> 
     let window = resolve_window(state, params)?;
     let hwnd = hwnd_from_id(window.id);
     require_observable_window(hwnd)?;
+    // An observation request satisfies the "call get_window_state before continuing"
+    // contract, so it must clear the human-input flag HERE — before the capture can
+    // fail. It used to be cleared only in `remember_capture`, i.e. after a successful
+    // frame, which meant a window Windows Graphics Capture can never frame (static
+    // page, window larger than the desktop, covered window) kept the flag forever and
+    // every later click/scroll answered "user input was detected in this window" with
+    // no way out. Measured on the moxueyuan PDF chapter page: dirty stayed true through
+    // a text-only and a screenshot observation, and scroll_to could not run at all.
+    crate::interrupt::clear();
     overlay::exclude_overlay_from_capture();
     for h in overlay::hwnds() {
         capture::register_overlay_hwnd(h);

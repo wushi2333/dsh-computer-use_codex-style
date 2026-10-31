@@ -354,6 +354,9 @@ const NATIVE_CALLS = new Set([
   // Python" assertion holds.)
   'start_audio_recording',
   'stop_audio_recording',
+  // DSH extension (helper-rs/src/main.rs): clear the human-input monitor without a
+  // capture. Not listed here it would fall through to the Python catalog and fail.
+  'clear_user_input',
   'observe',
   'type',
   'keypress',

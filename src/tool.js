@@ -988,22 +988,43 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps) {
   let y = Number.isFinite(args.y) ? args.y : Math.round(((meta && meta.height) || 600) / 2) + (Number.isFinite(meta && meta.originY) ? meta.originY : 0)
   const turnMeta = turnMetaFor(ctx.dshComputerUse, exec)
   let done = 0
+  const sendScroll = () => ctx.dshComputerUse.call('scroll', { window: win, x, y, scrollX: 0, scrollY: perStep }, exec.signal, turnMeta)
   for (let i = 0; i < steps; i += 1) {
     let r
     try {
-      r = await ctx.dshComputerUse.call('scroll', { window: win, x, y, scrollX: 0, scrollY: perStep }, exec.signal, turnMeta)
+      r = await sendScroll()
     } catch (err) {
-      // The cached screenshot geometry can predate a resize/maximise (stale centre →
-      // "point … is outside viewport { originX, originY, width, height }"). The error
-      // carries the live viewport, so re-centre from it and retry once.
       const msg = String(err && err.message ? err.message : err)
-      const m = /outside viewport \{\s*originX:\s*(-?[\d.]+),\s*originY:\s*(-?[\d.]+),\s*width:\s*([\d.]+),\s*height:\s*([\d.]+)/.exec(msg)
-      if (!m) throw err
-      const [ox, oy, vw, vh] = m.slice(1, 5).map(Number)
-      x = Math.round(ox + vw / 2)
-      y = Math.round(oy + vh / 2)
-      if (state) state.lastShotMeta = { ...(state.lastShotMeta || {}), originX: ox, originY: oy, width: vw, height: vh }
-      r = await ctx.dshComputerUse.call('scroll', { window: win, x, y, scrollX: 0, scrollY: perStep }, exec.signal, turnMeta)
+      // P1-4/P1-5: the human-input monitor or an empty lease refuses the wheel before it
+      // runs. The scroll never happened, so un-wedge and retry once:
+      // clear_user_input clears the monitor without a capture (the helper may not be
+      // able to produce one on a static/oversize/covered window), and the observation
+      // that follows satisfies the "call get_window_state before continuing" contract.
+      const unwedgeable = /user input was detected|needs a screenshot from the last observation|none is cached|not the latest observation|bounds changed before coordinate input|window bounds changed/i.test(msg)
+      if (unwedgeable) {
+        try { await ctx.dshComputerUse.call('clear_user_input', {}, exec.signal, turnMeta) } catch { /* older helper: no such method */ }
+        try {
+          const observed = await ctx.dshComputerUse.call(
+            'get_window_state',
+            { window: win, include_screenshot: true, include_text: false },
+            exec.signal,
+            turnMeta,
+          )
+          if (observed && Array.isArray(observed.value?.screenshots)) externalizeScreenshotIds(state, observed.value)
+        } catch { /* the retry below is what reports success or failure */ }
+        r = await sendScroll()
+      } else {
+        // The cached screenshot geometry can predate a resize/maximise (stale centre →
+        // "point … is outside viewport { originX, originY, width, height }"). The error
+        // carries the live viewport, so re-centre from it and retry once.
+        const m = /outside viewport \{\s*originX:\s*(-?[\d.]+),\s*originY:\s*(-?[\d.]+),\s*width:\s*([\d.]+),\s*height:\s*([\d.]+)/.exec(msg)
+        if (!m) throw err
+        const [ox, oy, vw, vh] = m.slice(1, 5).map(Number)
+        x = Math.round(ox + vw / 2)
+        y = Math.round(oy + vh / 2)
+        if (state) state.lastShotMeta = { ...(state.lastShotMeta || {}), originX: ox, originY: oy, width: vw, height: vh }
+        r = await sendScroll()
+      }
     }
     if (!r || r.ok === false) break
     done += 1
@@ -1620,18 +1641,25 @@ export async function recoverCoordinateRefusal(ctx, state, spec, exec, input, re
   if (!recoverable) return result
   if (!input || typeof input.window !== 'object' || input.window === null) return result
   try {
+    // Cheap un-wedge first: the helper's `clear_user_input` satisfies the "call
+    // get_window_state before continuing" contract WITHOUT a capture, which is the only
+    // thing that works on windows Windows Graphics Capture can never frame (static page,
+    // window bigger than the desktop, covered window). Without it the dirty flag was
+    // permanent and every later action answered the same refusal forever.
+    try { await ctx.dshComputerUse.call('clear_user_input', {}, exec.signal, turnMeta) } catch { /* older helper */ }
     const observed = await ctx.dshComputerUse.call(
       'get_window_state',
       { window: input.window, include_screenshot: true, include_text: false },
       exec.signal,
       turnMeta,
-    )
-    if (!observed || observed.ok === false) return result
-    const value = observed.value !== undefined ? observed.value : observed
+    ).catch(() => null)
+    const value = observed && observed.value !== undefined ? observed.value : observed
     if (value?.accessibility?.tree) {
       state.lastElements = extractInteractiveElements(value.accessibility.tree)
       state.lastWindow = { app: input.window.app, id: input.window.id, title: input.window.title }
     }
+    // The refusal means the action never ran, so the retry is safe even when the
+    // observation itself could not produce a frame.
     const retryInput = { ...input }
     delete retryInput.screenshotId
     const retried = await ctx.dshComputerUse.call(spec.name, retryInput, exec.signal, turnMeta)

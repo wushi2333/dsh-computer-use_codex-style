@@ -18,6 +18,7 @@ import {
   recallFrame,
   rememberFrame,
   runBatchActions,
+  runScrollTo,
   translateNestedActionIds,
   translateScreenshotId,
 } from '../src/tool.js'
@@ -255,4 +256,38 @@ test('parseJsonLine tolerates non-JSON and empty output', () => {
   assert.equal(parseJsonLine('just text\nno braces'), null)
   assert.equal(parseJsonLine('{"broken":'), null)
   assert.deepEqual(parseJsonLine('{"ok":true,"width":782}'), { ok: true, width: 782 })
+})
+
+// ---------------------------------------------------------------------------
+// P1-4/P1-5: a wheel refused as "user input" is un-wedged and retried
+// ---------------------------------------------------------------------------
+
+test('runScrollTo clears the input monitor and retries a refused wheel', async () => {
+  let first = true
+  const { ctx, calls } = fakeSidecar({
+    scroll: () => {
+      if (first) { first = false; throw new Error(USER_INPUT) }
+      return { ok: true }
+    },
+    clear_user_input: { cleared: true },
+    get_window_state: { ok: true, value: { accessibility: null, screenshots: [{ id: 'screenshot-0', width: 784, height: 1628 }] } },
+  })
+  const out = await runScrollTo(ctx, { shotMap: new Map() }, { window: { app: 'a', id: 1 }, steps: 2, delta: 1000 }, {}, 12)
+  assert.equal(out.stepsDone, 2)
+  const order = calls.map(c => c.name)
+  assert.deepEqual(order.slice(0, 3), ['scroll', 'clear_user_input', 'get_window_state'])
+  assert.equal(order.filter(n => n === 'scroll').length, 3)
+})
+
+test('runScrollTo still self-heals stale viewport geometry', async () => {
+  let first = true
+  const { ctx } = fakeSidecar({
+    scroll: () => {
+      if (first) { first = false; throw new Error('point (392.0, 814.0) is outside viewport { originX: -8, originY: -8, width: 784, height: 1628 })') }
+      return { ok: true }
+    },
+  })
+  const out = await runScrollTo(ctx, { shotMap: new Map() }, { window: { app: 'a', id: 1 }, steps: 1 }, {}, 12)
+  assert.equal(out.stepsDone, 1)
+  assert.deepEqual(out.at, { x: 384, y: 806 })
 })
