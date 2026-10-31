@@ -1372,7 +1372,7 @@ export function uiaActFallback(hwnd, name, action) {
   }
 }
 
-/** `uia_act` — act by element name (UIA patterns), then optionally re-observe. */
+/** `computer_use_uia_act` — act by element name (UIA patterns, then a click fallback), then optionally re-observe. */
 export function uiaActTool(ctx, state) {
   return defineTool({
     name: 'computer_use_uia_act',

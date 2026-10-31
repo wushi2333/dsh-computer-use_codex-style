@@ -102,7 +102,7 @@ $order = switch ($Action) {
 # --- Fallback for nodes that expose NO UIA pattern ---------------------------------
 # H5 pages (exam forms, custom checkboxes) expose their options as plain Text nodes:
 # SelectionItem/Invoke/LegacyIAccessible all fail. We still address the control by
-# NAME (that is the whole point of uia_act) and simply click the rectangle UIA reports.
+# NAME (that is the whole point of computer_use_uia_act) and simply click the rectangle UIA reports.
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -117,7 +117,7 @@ public static class CuMouse {
 # P1-4: stamp the helper's synthetic-input tag (helper-rs/src/interrupt.rs SYNTHETIC_TAG
 # = 0x4453_4855_0000_0001) on the injected events. The helper's low-level mouse hook
 # compares dwExtraInfo against that tag and skips its "a human touched this window"
-# bookkeeping, so an uia_act click no longer poisons the observation lease.
+# bookkeeping, so a computer_use_uia_act click no longer poisons the observation lease.
 $SyntheticTag = [IntPtr]::new([int64]0x4453485500000001)
 
 function Click-At([int]$x, [int]$y) {

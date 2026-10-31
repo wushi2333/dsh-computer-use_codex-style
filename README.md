@@ -426,13 +426,21 @@ The official DSH Computer Use follows a noticeably different design. Use this pl
 
 ### Capture needs a repaint (static windows)
 
-`Windows.Graphics.Capture` delivers a frame only when the target window **changes**. A static page — an exam form, a settings dialog, a paused document — can therefore time out with `window capture timed out`, and coordinate input is impossible without a frame. The plugin handles this in three ways:
+`Windows.Graphics.Capture` delivers a frame only when the target window **changes**. A static page — an exam form, a settings dialog, a paused document — can therefore time out with `window capture timed out`, and coordinate input is impossible without a frame. The plugin degrades instead of failing, in this order:
 
-- `get_window_state` with `include_text` and **no** screenshot on a Chromium host reads the .NET UIA fallback directly and never touches the capture path (also earns a valid observation lease).
-- `get_window_state` turns a capture timeout into a text-only answer plus `captureFailed: true` and a guidance line, instead of failing the call.
-- `computer_use_uia_act` drives controls by name through UIA patterns, which needs neither a frame nor coordinates — the reliable path for form/exam UIs in WebView2 hosts.
+1. **Nudge → retry.** A 1 px size round-trip (`scripts/gdi-capture.ps1 -NudgeOnly`, plus `InvalidateRect`/`UpdateWindow`) forces a repaint and the capture is retried once. The frame then lands in the helper's **own** capture session, so `screenshotId`, coordinate clicks and the observation lease all keep working. A window that needed a nudge is nudged *before* the next capture, so the 15 s timeout is paid once per window rather than once per observation.
+2. **PrintWindow (GDI).** `PrintWindow(PW_RENDERFULLCONTENT)` needs no fresh DWM frame at all. The picture is injected as a normal screenshot with `source: "gdi-printwindow"` — good for reading the page and for x/y geometry, but the helper holds no frame for it, so prefer element names (`computer_use_uia_act`) and expect one automatic re-observe before a coordinate click lands.
+3. **Stale frame.** If GDI fails too, the last good frame for that window is returned with `stale: true` and its age.
+4. **Text only.** Only then does it fall back to the pre-existing `captureFailed: true` plus the UIA text fallback.
 
-A window bigger than the desktop also cannot be composited; resize it to fit before expecting screenshots.
+`value.capture` reports which path was taken (`path`, `stale`, `recovered`, `oversizeWindow`, `guidance`) and `computer_use_health.captureRecovery` counts them (`wgc`, `wgc-after-nudge`, `gdi-printwindow`, `stale-frame`, `gdi-failed`). Text-only observation of a Chromium host still bypasses the capture path entirely (`.NET` UIA fallback, valid lease), and `computer_use_uia_act` still drives controls by name, needing neither frame nor coordinates.
+
+Two related behaviours from the same pass:
+
+- `batch_actions` is executed **step by step** by the plugin rather than as one opaque helper call: each step's `shot-N` screenshot id is translated like a top-level call, two coordinate steps in a row get a screenshot-only re-observation in between, and a `user input was detected in this window` refusal is retried once after that re-observe instead of aborting the whole batch.
+- The `computer_use_uia_act` click fallback (for nodes that expose no UIA pattern) stamps the helper's `SYNTHETIC_TAG` as `dwExtraInfo` on its injected events, so its own click is no longer mistaken for human input.
+
+A window **larger than the desktop** can never be composited. The capture helper reports both the screen and the window rectangles, so the guidance states that outright instead of leaving you to guess; resize the window to fit the screen.
 
 ---
 

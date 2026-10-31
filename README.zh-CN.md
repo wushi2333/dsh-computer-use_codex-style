@@ -417,13 +417,21 @@ DSH官方的Computer Use采用设计思路不大一致。如果希望使用Codex
 
 ### 截图需要窗口"有变化"（静态窗口）
 
-`Windows.Graphics.Capture` 只在目标窗口**发生重绘**时给帧。静态页面——考试答题页、设置对话框、停住的文档——会直接 `window capture timed out`；没有帧就拿不到坐标输入。插件用三招兜：
+`Windows.Graphics.Capture` 只在目标窗口**发生重绘**时给帧。静态页面——考试答题页、设置对话框、停住的文档——会直接 `window capture timed out`；没有帧就拿不到坐标输入。现在遇到这种情况会**按下面顺序降级**，而不是整单失败：
 
-- Chromium 宿主上 `get_window_state` 只取文本（`include_text: true`、不要截图）时**完全不走捕获通道**，直接读 .NET UIA 兜底，同时仍然拿到有效观察租约。
-- `get_window_state` 遇到捕获超时会**降级成纯文本**并返回 `captureFailed: true` + 提示，而不是整个调用失败。
-- `computer_use_uia_act` 按元素名用 UIA pattern 操作控件，既不需要帧也不需要坐标——WebView2 里的表单/考试界面走这条最稳。
+1. **抖一下再重试**：`scripts/gdi-capture.ps1 -NudgeOnly` 做一次 1 像素尺寸回弹（外加 `InvalidateRect`/`UpdateWindow`）逼窗口重绘，然后**重取一次** helper 的捕获。这一帧落在 helper **自己的**捕获会话里，所以 `screenshotId`、坐标点击、观察租约全都照常可用。需要抖动的窗口会被记住，**下一次捕获前先抖**——15 秒超时每个窗口只付一次，而不是每次观察都付。
+2. **PrintWindow（GDI）**：`PrintWindow(PW_RENDERFULLCONTENT)` 完全不需要新的 DWM 帧。抓到的图按普通截图注入，带 `source: "gdi-printwindow"`：读页面、算 x/y 都够用，但 helper 手里没有这一帧，所以优先用元素名（`computer_use_uia_act`），坐标点击前会自动补一次观察。
+3. **陈旧帧**：GDI 也失败时，返回该窗口**上一次成功**的帧，标 `stale: true` 并附年龄。
+4. **纯文本**：只有到这一步才退回原来的 `captureFailed: true` + UIA 文本兜底。
 
-另外，**比桌面还大**的窗口同样合成不了；先把它缩到屏幕内再期待截图。
+`value.capture` 会说明走了哪条路（`path`/`stale`/`recovered`/`oversizeWindow`/`guidance`），`computer_use_health.captureRecovery` 则给出计数（`wgc`、`wgc-after-nudge`、`gdi-printwindow`、`stale-frame`、`gdi-failed`）。Chromium 宿主上"只取文本"的观察依旧完全不走捕获通道（.NET UIA 兜底 + 有效租约）；`computer_use_uia_act` 也依旧按元素名操作，既不需要帧也不需要坐标。
+
+同一轮还有两个配套行为：
+
+- `batch_actions` 现在由插件**逐步执行**，而不是一整个丢给 helper：每一步的 `shot-N` 截图 id 都像顶层调用一样翻译；连续两个坐标动作之间会补一次"只带截图"的观察；遇到 `user input was detected in this window` 会先补观察再重试这一步，而不是整批中止。
+- `computer_use_uia_act` 的点击兜底（给没有任何 UIA pattern 的节点）在注入事件上打了 helper 的 `SYNTHETIC_TAG`（`dwExtraInfo`），所以它自己的点击不会再被当成"人工输入"。
+
+另外，**比桌面还大**的窗口永远合成不了。捕获脚本会同时报出屏幕与窗口矩形，所以提示会**直接说明**这件事，并把窗口缩到屏幕内即可。
 
 
 ---
