@@ -1849,6 +1849,30 @@ export function uiaActFallback(hwnd, name, action) {
   }
 }
 
+/**
+ * Decide one act step's verdict from the page fingerprint before/after.
+ *
+ * Split out as a pure function because the rule is the whole point of P1-5 and must be
+ * pinned by a test: uia_act's `ok` only ever meant "the click was issued", so a WebView2
+ * option that silently ignored the click still came back ok and a multi-select page looked
+ * answered when nothing was ticked.
+ *
+ * @returns {{applied?: boolean, unchanged?: boolean, hint?: string}} empty when unverifiable
+ */
+export function judgeActStep(before, after, ok) {
+  if (!ok) return {}
+  if (!before || !after) return {}      // cannot read the page: no claim either way
+  if (before === after) {
+    return {
+      applied: false,
+      unchanged: true,
+      hint: 'the click was issued but the page did not change — verify the effect '
+        + '(on a WebView2/WMPF page a bare Text option can ignore the click entirely)',
+    }
+  }
+  return { applied: true }
+}
+
 /** `computer_use_uia_act` — act by element name (UIA patterns, then a click fallback), then optionally re-observe. */
 export function uiaActTool(ctx, state) {
   return defineTool({
@@ -1870,6 +1894,12 @@ export function uiaActTool(ctx, state) {
       },
       action: { type: 'string', description: '"auto" (default), "select", "invoke" or "legacy".' },
       observe: { type: 'boolean', description: 'Re-read the window text after acting (default true).' },
+      verify: {
+        type: 'boolean',
+        description: 'Compare the page text before and after each step and report applied/unchanged '
+          + '(default true). A step that returned ok but changed nothing is the exact failure that made a '
+          + 'multi-select page look answered when it was not, so this is on unless you know better.',
+      },
     },
     output: { schema: OUTPUT_SCHEMA, render(_a, v) { return renderValue(v) } },
     async execute(args, exec) {
@@ -1883,8 +1913,17 @@ export function uiaActTool(ctx, state) {
         for (const step of args.names.split('|')) if (step.trim()) steps.push(step.trim())
       }
       if (!steps.length) throw new Error('names (or steps) is required; use "|" or an array to chain several steps')
+      const doVerify = !(args && args.verify === false)
+      // A cheap fingerprint of what the page currently says. Not a screenshot: this path
+      // exists precisely for windows that cannot be captured.
+      const pageFingerprint = () => {
+        const nodes = uiaTreeFallback(hwnd, 400)
+        if (!Array.isArray(nodes) || nodes.length === 0) return ''
+        return summarizeTree(formatUiaFallback(nodes)).slice(0, 4000)
+      }
       const acted = []
       for (const step of steps) {
+        const before = doVerify ? pageFingerprint() : ''
         const res = uiaActFallback(hwnd, step, args && args.action) || {}
         // Every field must be a defined JSON value: an `undefined` member makes the
         // harness reject the whole result as "not lossless JSON".
@@ -1895,11 +1934,22 @@ export function uiaActTool(ctx, state) {
           matched: typeof res.matched === 'string' ? res.matched : '',
         }
         if (res.error) row.error = String(res.error)
-        acted.push(row)
-        // Let the page settle between steps (select → next happens on click).
+        // Let the page settle before judging whether the click did anything.
         await new Promise((resolve) => setTimeout(resolve, 260))
+        if (doVerify && row.ok) {
+          const after = pageFingerprint()
+          const verdict = judgeActStep(before, after, row.ok)
+          if (verdict.applied === true) row.applied = true
+          if (verdict.unchanged) { row.applied = false; row.unchanged = true; row.hint = verdict.hint }
+        }
+        acted.push(row)
       }
-      const value = { acted, ok: acted.every((a) => a.ok) }
+      // ok now means "issued AND (when verifiable) actually changed the page".
+      const value = {
+        acted,
+        ok: acted.every((a) => a.ok && a.applied !== false),
+        unchanged: acted.filter((a) => a.unchanged).map((a) => a.name),
+      }
       const wantObserve = args && args.observe !== false
       if (wantObserve) {
         const nodes = uiaTreeFallback(hwnd, 400)

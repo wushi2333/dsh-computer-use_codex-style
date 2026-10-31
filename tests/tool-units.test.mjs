@@ -14,6 +14,7 @@ import {
   captureGuidance,
   frameObservation,
   friendlyActionError,
+  judgeActStep,
   parseJsonLine,
   parsePageIndicator,
   recallFrame,
@@ -409,4 +410,23 @@ test('summarizeTree is a no-op for empty input', () => {
   // null/undefined normalize to the empty string rather than the literal "null".
   assert.equal(summarizeTree(null), '')
   assert.equal(summarizeTree(undefined), '')
+})
+
+test('judgeActStep distinguishes applied / unchanged / unverifiable', () => {
+  // The page changed: the click really did something.
+  assert.deepEqual(judgeActStep('A ○', 'A ●', true), { applied: true })
+
+  // The click was issued (ok) but nothing changed — the exact WMPF multi-select trap.
+  const stalled = judgeActStep('same text', 'same text', true)
+  assert.equal(stalled.applied, false)
+  assert.equal(stalled.unchanged, true)
+  assert.match(stalled.hint, /did not change/)
+
+  // A failed step gets no verdict — the caller already has the error.
+  assert.deepEqual(judgeActStep('a', 'b', false), {})
+
+  // Unreadable page (empty fingerprint) makes no claim, so `ok` alone must not be
+  // upgraded to "applied" and must not be downgraded to "unchanged" either.
+  assert.deepEqual(judgeActStep('', 'something', true), {})
+  assert.deepEqual(judgeActStep('something', '', true), {})
 })
