@@ -114,13 +114,19 @@ public static class CuMouse {
 }
 "@ -ErrorAction SilentlyContinue
 
+# P1-4: stamp the helper's synthetic-input tag (helper-rs/src/interrupt.rs SYNTHETIC_TAG
+# = 0x4453_4855_0000_0001) on the injected events. The helper's low-level mouse hook
+# compares dwExtraInfo against that tag and skips its "a human touched this window"
+# bookkeeping, so an uia_act click no longer poisons the observation lease.
+$SyntheticTag = [IntPtr]::new([int64]0x4453485500000001)
+
 function Click-At([int]$x, [int]$y) {
   $p = New-Object CuMouse+POINT
   [void][CuMouse]::GetCursorPos([ref]$p)
   [void][CuMouse]::SetCursorPos($x, $y)
   Start-Sleep -Milliseconds 40
-  [CuMouse]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)   # LEFT DOWN
-  [CuMouse]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)   # LEFT UP
+  [CuMouse]::mouse_event(0x0002, 0, 0, 0, $SyntheticTag)   # LEFT DOWN
+  [CuMouse]::mouse_event(0x0004, 0, 0, 0, $SyntheticTag)   # LEFT UP
   Start-Sleep -Milliseconds 40
   [void][CuMouse]::SetCursorPos($p.X, $p.Y)                 # leave the pointer where it was
 }

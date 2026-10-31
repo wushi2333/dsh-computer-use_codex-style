@@ -232,13 +232,29 @@ export function apply(ctx, config) {
   return ready
 }
 
+/**
+ * Register one tool and remember its real name (P2-6).
+ *
+ * `computer_use_health.tools.exposed` used to be a hardcoded list sitting next to the
+ * registrations, so the 2026-10 `computer_use_*` rename left it printing names that no
+ * longer existed while the registry carried the new ones. The health surface now
+ * reports what was actually registered.
+ */
+function registerTool(ctx, state, tool) {
+  ctx.tools.register(tool)
+  const name = tool && typeof tool.name === 'string' ? tool.name : ''
+  if (!name) return
+  state.registeredNames = Array.isArray(state.registeredNames) ? state.registeredNames : []
+  if (!state.registeredNames.includes(name)) state.registeredNames.push(name)
+}
+
 async function registerDesktop(ctx, state, config) {
   let desktops
   try {
     const listed = await ctx.dshComputerUse.tools('computer')
     desktops = Array.isArray(listed?.tools) ? listed.tools.filter(spec => spec?.name) : []
   } catch (error) {
-    ctx.tools.register(healthTool(ctx, state, config, String(error)))
+    registerTool(ctx, state, healthTool(ctx, state, config, String(error)))
     return
   }
   // Harness extensions are requested as their own surface (TC-01). A helper
@@ -260,32 +276,31 @@ async function registerDesktop(ctx, state, config) {
   const extras = harness.filter(spec => enabled.has(spec.name))
   // "First wedge → permanently use fallback for this app this session" switch.
   state.fallbackLatch = config.fallbackLatchAfterWedge !== false
-  ctx.tools.register(healthTool(ctx, state, config))
+  registerTool(ctx, state, healthTool(ctx, state, config))
   // Standalone, helper-independent tools. They talk to the sidecar only through the
   // same `call` bridge the window2 tools use, so they need no helper surface entry
   // (and cannot disturb the `WINDOW2_TOOLS` contract).
   // NOTE: there is NO harness-provided desktop `wait` — an earlier assumption of that
   // was wrong; this plugin owns it. Register it once, here.
-  ctx.tools.register(waitTool(ctx, state))
+  registerTool(ctx, state, waitTool(ctx, state))
   // Read-only CDP probe (detect/enable CDP for Chromium/WebView2 hosts).
-  ctx.tools.register(cdpProbeTool(ctx, state))
+  registerTool(ctx, state, cdpProbeTool(ctx, state))
   // Long-document + polling helpers (one-call scroll-to-end, wait-until, doc URLs).
-  ctx.tools.register(scrollToTool(ctx, state))
-  ctx.tools.register(reachLastPageTool(ctx, state))
-  ctx.tools.register(waitUntilTool(ctx, state))
-  ctx.tools.register(documentsTool(ctx, state))
-  ctx.tools.register(uiaActTool(ctx, state))
+  registerTool(ctx, state, scrollToTool(ctx, state))
+  registerTool(ctx, state, reachLastPageTool(ctx, state))
+  registerTool(ctx, state, waitUntilTool(ctx, state))
+  registerTool(ctx, state, documentsTool(ctx, state))
+  registerTool(ctx, state, uiaActTool(ctx, state))
   const exposed = desktops.concat(extras)
   for (const spec of exposed) {
     try {
-      ctx.tools.register(makeSidecarTool(ctx, spec, config, state, {}))
+      registerTool(ctx, state, makeSidecarTool(ctx, spec, config, state, {}))
     } catch (error) {
       console.error(`[dsh-computer-use] skipped tool ${spec.name}: ${error}`)
     }
   }
-  state.exposedNames = exposed.map(spec => spec.name)
-    .concat(['computer_use_wait', 'computer_use_cdp_probe', 'computer_use_scroll_to', 'computer_use_reach_last_page', 'computer_use_wait_until', 'computer_use_documents', 'computer_use_uia_act'])
-    .filter((name, index, all) => all.indexOf(name) === index)
+  // P2-6: publish exactly what the registry received, in registration order.
+  state.exposedNames = [...(state.registeredNames || [])]
   publishToolNames(ctx, state)
 }
 
@@ -320,8 +335,8 @@ async function unlockBrowserTools(ctx, state, config) {
   for (const spec of listed?.tools || []) {
     if (!spec?.name) continue
     try {
-      ctx.tools.register(makeSidecarTool(ctx, spec, config, state, { descriptionPrefix: BROWSER_ENTRY_GUIDANCE }))
-      state.exposedNames = [...state.exposedNames, spec.name]
+      registerTool(ctx, state, makeSidecarTool(ctx, spec, config, state, { descriptionPrefix: BROWSER_ENTRY_GUIDANCE }))
+      state.exposedNames = [...(state.registeredNames || [])]
     } catch (error) {
       console.error(`[dsh-computer-use] skipped tool ${spec.name}: ${error}`)
     }
@@ -353,6 +368,14 @@ function healthTool(ctx, state, config, startError) {
         browserUnlocked: Boolean(state.browserUnlocked),
         browserSkill: BROWSER_SKILL,
         tools: { exposed: state.exposedNames, enabled: config.enabledTools },
+        // P0-1: how many observations needed the repaint nudge / PrintWindow / stale
+        // frame, so "the capture keeps failing" is answerable from health instead of
+        // from the model's memory of a timeout.
+        captureRecovery: {
+          attempts: Object.fromEntries(state.captureStats instanceof Map ? state.captureStats : new Map()),
+          nudgedWindows: state.nudgeNext instanceof Set ? [...state.nudgeNext] : [],
+          cachedFrames: state.frameCache instanceof Map ? [...state.frameCache.keys()] : [],
+        },
         fallback: {
           latchAfterWedge: config.fallbackLatchAfterWedge !== false,
           latchedApps: state.wedgeLatched instanceof Set ? [...state.wedgeLatched] : [],
@@ -695,6 +718,233 @@ export function cropImageBase64(base64, mimeType, region, origin, frame) {
   } finally {
     try { if (dir) fs.rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Capture degradation (P0-1): Windows Graphics Capture needs a repaint, and a
+// static window (exam form, paused player, document) never produces one. The
+// helper therefore answers `window capture timed out` and the observation was
+// useless even though `health.capture.coverage.knownPaths` lists GDI paths.
+// ---------------------------------------------------------------------------
+
+/** Nudge-only repaint / PrintWindow pixel grab, plus the screen geometry to explain a failure. */
+const GDI_CAPTURE_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'gdi-capture.ps1')
+
+/**
+ * Run `gdi-capture.ps1`. The script writes one JSON line and may exit non-zero
+ * (2..6) after printing it, so a thrown `execFileSync` still carries a parseable
+ * `stdout`; prefer that over the generic process error.
+ *
+ * @param {number} hwnd window handle
+ * @param {{ nudgeOnly?: boolean, outPath?: string }} options
+ * @returns {{ok: boolean, width?: number, height?: number, window?: object, screen?: object, oversize?: boolean, error?: string}}
+ */
+export function runCaptureScript(hwnd, options = {}) {
+  if (!Number.isInteger(hwnd) || hwnd <= 0) return { ok: false, error: 'bad window id' }
+  const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', GDI_CAPTURE_SCRIPT, '-Hwnd', String(hwnd)]
+  if (options.nudgeOnly) args.push('-NudgeOnly')
+  else if (options.outPath) args.push('-OutPath', String(options.outPath))
+  const parse = (text) => {
+    const line = String(text || '').split(/\r?\n/).find((l) => l.trim().startsWith('{'))
+    if (!line) return null
+    try { return JSON.parse(line) } catch { return null }
+  }
+  try {
+    const raw = execFileSync('powershell.exe', args, {
+      encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024,
+    })
+    return parse(raw) || { ok: false, error: String(raw || '').trim() || 'no output' }
+  } catch (error) {
+    const parsed = parse(error && error.stdout)
+    if (parsed) return parsed
+    return { ok: false, error: String(error && error.message ? error.message : error) }
+  }
+}
+
+/** Force a repaint so the helper's own WGC capture session can produce a frame. */
+export function nudgeWindow(hwnd) {
+  return runCaptureScript(hwnd, { nudgeOnly: true })
+}
+
+/**
+ * Grab a window with PrintWindow(PW_RENDERFULLCONTENT) as base64 PNG.
+ *
+ * Visual-only fallback: the helper never saw this frame, so it cannot be the
+ * lease behind a coordinate click. It still beats "no screenshot at all" —
+ * the model can read the page and act by element name or keyboard.
+ */
+export function gdiWindowFrame(hwnd) {
+  let dir = null
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-gdi-'))
+    const outPath = path.join(dir, 'frame.png')
+    const res = runCaptureScript(hwnd, { outPath })
+    if (!res || res.ok !== true) return { ok: false, error: (res && res.error) || 'capture failed', geometry: res }
+    if (!fs.existsSync(outPath)) return { ok: false, error: 'no png written' }
+    const buf = fs.readFileSync(outPath)
+    if (!buf.length) return { ok: false, error: 'empty png' }
+    return {
+      ok: true,
+      data: buf.toString('base64'),
+      width: Number(res.width) || 0,
+      height: Number(res.height) || 0,
+      geometry: res,
+    }
+  } catch (error) {
+    return { ok: false, error: String(error && error.message ? error.message : error) }
+  } finally {
+    try { if (dir) fs.rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ }
+  }
+}
+
+/** Shape a raw frame into the helper's observation shape (image + screenshot entry). */
+export function frameObservation(frame, extra = {}) {
+  return {
+    ok: true,
+    value: {
+      accessibility: null,
+      screenshots: [{
+        id: 'screenshot-0',
+        width: frame.width,
+        height: frame.height,
+        originX: 0,
+        originY: 0,
+        source: extra.source || 'gdi-printwindow',
+        ...extra.screenshot,
+      }],
+      ...(extra.value || {}),
+    },
+    images: [{
+      data: frame.data,
+      mimeType: 'image/png',
+      width: frame.width,
+      height: frame.height,
+      originX: 0,
+      originY: 0,
+    }],
+  }
+}
+
+/** Remember the last good frame per window so a later timeout can serve it as stale. */
+export function rememberFrame(state, hwnd, frame) {
+  if (!Number.isInteger(hwnd) || hwnd <= 0 || !frame || !frame.data) return
+  state.frameCache = state.frameCache instanceof Map ? state.frameCache : new Map()
+  state.frameCache.set(hwnd, {
+    data: frame.data,
+    width: Number(frame.width) || 0,
+    height: Number(frame.height) || 0,
+    at: Date.now(),
+  })
+  // One stale frame per window is enough; bound the map so a long session cannot
+  // accumulate every window it ever captured.
+  if (state.frameCache.size > 6) {
+    const oldest = [...state.frameCache.entries()].sort((a, b) => a[1].at - b[1].at)[0]
+    if (oldest) state.frameCache.delete(oldest[0])
+  }
+}
+
+export function recallFrame(state, hwnd) {
+  if (!Number.isInteger(hwnd) || !(state.frameCache instanceof Map)) return null
+  const hit = state.frameCache.get(hwnd)
+  return hit && hit.data ? hit : null
+}
+
+function bumpCaptureStat(state, key) {
+  state.captureStats = state.captureStats instanceof Map ? state.captureStats : new Map()
+  state.captureStats.set(key, (state.captureStats.get(key) || 0) + 1)
+}
+
+/**
+ * Turn a `capture timed out` into the most usable observation available.
+ *
+ * Preference order — each step keeps more capability than the one after it:
+ *   1. **nudge → retry**: a 1 px size round-trip makes the window repaint, so the
+ *      helper's *own* capture session gets a frame. Coordinate input, screenshot
+ *      ids and the observation lease all keep working.
+ *   2. **PrintWindow**: a real picture of a window WGC may never frame (static
+ *      page, DRM surface, window larger than the desktop). Visual only.
+ *   3. **stale frame**: the last good frame for this window, flagged stale, so a
+ *      coordinate click still has pixel geometry to work from.
+ *   4. nothing: text-only observation (the previous behaviour).
+ *
+ * @param {object} state plugin state (frame cache + nudge bookkeeping)
+ * @param {number} hwnd target window handle
+ * @param {() => Promise<object>} retry re-issues the helper capture call
+ * @returns {Promise<{result: object|null, path: string|null, stale: boolean, ageMs?: number, geometry: object|null, error?: string}>}
+ */
+export async function captureFallback(state, hwnd, retry) {
+  const id = Number.isInteger(hwnd) && hwnd > 0 ? hwnd : 0
+  let geometry = null
+  if (id) {
+    const nudged = nudgeWindow(id)
+    geometry = nudged || null
+    // A window bigger than the whole desktop cannot be framed by WGC and a nudge
+    // cannot change that; skip the retry and go straight to PrintWindow (P2-7).
+    const hopeless = Boolean(nudged && nudged.oversize)
+    if (nudged && nudged.ok && !hopeless && typeof retry === 'function') {
+      try {
+        const again = await retry()
+        if (again && again.ok !== false) {
+          state.nudgeNext = state.nudgeNext instanceof Set ? state.nudgeNext : new Set()
+          // Remember that this window needed a repaint, so the NEXT observation nudges
+          // *before* asking the helper instead of paying a 15 s timeout again.
+          state.nudgeNext.add(id)
+          bumpCaptureStat(state, 'wgc-after-nudge')
+          return { result: again, path: 'wgc-after-nudge', stale: false, geometry }
+        }
+      } catch { /* retry timed out too; keep degrading */ }
+    }
+    const frame = gdiWindowFrame(id)
+    if (frame && frame.ok) {
+      rememberFrame(state, id, frame)
+      bumpCaptureStat(state, 'gdi-printwindow')
+      return {
+        result: frameObservation(frame, { source: 'gdi-printwindow' }),
+        path: 'gdi-printwindow',
+        stale: false,
+        geometry: frame.geometry || geometry,
+      }
+    }
+    geometry = frame && frame.geometry ? { ...(geometry || {}), ...frame.geometry } : geometry
+    bumpCaptureStat(state, 'gdi-failed')
+  }
+  const cached = recallFrame(state, id)
+  if (cached) {
+    bumpCaptureStat(state, 'stale-frame')
+    return {
+      result: frameObservation(cached, { source: 'stale-frame', screenshot: { stale: true } }),
+      path: 'stale-frame',
+      stale: true,
+      ageMs: Date.now() - cached.at,
+      geometry,
+    }
+  }
+  return { result: null, path: null, stale: false, geometry, error: 'capture timed out and no frame could be recovered' }
+}
+
+/** The sentence that explains a degraded capture, including an oversize window (P2-7). */
+export function captureGuidance(degraded) {
+  const geometry = degraded && degraded.geometry ? degraded.geometry : null
+  const oversize = Boolean(geometry && geometry.oversize)
+  const screen = geometry && geometry.screen ? ` (screen ${geometry.screen.width}x${geometry.screen.height})` : ''
+  const win = geometry && geometry.window ? ` window ${geometry.window.width}x${geometry.window.height}` : ''
+  if (degraded && degraded.path === 'wgc-after-nudge') {
+    return 'Static window: the capture needed a 1 px repaint nudge and then succeeded, so coordinates are valid. The window is now nudged before each observation automatically.'
+  }
+  if (degraded && degraded.path === 'gdi-printwindow') {
+    return `Screenshot served by the GDI PrintWindow fallback (Windows Graphics Capture could not frame this static window)${win}${screen}. `
+      + 'The picture is valid for reading the page and for x/y geometry, but the helper holds no capture session for it: '
+      + 'prefer element names (computer_use_uia_act) or keyboard, and expect one automatic re-observe before a coordinate click lands.'
+      + (oversize ? ' NOTE: the window is LARGER THAN THE SCREEN, which is why WGC can never frame it — resize it to fit the desktop.' : '')
+  }
+  if (degraded && degraded.path === 'stale-frame') {
+    return `Live capture still timed out; returned the last frame for this window (${Math.round((degraded.ageMs || 0) / 1000)}s old, marked stale). `
+      + 'Geometry is probably still right, but re-read the page before trusting a state change.'
+  }
+  return 'Screenshot unavailable (capture timed out, and the GDI fallback produced no frame either — likely a DRM/hardware-overlay surface, '
+    + 'or a window larger than the desktop). Text is served from the UIA fallback; element names and keyboard shortcuts still work, '
+    + 'but coordinate clicks need a screenshot.'
+    + (oversize ? ' The window is LARGER THAN THE SCREEN: resize it to fit the desktop and the capture will work.' : '')
 }
 
 /** Extract live document URLs from a .NET UIA node list (Document role). */
@@ -1127,13 +1377,20 @@ export function uiaActTool(ctx, state) {
   return defineTool({
     name: 'computer_use_uia_act',
     description:
-      'Act on this window by ELEMENT NAME using UIA patterns (Select/Invoke) — no screenshot and no coordinates, '
-      + 'so it works on static windows that Windows Graphics Capture cannot capture (exam/form pages in WeChat/WebView2). '
-      + 'Pass several names separated by "|" to run them in order (e.g. "A、选项文本|下一题"). '
+      'Act on this window by ELEMENT NAME using UIA patterns (Select/Invoke), with a coordinate-click fallback for '
+      + 'nodes that expose no pattern at all (H5 multi-select options and plain `Text` buttons such as 交卷) — no '
+      + 'screenshot needed, so it works on static windows that Windows Graphics Capture cannot frame (exam/form pages '
+      + 'in WeChat/WebView2). Pass several names separated by "|", or an array in `steps`, to run them in order '
+      + '(e.g. "A、选项文本|下一题", or steps:["A","B","D"] to tick a multi-select). '
       + 'Returns the resulting text tree so the next step can be planned in the same call.',
     parameters: {
       window: WIN_PARAM,
-      names: { type: 'string', description: 'Element name(s); a distinctive substring is enough. Separate several steps with "|".', required: true },
+      names: { type: 'string', description: 'Element name(s); a distinctive substring is enough. Separate several steps with "|".' },
+      steps: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Multi-value form helper: one label per entry (e.g. ["A","B","D"] to tick a multi-select), run in order. Use instead of a "|"-joined names string when the labels themselves contain "|".',
+      },
       action: { type: 'string', description: '"auto" (default), "select", "invoke" or "legacy".' },
       observe: { type: 'boolean', description: 'Re-read the window text after acting (default true).' },
     },
@@ -1141,8 +1398,14 @@ export function uiaActTool(ctx, state) {
     async execute(args, exec) {
       const win = args && args.window
       const hwnd = Number(win && win.id)
-      const steps = String((args && args.names) || '').split('|').map((s) => s.trim()).filter(Boolean)
-      if (!steps.length) throw new Error('names is required (use "|" to chain several steps)')
+      const steps = []
+      if (Array.isArray(args && args.steps)) {
+        for (const step of args.steps) if (typeof step === 'string' && step.trim()) steps.push(step.trim())
+      }
+      if (typeof (args && args.names) === 'string') {
+        for (const step of args.names.split('|')) if (step.trim()) steps.push(step.trim())
+      }
+      if (!steps.length) throw new Error('names (or steps) is required; use "|" or an array to chain several steps')
       const acted = []
       for (const step of steps) {
         const res = uiaActFallback(hwnd, step, args && args.action) || {}
@@ -1214,6 +1477,30 @@ export function translateScreenshotId(state, input) {
 }
 
 /**
+ * P1-3: translate the external `shot-N` ids that live *inside* a batched call.
+ *
+ * `batch_actions` carries its steps in `actions[]` and `fill_form` in `fields[]`;
+ * the top-level pass above never sees them, so the helper answered
+ * `unknown screenshotId` for a `shot-N` that worked fine as a top-level `click`.
+ * Doing it here keeps the translation in one place instead of teaching every
+ * tool about external ids.
+ */
+export function translateNestedActionIds(state, input) {
+  if (!input || typeof input !== 'object') return
+  const visit = (node) => {
+    if (!node || typeof node !== 'object') return
+    if (Array.isArray(node)) { node.forEach(visit); return }
+    if (typeof node.screenshotId === 'string') translateScreenshotId(state, node)
+    if (node.arguments && typeof node.arguments === 'object') visit(node.arguments)
+    if (node.args && typeof node.args === 'object') visit(node.args)
+    if (Array.isArray(node.actions)) node.actions.forEach(visit)
+    if (Array.isArray(node.fields)) node.fields.forEach(visit)
+  }
+  if (Array.isArray(input.actions)) input.actions.forEach(visit)
+  if (Array.isArray(input.fields)) input.fields.forEach(visit)
+}
+
+/**
  * Remember that this app's UIA provider is wedged.
  *
  * The 60s cooldown is always recorded. When `state.fallbackLatch` is on (the
@@ -1248,20 +1535,39 @@ export function isWedged(state, app) {
  */
 export function friendlyActionError(state, input, rawMessage) {
   const msg = String(rawMessage == null ? '' : rawMessage)
+  // P3-8: the helper sometimes answers with an entire window list inside the error
+  // text. That hides the actual sentence, so keep the head and point at the tool that
+  // owns the full list instead of pasting it into a tool result.
+  // The pass-through test reads the ORIGINAL message: the truncation suffix itself
+  // mentions list_windows, so testing the compacted text would swallow every long error.
+  const alreadyActionable = /call list_windows/i.test(msg)
+  const compact = msg.length > 700
+    ? `${msg.slice(0, 700)}… (truncated — call list_windows for the full window list)`
+    : msg
   // Already carries actionable guidance (e.g. the Rust helper now appends it) — don't double it.
-  if (/call list_windows/i.test(msg)) return null
-  if (/window id \d+ was not found|was not found|IdGone|window .*?not found|window is gone|window was closed/i.test(msg)) {
+  if (alreadyActionable) return null
+  // P1-4: the human-input monitor cannot always tell our own injected click from the
+  // human's (input that came from outside the helper). The action never ran, so say so
+  // instead of leaving the model to guess whether its click landed.
+  if (/user input was detected/i.test(compact)) {
+    return new Error(
+      `${compact} — this is the monitor seeing an injected click, and the action did NOT run. `
+      + 'Call get_window_state (include_screenshot) and retry once; batch_actions re-observes between coordinate steps automatically.',
+    )
+  }
+  if (/window id \d+ was not found|was not found|IdGone|window .*?not found|window is gone|window was closed/i.test(compact)) {
     state.lastElements = []
     state.lastWindow = null
-    return new Error(`${msg} — the target window appears CLOSED or gone; call list_windows to re-locate it, then retry.`)
+    return new Error(`${compact} — the target window appears CLOSED or gone; call list_windows to re-locate it, then retry.`)
   }
-  if (/desktop is locked|SecureDesktop/i.test(msg)) {
-    return new Error(`${msg} — the desktop is LOCKED; ask the user to unlock it, then retry.`)
+  if (/desktop is locked|SecureDesktop/i.test(compact)) {
+    return new Error(`${compact} — the desktop is LOCKED; ask the user to unlock it, then retry.`)
   }
-  if (/wedged|cooldown|no answer within|accessibility dump|UIA/i.test(msg)) {
+  if (/wedged|cooldown|no answer within|accessibility dump|UIA/i.test(compact)) {
     noteWedge(state, input && input.window && input.window.app)
-    return new Error(`${msg} — NOTE: screenshots still work; retry without include_text and act by x/y coordinates.`)
+    return new Error(`${compact} — NOTE: screenshots still work; retry without include_text and act by x/y coordinates.`)
   }
+  if (compact !== msg) return new Error(compact)
   return null
 }
 
@@ -1286,6 +1592,14 @@ export async function recoverCoordinateRefusal(ctx, state, spec, exec, input, re
     || /unknown screenshotId/i.test(message)
     || /bounds changed before coordinate input/i.test(message)
     || /window bounds changed/i.test(message)
+    // P1-4: the monitor cannot tell our own injected click from the human's when the
+    // input came from outside the helper (the uia_act click fallback, or a batch step
+    // whose synthetic window already expired). The action never ran, so a single
+    // re-observe clears the dirty flag and the retry is safe.
+    || /user input was detected/i.test(message)
+    // P1-5: on a static page the only lease that ever exists is the stale/GDI frame, so
+    // treat "no screenshot cached" as recoverable instead of a deadlock.
+    || /needs a screenshot from the last observation/i.test(message)
   if (!recoverable) return result
   if (!input || typeof input.window !== 'object' || input.window === null) return result
   try {
@@ -1342,6 +1656,81 @@ function normalizeSchemaTypes(node, path = "schema") {
   if (node.items !== undefined) normalizeSchemaTypes(node.items, path + ".items")
   for (const key of ['anyOf', 'oneOf', 'allOf']) if (Array.isArray(node[key])) node[key].forEach((x, i) => normalizeSchemaTypes(x, path + '.' + key + '[' + i + ']'))
   if (node.additionalProperties && typeof node.additionalProperties === 'object') normalizeSchemaTypes(node.additionalProperties, path + '.additionalProperties')
+}
+
+/**
+ * P1-4: run a batch one step at a time so each coordinate step can be re-grounded.
+ *
+ * The helper's own batch runs every step back to back; its human-input monitor then
+ * flags the *second* coordinate action as human input ("user input was detected in
+ * this window") because the synthetic window covering our injection had already
+ * expired. Splitting the batch here also lets every step carry its own translated
+ * `shot-N` id (P1-3) and lets the failure name the step that broke.
+ *
+ * @returns {Promise<{ok: boolean, value?: object, results: object[], failedAt?: number, error?: string}>}
+ */
+export async function runBatchActions(ctx, state, exec, turnMeta, input) {
+  const actions = Array.isArray(input && input.actions) ? input.actions : []
+  if (!actions.length) return { ok: false, results: [], error: 'batch_actions needs a non-empty actions[] array (each step: { name, arguments })' }
+  const shared = input && typeof input.window === 'object' ? input.window : null
+  const results = []
+  let lastCoordinate = false
+  const observe = async (target) => {
+    try {
+      await ctx.dshComputerUse.call(
+        'get_window_state',
+        { window: target, include_screenshot: true, include_text: false },
+        exec.signal,
+        turnMeta,
+      )
+    } catch { /* the retry below reports the failure that matters */ }
+  }
+  for (let i = 0; i < actions.length; i += 1) {
+    const action = actions[i]
+    const stepName = String((action && action.name) || '')
+    if (!stepName) return { ok: false, results, failedAt: i + 1, error: `batch_actions step ${i + 1} has no name` }
+    const stepArgs = action && typeof action.arguments === 'object' && action.arguments ? { ...action.arguments } : {}
+    if (shared && stepArgs.window === undefined) stepArgs.window = shared
+    translateScreenshotId(state, stepArgs)
+    translateNestedActionIds(state, stepArgs)
+    const coordinate = COORDINATE_TOOLS.has(stepName)
+    // Two coordinate actions in a row: renew the lease *before* the second one instead
+    // of letting it fail and recovering after a wasted round trip.
+    if (lastCoordinate && coordinate) await observe(stepArgs.window || shared)
+    const row = { step: i + 1, name: stepName, ok: false }
+    let res
+    try {
+      res = await ctx.dshComputerUse.call(stepName, stepArgs, exec.signal, turnMeta)
+    } catch (error) {
+      row.error = String(error && error.message ? error.message : error)
+      results.push(row)
+      return { ok: false, results, failedAt: i + 1, error: `batch_actions step ${i + 1} (${stepName}) threw: ${row.error}` }
+    }
+    row.ok = res ? res.ok !== false : false
+    if (!row.ok && res && res.error) row.error = String(res.error)
+    results.push(row)
+    if (!row.ok) {
+      const recoverable = coordinate && /user input was detected|needs a screenshot|none is cached|not the latest observation|bounds changed/i.test(String(row.error || ''))
+      if (recoverable) {
+        await observe(stepArgs.window || shared)
+        try {
+          const retry = await ctx.dshComputerUse.call(stepName, stepArgs, exec.signal, turnMeta)
+          row.ok = retry ? retry.ok !== false : false
+          row.retried = true
+          if (row.ok) delete row.error
+          else if (retry && retry.error) row.error = String(retry.error)
+        } catch (error) {
+          row.error = String(error && error.message ? error.message : error)
+        }
+      }
+      if (!row.ok) {
+        return { ok: false, results, failedAt: i + 1, error: `batch_actions step ${i + 1} (${stepName}) failed: ${row.error || 'unknown error'}` }
+      }
+    }
+    lastCoordinate = coordinate
+    await new Promise((resolve) => setTimeout(resolve, 60))
+  }
+  return { ok: true, results, value: { executed: results.length, results } }
 }
 
 function makeSidecarTool(ctx, spec, config, state, options) {
@@ -1492,7 +1881,26 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       // *finishes*, not when it was accepted.
       let result
       let captureFailed = false
+      let captureDegraded = null
       translateScreenshotId(state, input)
+      // P1-3: `batch_actions` carries its sub-actions in `actions[]`, so the top-level
+      // translation above never reaches their screenshotId and the helper rejects the
+      // external `shot-N` with `unknown screenshotId`.
+      translateNestedActionIds(state, input)
+      // P1-3/P1-4: batches are driven here, one step at a time, so every coordinate step
+      // gets a fresh observation lease and its own translated screenshot id.
+      if (spec.name === 'batch_actions') {
+        if (gate?.write) safety.beginWrite()
+        let outcome
+        try {
+          outcome = await runBatchActions(ctx, state, exec, turnMeta, input)
+        } finally {
+          if (gate?.write) safety.finishWrite()
+        }
+        if (gate?.write) safety.lease.note(gate.sessionId, spec.name)
+        if (!outcome.ok) throw friendlyActionError(state, input, outcome.error) || new Error(String(outcome.error))
+        return { value: outcome.value, images: [] }
+      }
       const wantText = spec.name === 'get_window_state' && Boolean(input && input.include_text)
       const wantShot = spec.name === 'get_window_state'
         ? (input && input.include_screenshot === undefined ? true : Boolean(input && input.include_screenshot))
@@ -1513,18 +1921,33 @@ function makeSidecarTool(ctx, spec, config, state, options) {
         return c
       })()
       if (gate?.write) safety.beginWrite()
+      const hwndForCapture = Number(input && input.window && input.window.id)
       try {
         if (textOnlySkipHelper) {
           result = { ok: true, value: { accessibility: null }, images: [] }
         } else {
+          // A window that already needed a repaint (static page) is nudged BEFORE the
+          // helper capture, so it does not pay the 15 s timeout on every observation.
+          const preNudge = spec.name === 'get_window_state' && wantShot
+            && Number.isInteger(hwndForCapture) && state.nudgeNext instanceof Set && state.nudgeNext.has(hwndForCapture)
+          if (preNudge) nudgeWindow(hwndForCapture)
+          const attempt = () => ctx.dshComputerUse.call(spec.name, callInput, exec.signal, turnMeta)
           try {
-            result = await ctx.dshComputerUse.call(spec.name, callInput, exec.signal, turnMeta)
+            result = await attempt()
           } catch (thrown) {
             const thrownMsg = thrown && thrown.message ? thrown.message : String(thrown)
             if (spec.name === 'get_window_state' && /capture timed out|window capture timed out/i.test(thrownMsg)) {
-              // DRM/overlay windows cannot be captured; fall back to text-only rather than failing.
+              // P0-1: WGC only frames a window that repaints, so a static page always
+              // times out. Degrade instead of failing the whole observation:
+              // nudge→retry (keeps the helper's own frame), then PrintWindow, then the
+              // last good frame flagged stale, then text-only as before.
               captureFailed = true
-              result = { ok: true, value: { accessibility: null }, images: [] }
+              const degraded = wantShot
+                ? await captureFallback(state, hwndForCapture, attempt)
+                : { result: null, path: null, stale: false, geometry: null }
+              captureDegraded = degraded
+              if (degraded.result) result = degraded.result
+              else result = { ok: true, value: { accessibility: null }, images: [] }
             } else {
               throw friendlyActionError(state, input, thrownMsg) || thrown
             }
@@ -1547,6 +1970,17 @@ function makeSidecarTool(ctx, spec, config, state, options) {
         if (gate?.write) safety.finishWrite()
       }
       if (gate?.write) safety.lease.note(gate.sessionId, spec.name)
+      // Keep the last good frame for this window: a later live-capture timeout can then
+      // serve it flagged stale instead of leaving the model with no pixels at all.
+      if (spec.name === 'get_window_state' && Array.isArray(result?.images) && result.images[0]?.data
+          && Number.isInteger(hwndForCapture)) {
+        rememberFrame(state, hwndForCapture, {
+          data: result.images[0].data,
+          width: result.images[0].width,
+          height: result.images[0].height,
+        })
+        bumpCaptureStat(state, captureDegraded ? 'frame-recovered' : 'wgc')
+      }
       if (!result?.ok && result?.error) {
         const msg = String(result.error)
         throw friendlyActionError(state, input, msg) || new Error(msg)
@@ -1613,8 +2047,21 @@ function makeSidecarTool(ctx, spec, config, state, options) {
         }
         if (captureFailed) {
           if (!value.accessibility || typeof value.accessibility !== 'object') value.accessibility = {}
-          value.accessibility.guidance = 'Screenshot unavailable (capture timed out — likely a DRM/hardware-overlay video surface). Text is served from the UIA fallback; keyboard shortcuts still work, but coordinate clicks need a screenshot.'
-          value.captureFailed = true
+          const guidance = captureGuidance(captureDegraded)
+          value.accessibility.guidance = guidance
+          const recovered = Boolean(captureDegraded && captureDegraded.result)
+          value.capture = {
+            failed: true,
+            path: (captureDegraded && captureDegraded.path) || null,
+            stale: Boolean(captureDegraded && captureDegraded.stale),
+            recovered,
+            ...(captureDegraded && captureDegraded.ageMs ? { ageMs: captureDegraded.ageMs } : {}),
+            ...(captureDegraded && captureDegraded.geometry && captureDegraded.geometry.oversize ? { oversizeWindow: true } : {}),
+            guidance,
+          }
+          // Only a fully unrecovered observation keeps the historical flag, which other
+          // layers (and the skill doc) treat as "no pixels at all".
+          if (!recovered) value.captureFailed = true
         }
       }
       // Region crop (token saving): crop each captured frame to the requested rectangle.
