@@ -1327,10 +1327,23 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps, probe = 
         y,
         direction: to,
       })
-      result.page = { ...paged, wheelStoppedAt: ind.current }
+      result.page = { ...paged, key: paged.key || 'none', wheelStoppedAt: ind.current }
       result.stepsDoneByKey = to === 'bottom' ? paged.to - paged.from : paged.from - paged.to
+      if (paged.to === paged.from) {
+        // The counter is readable and NOT at the last page, yet the wheel, the three key
+        // strategies and the interpolated swipe all left it where it was. Say that out
+        // loud instead of returning `key:null` with no verdict (that is the same silent
+        // failure this tool was fixed for, just reached through the counter branch).
+        result.moved = 'none'
+        result.swipe = { tried: true, pageStayedAt: ind.current }
+        result.guidance = 'The page counter stayed at ' + ind.current + '/' + ind.total + ' after the wheel, '
+          + 'Page_Down/Right/Next and an interpolated swipe, so this viewer binds none of those gestures. '
+          + 'Next step: computer_use_uia_act on its next-page/下一题 control (read the tree first — one '
+          + 'WeChatAppEx window can hold several courses, and its first Document node is often a hidden one).'
+      }
     } else if (ind) {
-      result.page = { from: ind.current, to: ind.current, total: ind.total, key: null, wheelStoppedAt: ind.current }
+      result.page = { from: ind.current, to: ind.current, total: ind.total, key: 'none', wheelStoppedAt: ind.current }
+      result.atEnd = atTargetEnd(ind)
     } else {
       // No page counter at all (the UIA walk failed, or the page has none). Staying
       // silent here made "never even tried" look identical to "tried and failed".
