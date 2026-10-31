@@ -774,6 +774,20 @@ export function nudgeWindow(hwnd) {
 const UIA_SWIPE_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'uia-swipe.ps1')
 
 /**
+ * Hash the window's current pixels (GDI, so it works on windows WGC cannot frame).
+ * Second signal for "did the page actually move" when no page counter is readable.
+ */
+export function frameHash(hwnd) {
+  try {
+    const frame = gdiWindowFrame(hwnd)
+    if (!frame || frame.ok !== true || !frame.data) return null
+    return crypto.createHash('sha1').update(frame.data).digest('hex')
+  } catch {
+    return null
+  }
+}
+
+/**
  * Swipe with `SendInput` directly, bypassing the helper.
  *
  * The helper's `drag` jumps straight from press to release (4 events, no motion in
@@ -1270,6 +1284,30 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps, probe = 
       result.stepsDoneByKey = to === 'bottom' ? paged.to - paged.from : paged.from - paged.to
     } else if (ind) {
       result.page = { from: ind.current, to: ind.current, total: ind.total, key: null, wheelStoppedAt: ind.current }
+    } else {
+      // No page counter at all (the UIA walk failed, or the page has none). Staying
+      // silent here made "never even tried" look identical to "tried and failed", so
+      // issue one interpolated swipe and prove the outcome with a frame hash.
+      const geo = state && state.lastShotMeta ? state.lastShotMeta : null
+      const w = Number(geo && geo.width) > 0 ? Number(geo.width) : 784
+      const h = Number(geo && geo.height) > 0 ? Number(geo.height) : 1628
+      const cy = Number.isFinite(y) ? y : Math.round(h / 2)
+      const before = frameHash(hwnd)
+      const swiped = swipeViaScript(hwnd, {
+        fromX: Math.round(w * 0.78), fromY: cy, toX: Math.round(w * 0.2), toY: cy,
+      })
+      const after = frameHash(hwnd)
+      result.page = null
+      result.pageProbe = 'unavailable'
+      result.swipe = { ok: Boolean(swiped && swiped.ok === true) }
+      result.moved = before && after ? before !== after : 'unknown'
+      result.guidance = 'No "current/total" page counter could be read for this window, so paging cannot be measured. '
+        + 'One interpolated swipe was issued: '
+        + (result.moved === true
+          ? 'the frame CHANGED, so the gesture landed — call reach_last_page again (or scroll_to) to continue.'
+          : result.moved === false
+            ? 'the frame did NOT change — this viewer needs another gesture (ScrollPattern, or a click on its next control).'
+            : 'the frame could not be captured either, so movement is UNKNOWN.')
     }
   }
   return result
