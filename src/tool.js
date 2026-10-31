@@ -770,6 +770,36 @@ export function nudgeWindow(hwnd) {
   return runCaptureScript(hwnd, { nudgeOnly: true })
 }
 
+/** Interpolated SendInput swipe (no helper capture session needed). */
+const UIA_SWIPE_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'uia-swipe.ps1')
+
+/**
+ * Swipe with `SendInput` directly, bypassing the helper.
+ *
+ * The helper's `drag` jumps straight from press to release (4 events, no motion in
+ * between), which web galleries and slide readers ignore; it also needs a helper capture
+ * session that a window WGC cannot frame never has. This script walks the pointer with N
+ * intermediate moves and stamps SYNTHETIC_TAG, so it works on both counts.
+ */
+export function swipeViaScript(hwnd, box) {
+  if (!Number.isInteger(hwnd) || hwnd <= 0) return { ok: false, error: 'bad window id' }
+  const args = [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', UIA_SWIPE_SCRIPT,
+    '-Hwnd', String(hwnd),
+    '-FromX', String(Math.round(box.fromX)), '-FromY', String(Math.round(box.fromY)),
+    '-ToX', String(Math.round(box.toX)), '-ToY', String(Math.round(box.toY)),
+    '-DurationMs', '350', '-Steps', '14',
+  ]
+  try {
+    return parseJsonLine(execFileSync('powershell.exe', args, {
+      encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 1024 * 1024,
+    })) || { ok: false, error: 'no output' }
+  } catch (error) {
+    return parseJsonLine(error && error.stdout)
+      || { ok: false, error: String(error && error.message ? error.message : error) }
+  }
+}
+
 /**
  * Grab a window with PrintWindow(PW_RENDERFULLCONTENT) as base64 PNG.
  *
@@ -1117,12 +1147,17 @@ async function pageThroughByKeys(ctx, win, start, exec, turnMeta, probe, opts = 
       try { await ctx.dshComputerUse.call('clear_user_input', {}, exec.signal, turnMeta) } catch { /* older helper */ }
     }
     try {
-      await ctx.dshComputerUse.call(
-        'drag',
-        { window: win, from_x: fromX, from_y: cy, to_x: toX, to_y: cy },
-        exec.signal,
-        turnMeta,
-      )
+      // Interpolated SendInput swipe first (no lease, real pointer motion); fall back to
+      // the helper's 4-event drag only when the script itself failed.
+      const viaScript = swipeViaScript(hwnd, { fromX, fromY: cy, toX, toY: cy })
+      if (!viaScript || viaScript.ok !== true) {
+        await ctx.dshComputerUse.call(
+          'drag',
+          { window: win, from_x: fromX, from_y: cy, to_x: toX, to_y: cy },
+          exec.signal,
+          turnMeta,
+        )
+      }
     } catch {
       break
     }
