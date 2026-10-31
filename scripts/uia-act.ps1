@@ -107,6 +107,7 @@ Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public static class CuMouse {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll", SetLastError=true)] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
   [DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint n, INPUT[] p, int cb);
@@ -144,6 +145,10 @@ $MOUSEEVENTF_LEFTUP = 0x0004
 $INPUT_MOUSE = 0
 
 function Click-At([int]$x, [int]$y) {
+  # Measured: a click on a plain-Text option label did nothing while the same node acted
+  # fine through its UIA pattern — the window was simply not foreground, so SendInput went
+  # to whatever was on top. Bring it up first and give the compositor a moment.
+  try { [void][CuMouse]::SetForegroundWindow([IntPtr]$Hwnd); Start-Sleep -Milliseconds 120 } catch { }
   $p = New-Object CuMouse+POINT
   [void][CuMouse]::GetCursorPos([ref]$p)
   [void][CuMouse]::SetCursorPos($x, $y)

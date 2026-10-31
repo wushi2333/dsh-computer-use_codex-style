@@ -1,0 +1,15 @@
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\bin\Release\net8.0-windows\dsh-touchtap.exe
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\bin\Release\net8.0-windows\dsh-touchtap.deps.json
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\bin\Release\net8.0-windows\dsh-touchtap.runtimeconfig.json
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\bin\Release\net8.0-windows\dsh-touchtap.dll
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\bin\Release\net8.0-windows\dsh-touchtap.pdb
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\obj\Release\net8.0-windows\touchtap.GeneratedMSBuildEditorConfig.editorconfig
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\obj\Release\net8.0-windows\touchtap.AssemblyInfoInputs.cache
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\obj\Release\net8.0-windows\touchtap.AssemblyInfo.cs
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\obj\Release\net8.0-windows\touchtap.csproj.CoreCompileInputs.cache
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\obj\Release\net8.0-windows\touchtap.sourcelink.json
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\obj\Release\net8.0-windows\dsh-touchtap.dll
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\obj\Release\net8.0-windows\refint\dsh-touchtap.dll
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\obj\Release\net8.0-windows\dsh-touchtap.pdb
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\obj\Release\net8.0-windows\touchtap.genruntimeconfig.cache
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\touchtap\obj\Release\net8.0-windows\ref\dsh-touchtap.dll

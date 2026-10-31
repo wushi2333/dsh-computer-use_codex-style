@@ -1,0 +1,23 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "dsh-touchtap/1.0.0": {
+        "runtime": {
+          "dsh-touchtap.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "dsh-touchtap/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

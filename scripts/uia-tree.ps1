@@ -43,7 +43,24 @@ function Walk($el, $depth) {
       $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
       if ($vp) { $val = [string]$vp.Current.Value }
     } catch {}
-    $keep = ($name -and $name.Trim()) -or ($val -and $val.Trim()) -or ($interactive -contains $ct)
+    # Selection state: without this the caller cannot tell a ticked checkbox from an
+    # empty one, so "did my click land" had to be eyeballed from a screenshot.
+    #   sel      SelectionItem.IsSelected   (radio / list item)
+    #   tog      Toggle.ToggleState         (checkbox)
+    $sel = ''
+    try {
+      $sp2 = $el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+      if ($sp2) { $sel = if ($sp2.Current.IsSelected) { 'on' } else { 'off' } }
+    } catch {}
+    if (-not $sel) {
+      try {
+        $tp2 = $el.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+        if ($tp2) { $sel = ($tp2.Current.ToggleState.ToString() -replace 'Indeterminate','mixed') }
+      } catch {}
+    }
+    $hasPattern = $false
+    try { $hasPattern = (@($el.GetSupportedPatterns()).Count -gt 0) } catch {}
+    $keep = ($name -and $name.Trim()) -or ($val -and $val.Trim()) -or ($interactive -contains $ct) -or $sel
     if ($keep) {
       $r = $cur.BoundingRectangle
       [void]$script:out.Add([pscustomobject]@{
@@ -51,6 +68,8 @@ function Walk($el, $depth) {
         role  = ($ct -replace 'ControlType\.','')
         name  = $name
         value = $val
+        sel   = $sel
+        pat   = $hasPattern
         x = [int]([math]::Max(0, $r.X - $ox))
         y = [int]([math]::Max(0, $r.Y - $oy))
         w = [int]$r.Width

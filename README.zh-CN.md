@@ -186,7 +186,7 @@ flowchart TB
 |---|---|---|
 | `batch_actions` | 开启 | 一次调用执行一串确定性动作，然后做一次 `get_window_state` |
 | `computer_use_health` | 始终 | 后端、允许列表、文档门禁、环境审计 |
-| `computer_use_uia_act` | 开启 | 按**元素名**用 UIA pattern（`SelectionItem`/`Invoke`/`LegacyIAccessible`）操作控件：不需要截图、不需要坐标，因此在 WGC 截不到的静态窗口上也能用；用 `"A、选项|下一题"` 链式多步，返回动作后的文本树 |
+| `computer_use_uia_act` | 开启 | 按**元素名**用 UIA pattern（`SelectionItem`/`Invoke`/`LegacyIAccessible`）操作控件：不需要截图、不需要坐标，因此在 WGC 截不到的静态窗口上也能用；用 `"A、选项|下一题"` 链式多步，返回动作后的文本树。**注意**：若目标是**完全没有任何 pattern 的裸 `Text` 节点**（微信小程序考试选项），兜底点击只代表"点发出去了"，页面可能根本不响应，必须另行验证（见下文 `scripts/uia-ticks.ps1`） |
 | `computer_use_wait` | 开启 | 固定等待（可选顺带重新观察），不占一次 helper 往返 |
 | `computer_use_wait_until` | 开启 | 轮询到文本出现 / 截图变化 / 超时为止 |
 | `computer_use_scroll_to` | 开启 | 用多次顺序滚轮脉冲滚到底/顶/约百分比（脉冲间 70ms，因为应用会合并快速脉冲） |
@@ -429,6 +429,9 @@ DSH官方的Computer Use采用设计思路不大一致。如果希望使用Codex
 同一轮还有两个配套行为：
 
 - `batch_actions` 现在由插件**逐步执行**，而不是一整个丢给 helper：每一步的 `shot-N` 截图 id 都像顶层调用一样翻译；连续两个坐标动作之间会补一次"只带截图"的观察；遇到 `user input was detected in this window` 会先补观察再重试这一步，而不是整批中止。
+- **微信小程序（WMPF）页面既不吃鼠标也不吃触摸注入**。实测 40 题安全考试：`SendInput` 点击事件确实送达（返回 2、光标回读正确、窗口在前台、`WindowFromPoint` 命中页面），但页面完全无反应；`InjectTouchInput` 全部 `err=87`，因为本机 `IsTouchWindow=false`。**真正有效的是两件事**：`scripts/uia-post.ps1`（`PostMessage` 直接把 `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/`WM_LBUTTONUP` 投给渲染子窗口，`lParam = x|y<<16`）与 `scripts/uia-ticks.ps1`（**按像素判红**读勾选框 ON/OFF）——这些选项是裸 `Text`、没有任何 `SelectionItem`/`Toggle` pattern，像素是唯一可信的回读手段。
+- **不要用"算出来的坐标"去点 WMPF 多选题**。选项标签的 `y` 不是勾选框的 `y`（实测某 5 选项题差 **+48**，且 4 选项与 5 选项行距不同），而且**每勾一次页面就会重排**，所以"读一次坐标再连点一批"必然错位。可靠姿势是：**人工勾选 + `uia-ticks.ps1` 像素复核**（先扫 200–440 竖带找红区定位行，再 `-Points "119,<y>;..."`）。
+- 交卷可以稳定用 `computer_use_uia_act`：点 `交卷` → 确认弹窗点 `提交`。已端到端验证（40/40，100 分）。
 - `computer_use_uia_act` 的点击兜底（给没有任何 UIA pattern 的节点）在注入事件上打了 helper 的 `SYNTHETIC_TAG`（`dwExtraInfo`），所以它自己的点击不会再被当成"人工输入"。
 - `computer_use_scroll_to` / `computer_use_reach_last_page` 不再只信滚轮。阶梯是：滚轮 → `Page_Down` → `Right` → `Next` → **插值 swipe**（`scripts/uia-swipe.ps1`：14 个中间移动、350ms、带 `SYNTHETIC_TAG`、**不需要 helper 捕获会话**；helper 自带的 `drag` 只有 4 个事件、中间没有移动，网页阅读器不认）。**是否真的翻动**用三信号判定，最硬的先判：页码「当前/总页」→ UIA 树文本 diff（`documentSnapshot()`，还能识别 `最后一页了` → `lastPage`）→ GDI 帧哈希；**帧相同只会降级为 `unknown`**，因为 `PrintWindow` 对 Chromium 表面常返回陈旧帧。返回体给出 `page`、`pageProbe`、`swipe:{ok,from:'document-rect'|'window-rect'}`、`moved:'text'|'frame'|'unknown'`、`lastPage`、`guidance`。树里第一个 `Document` 常常是**别的后台课程**，所以文档矩形要过“能塞进当前窗口”的检查，不合格就退回窗口矩形，保证 swipe 落在可见文档里。已证伪的一条路：**UIA ScrollPattern**——第一个可滚动节点是隐藏文档（`VerticalScrollPercent` 始终 `-1`），按“可见 + VerticallyScrollable”过滤后，81 个元素的树里一个都没有。
 
