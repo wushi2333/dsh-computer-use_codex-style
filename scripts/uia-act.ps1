@@ -99,9 +99,51 @@ $order = switch ($Action) {
   default { @('select', 'invoke', 'legacy') }
 }
 
+# --- Fallback for nodes that expose NO UIA pattern ---------------------------------
+# H5 pages (exam forms, custom checkboxes) expose their options as plain Text nodes:
+# SelectionItem/Invoke/LegacyIAccessible all fail. We still address the control by
+# NAME (that is the whole point of uia_act) and simply click the rectangle UIA reports.
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class CuMouse {
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint d, IntPtr e);
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+}
+"@ -ErrorAction SilentlyContinue
+
+function Click-At([int]$x, [int]$y) {
+  $p = New-Object CuMouse+POINT
+  [void][CuMouse]::GetCursorPos([ref]$p)
+  [void][CuMouse]::SetCursorPos($x, $y)
+  Start-Sleep -Milliseconds 40
+  [CuMouse]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)   # LEFT DOWN
+  [CuMouse]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)   # LEFT UP
+  Start-Sleep -Milliseconds 40
+  [void][CuMouse]::SetCursorPos($p.X, $p.Y)                 # leave the pointer where it was
+}
+
 $ok = $false
 foreach ($k in $order) {
   if (Try-Pattern $match $k) { $used = $k; $ok = $true; break }
+}
+
+$rect = ''
+if (-not $ok) {
+  try {
+    $r = $match.Current.BoundingRectangle
+    if ($r.Width -gt 2 -and $r.Height -gt 2) {
+      $cx = [int]($r.X + ($r.Width / 2))
+      $cy = [int]($r.Y + ($r.Height / 2))
+      Click-At $cx $cy
+      Start-Sleep -Milliseconds 140
+      $used = 'click'
+      $rect = "$cx,$cy"
+      $ok = $true
+    }
+  } catch { }
 }
 
 $name = ''
@@ -109,7 +151,7 @@ $ctl = ''
 try { $name = $match.Current.Name } catch { }
 try { $ctl = $match.Current.ControlType.ProgrammaticName } catch { }
 
-Write-Output ('{"ok":' + ($ok.ToString().ToLower()) + ',"action":"' + $used + '","matched":"' + ($name -replace '"', '\"') + '","control":"' + $ctl + '"}')
+Write-Output ('{"ok":' + ($ok.ToString().ToLower()) + ',"action":"' + $used + '","matched":"' + ($name -replace '"', '\"') + '","control":"' + $ctl + '","at":"' + $rect + '"}')
 
 if ($Dump) {
   Start-Sleep -Milliseconds 250
