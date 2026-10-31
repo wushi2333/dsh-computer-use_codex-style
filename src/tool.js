@@ -788,6 +788,53 @@ export function frameHash(hwnd) {
 }
 
 /**
+ * Text snapshot of the window's UIA tree (the .NET walk the plugin already uses).
+ * A slide reader's document text carries the page counter and the completion marker
+ * ("最后一页了"), so a text diff is the most reliable "did it move" signal there is —
+ * far better than pixels, and it needs neither a capture session nor a lease.
+ */
+export function documentSnapshot(hwnd) {
+  if (!Number.isInteger(hwnd) || hwnd <= 0) return null
+  try {
+    const nodes = uiaTreeFallback(hwnd, 600)
+    if (!Array.isArray(nodes) || nodes.length === 0) return null
+    const text = nodes.map(n => [n.name, n.value].filter(Boolean).join(' ')).join('\n')
+    return { text, lastPage: /最后一页了|最后一页|已学完|学习完成/.test(text) }
+  } catch {
+    return null
+  }
+}
+
+/** The visible Document node's window-relative rect, if the tree reports one. */
+export function documentRect(hwnd) {
+  if (!Number.isInteger(hwnd) || hwnd <= 0) return null
+  try {
+    const nodes = uiaTreeFallback(hwnd, 600)
+    if (!Array.isArray(nodes) || nodes.length === 0) return null
+    // The node objects carry no geometry fields, but the formatted tree prints the UIA
+    // bounding rectangle after each label: "Document 核心制度培训… {{x:8,y:56,w:768,h:1564}}".
+    // Measured: the first Document line is the visible one, so parse from there.
+    const text = formatUiaFallback(nodes)
+    const m = /(?:Document|文档)\b[^\n{]*\{\{x:(-?\d+),y:(-?\d+),w:(\d+),h:(\d+)\}\}/.exec(text)
+    if (m) {
+      const [x, y, width, height] = m.slice(1, 5).map(Number)
+      if (width > 40 && height > 40) return { x, y, width, height }
+    }
+    // Last resort: accept any node whose formatted line has a large rect.
+    const loose = /\{\{x:(-?\d+),y:(-?\d+),w:(\d+),h:(\d+)\}\}/g
+    let best = null
+    for (const hit of text.matchAll(loose)) {
+      const [x, y, width, height] = hit.slice(1, 5).map(Number)
+      if (width < 200 || height < 200) continue
+      if (!best || width * height > best.width * best.height) best = { x, y, width, height }
+    }
+    return best
+  } catch {
+    return null
+  }
+}
+
+/**
  * Swipe with `SendInput` directly, bypassing the helper.
  *
  * The helper's `drag` jumps straight from press to release (4 events, no motion in
@@ -1286,28 +1333,54 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps, probe = 
       result.page = { from: ind.current, to: ind.current, total: ind.total, key: null, wheelStoppedAt: ind.current }
     } else {
       // No page counter at all (the UIA walk failed, or the page has none). Staying
-      // silent here made "never even tried" look identical to "tried and failed", so
-      // issue one interpolated swipe and prove the outcome with a frame hash.
+      // silent here made "never even tried" look identical to "tried and failed".
+      //
+      // Three signals, strongest first: a text diff of the UIA tree (a slide reader's
+      // document text carries "1/13" and the completion marker), then a frame hash, and
+      // when neither moved we say UNKNOWN rather than false — GDI PrintWindow happily
+      // returns a stale frame for a Chromium surface, so "same pixels" is not proof.
+      const before = documentSnapshot(hwnd)
+      const hashBefore = frameHash(hwnd)
       const geo = state && state.lastShotMeta ? state.lastShotMeta : null
       const w = Number(geo && geo.width) > 0 ? Number(geo.width) : 784
       const h = Number(geo && geo.height) > 0 ? Number(geo.height) : 1628
-      const cy = Number.isFinite(y) ? y : Math.round(h / 2)
-      const before = frameHash(hwnd)
+      const doc = documentRect(hwnd)
+      // A WebView2 window can hold SEVERAL documents (a hidden tab from an earlier
+      // course). Only a rect that fits this window is the one on screen — measured: the
+      // first Document line belonged to a 768x1564 portrait document inside a 1668x744
+      // window, and swiping there would land off-window.
+      const box = doc
+        && doc.x >= -8 && doc.y >= -8
+        && doc.x + doc.width <= w + 24 && doc.y + doc.height <= h + 24
+        ? doc
+        : null
+      const left = box ? box.x : 0
+      const right = box ? box.x + box.width : w
+      const cy = box ? Math.round(box.y + box.height / 2) : (Number.isFinite(y) ? y : Math.round(h / 2))
       const swiped = swipeViaScript(hwnd, {
-        fromX: Math.round(w * 0.78), fromY: cy, toX: Math.round(w * 0.2), toY: cy,
+        fromX: Math.round(left + (right - left) * 0.78),
+        fromY: cy,
+        toX: Math.round(left + (right - left) * 0.2),
+        toY: cy,
       })
-      const after = frameHash(hwnd)
+      const after = documentSnapshot(hwnd)
+      const hashAfter = frameHash(hwnd)
+      const textMoved = Boolean(before && after && before.text !== after.text)
+      const frameMoved = Boolean(hashBefore && hashAfter && hashBefore !== hashAfter)
       result.page = null
       result.pageProbe = 'unavailable'
-      result.swipe = { ok: Boolean(swiped && swiped.ok === true) }
-      result.moved = before && after ? before !== after : 'unknown'
+      result.swipe = { ok: Boolean(swiped && swiped.ok === true), from: box ? 'document-rect' : 'window-rect' }
+      result.moved = textMoved ? 'text' : (frameMoved ? 'frame' : 'unknown')
+      result.lastPage = Boolean(after && after.lastPage)
       result.guidance = 'No "current/total" page counter could be read for this window, so paging cannot be measured. '
-        + 'One interpolated swipe was issued: '
-        + (result.moved === true
-          ? 'the frame CHANGED, so the gesture landed — call reach_last_page again (or scroll_to) to continue.'
-          : result.moved === false
-            ? 'the frame did NOT change — this viewer needs another gesture (ScrollPattern, or a click on its next control).'
-            : 'the frame could not be captured either, so movement is UNKNOWN.')
+        + 'One interpolated swipe was issued inside the visible document rectangle: '
+        + (textMoved
+          ? 'the accessibility text CHANGED, so the gesture landed — call reach_last_page again to continue.'
+          : frameMoved
+            ? 'the frame changed but the text did not — possibly a transient paint; re-read the page before trusting it.'
+            : 'nothing observable changed. GDI frames can be stale on Chromium, so this is UNKNOWN rather than a '
+              + 'proven no-op; if it really did not move, the viewer needs a click on its next control.')
+        + (result.lastPage ? ' The document already reports its LAST page.' : '')
     }
   }
   return result
