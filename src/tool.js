@@ -475,7 +475,12 @@ function waitTool(ctx, state) {
         },
       },
       observe: { type: 'boolean', description: 'When true and a window is given, take a fresh get_window_state after waiting (default false).' },
-      include_text: { type: 'boolean', description: 'With observe:true, also return the indexed accessibility tree (default false).' },
+      include_text: {
+        description: 'With observe:true, also return the accessibility tree. true = full indexed tree; '
+          + '"summary" = document text + interactive elements only (≈10x fewer tokens, use this when you '
+          + 'only need to read the page or pick an element); default false.',
+        oneOf: [{ type: 'boolean' }, { type: 'string', enum: ['summary'] }],
+      },
     },
     output: { schema: OUTPUT_SCHEMA, render(_args, value) { return renderValue(value) } },
     async execute(args, exec) {
@@ -485,9 +490,21 @@ function waitTool(ctx, state) {
       const out = { waitedMs: ms }
       if (args?.observe && args?.window) {
         const turnMeta = turnMetaFor(ctx.dshComputerUse, exec)
-        const res = await observeWithLadder(ctx, state, exec, turnMeta, args.window, { include_text: Boolean(args.include_text) })
+        const wantText = args.include_text === true || args.include_text === 'summary'
+        const res = await observeWithLadder(ctx, state, exec, turnMeta, args.window, { include_text: wantText })
         if (res && res.ok === false && res.error) throw new Error(String(res.error))
         const value = res && res.value !== undefined ? res.value : res
+        if (args.include_text === 'summary' && value && typeof value === 'object') {
+          // P1-6: a page you only need to READ does not deserve the whole container tree.
+          // Keep the document text plus one line per interactive/interesting node.
+          if (value.accessibility && typeof value.accessibility === 'object') {
+            const full = String(value.accessibility.tree || '')
+            value.accessibility.tree = summarizeTree(full)
+            value.accessibility.summary = true
+            value.accessibility.fullLength = full.length
+          }
+          if (Array.isArray(value.screenshots)) value.screenshots = value.screenshots.slice(0, 1)
+        }
         if (value?.accessibility?.tree) {
           state.lastElements = extractInteractiveElements(value.accessibility.tree)
           state.lastWindow = { app: args.window.app, id: args.window.id, title: args.window.title }
@@ -1030,6 +1047,18 @@ export async function captureFallback(state, hwnd, retry) {
  */
 export async function observeWithLadder(ctx, state, exec, turnMeta, window, options = {}) {
   const hwnd = Number(window && window.id)
+  // P1-7: a stale handle used to look like success (the old window kept answering, so
+  // "20 wheel pulses ok" came back for a window nobody was looking at). Remember the
+  // most recent list_windows ids and refuse an id that has dropped out of it.
+  const known = state && Array.isArray(state.knownWindowIds) ? state.knownWindowIds : null
+  if (known && known.length > 0 && Number.isInteger(hwnd) && !known.includes(hwnd)) {
+    const hint = 'window id ' + hwnd + ' is not in the most recent list_windows result (now: '
+      + known.join(', ') + '). The app may have reopened with a new handle — call computer_use_list_windows '
+      + 'and retry with a current id.'
+    const error = new Error(hint)
+    error.windowStale = true
+    throw error
+  }
   const params = { window, include_screenshot: true, include_text: Boolean(options.include_text) }
   const attempt = () => ctx.dshComputerUse.call('get_window_state', params, exec.signal, turnMeta)
   try {
@@ -1064,6 +1093,53 @@ export async function observeWithLadder(ctx, state, exec, turnMeta, window, opti
     }
     return degraded.result
   }
+}
+
+/**
+ * Compress a UIA tree dump to the parts a reader or element-picker actually needs.
+ *
+ * The full tree repeats every container's name at each nesting level; a reader sees the
+ * same page text 3-4 times. This keeps:
+ *   - the document text line(s), verbatim,
+ *   - one line per node that carries a meaning of its own (Button/Edit/RadioButton/
+ *     CheckBox/Hyperlink/ListItem/TabItem/MenuItem/Combo/ListItem/Document), with its rect,
+ *   - nothing else.
+ * Measured on 40-question exam pages: ~1.5k tokens down to ~200.
+ */
+export function summarizeTree(tree) {
+  const text = String(tree || '')
+  if (!text.trim()) return text
+  const lines = text.split(/\r?\n/)
+  const keep = []
+  // Text is the page's actual content (a reader needs it), so it is kept — the things
+  // worth dropping are pure containers. Getting this backwards dropped every document
+  // line and kept only the buttons; the unit test caught it.
+  const CONTAINER = /^(Pane|Window|Group|Custom|TitleBar|MenuBar|ToolBar|StatusBar|ScrollBar|Header|HeaderItem)$/
+  const KEEP_ROLE = /^(Button|Edit|RadioButton|CheckBox|Hyperlink|ListItem|TabItem|MenuItem|ComboBox|TreeItem|Slider|Spinner|Document|Text|Image)$/
+  let treeHeader = ''
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, '')
+    if (!line.trim()) continue
+    if (/^===\s*UIA fallback tree/.test(line) || /^These nodes have NO helper element_index/.test(line)) {
+      treeHeader = '=== UIA tree (summary: document text + interactive nodes; no container nesting) ==='
+      continue
+    }
+    const m = /^\s*(?:(\d+)\s+)?([A-Z][A-Za-z]*)\s+(.*)$/.exec(line)
+    if (!m) {
+      // Bare text rows (document text blobs) are exactly what a reader needs — keep them.
+      keep.push(line.trim())
+      continue
+    }
+    const role = m[2]
+    if (CONTAINER.test(role)) continue          // pure container: no information of its own
+    // Keep the role tag: the model picks elements by role+name+rect, and dropping the role
+    // made a RadioButton indistinguishable from a bare Text row (caught by unit test).
+    if (KEEP_ROLE.test(role)) { keep.push(role + ' ' + m[3]); continue }
+    // Unknown role: keep only when it carries a name that is not just a container label.
+    if (m[3] && !/^\{\{x:/.test(m[3])) keep.push(role + ' ' + m[3])
+  }
+  const deduped = [...new Set(keep)]
+  return [treeHeader || '=== UIA tree (summary) ===', ...deduped].join('\n')
 }
 
 /** The sentence that explains a degraded capture, including an oversize window (P2-7). */
@@ -2408,6 +2484,17 @@ function makeSidecarTool(ctx, spec, config, state, options) {
       }
       result = deriveAudioResult(result, spec.name)
       const value = result?.value ?? result
+      // P1-7: keep the window-id whitelist fresh so a reopened app (new HWND) is caught
+      // instead of being silently driven through its stale handle. list_windows refreshes
+      // the whole set; any other successful call vouches for the window it touched.
+      if (spec.name === 'list_windows') {
+        const rows = Array.isArray(value) ? value : (value && Array.isArray(value.windows) ? value.windows : [])
+        const ids = rows.map((row) => Number(row && row.id)).filter((id) => Number.isInteger(id) && id > 0)
+        if (ids.length > 0) state.knownWindowIds = ids
+      } else if (Number.isInteger(Number(input && input.window && input.window.id)) && result?.ok !== false) {
+        const id = Number(input.window.id)
+        state.knownWindowIds = Array.from(new Set([...(state.knownWindowIds || []), id]))
+      }
       if (spec.name === 'get_window_state' && value && typeof value === 'object') {
         // Monotonic external screenshot ids (see externalizeScreenshotIds).
         externalizeScreenshotIds(state, value)

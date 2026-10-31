@@ -20,6 +20,7 @@ import {
   rememberFrame,
   runBatchActions,
   runScrollTo,
+  summarizeTree,
   translateNestedActionIds,
   translateScreenshotId,
 } from '../src/tool.js'
@@ -376,4 +377,36 @@ test('a gallery that ignores wheel and keys is paged by swipe', async () => {
   // Three key strategies × 7 presses each found nothing; the six swipes did the work.
   assert.equal(calls.filter(c => c.name === 'press_key').length, 21)
   assert.equal(calls.filter(c => c.name === 'drag').length, 6)
+})
+
+test('summarizeTree keeps document text and interactive rows, drops container nesting', () => {
+  const full = [
+    '=== UIA fallback tree (.NET UIAutomation ControlView) ===',
+    'These nodes have NO helper element_index. Act by x/y using the window-relative bounds.',
+    '',
+    '\tWindow 微信 {{x:0,y:0,w:784,h:1628}}',
+    '\t\tPane 微信 {{x:8,y:8,w:768,h:1612}}',
+    '\t\t\tPane 微信 {{x:8,y:8,w:768,h:1612}}',
+    '\t\t\t\tText 医院全员安全生产知识考核 {{x:72,y:67,w:640,h:21}}',
+    '\t\t\t\tText A、 {{x:144,y:216,w:24,h:16}}',
+    '\t\t\t\tRadioButton A、无水乙醇 {{x:0,y:203,w:13,h:13}}',
+    '\t\t\t\tButton 下一题 {{x:538,y:1573,w:101,h:35}}',
+  ].join('\n')
+  const out = summarizeTree(full)
+  // Container panes carry no information of their own and are dropped.
+  assert.ok(!out.includes('Pane 微信'), 'container panes should be dropped')
+  // Document text and interactive nodes survive.
+  assert.ok(out.includes('医院全员安全生产知识考核'), 'document text must survive')
+  assert.ok(out.includes('RadioButton A、无水乙醇'), 'interactive node must survive')
+  assert.ok(out.includes('Button 下一题'), 'button must survive')
+  assert.ok(out.startsWith('=== UIA tree (summary'), 'summary header replaces the wall of instructions')
+  // And it is meaningfully shorter than the input.
+  assert.ok(out.length < full.length, 'summary must be smaller than the full tree')
+})
+
+test('summarizeTree is a no-op for empty input', () => {
+  assert.equal(summarizeTree(''), '')
+  // null/undefined normalize to the empty string rather than the literal "null".
+  assert.equal(summarizeTree(null), '')
+  assert.equal(summarizeTree(undefined), '')
 })
