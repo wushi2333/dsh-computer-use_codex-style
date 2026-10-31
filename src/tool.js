@@ -1067,6 +1067,11 @@ async function pageThroughByKeys(ctx, win, start, exec, turnMeta, probe, opts = 
   const toX = forward ? rightX : leftX
   let cur = out.to
   for (let i = 0; i < budget(); i += 1) {
+    // A drag is a coordinate action: it needs the lease, and every other swipe re-clears
+    // the input monitor so one un-taggable event cannot poison the rest of the run.
+    if (i % 2 === 1) {
+      try { await ctx.dshComputerUse.call('clear_user_input', {}, exec.signal, turnMeta) } catch { /* older helper */ }
+    }
     try {
       await ctx.dshComputerUse.call(
         'drag',
@@ -1157,9 +1162,28 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps, probe = 
     let ind = null
     try { ind = probe(hwnd) } catch { ind = null }
     if (ind && !atTargetEnd(ind)) {
+      // Swiping needs a live capture lease AND the window's CURRENT rectangle: the cached
+      // `lastShotMeta` can predate a resize (784x1628 -> 1668x744), which puts the swipe
+      // endpoints outside the window and makes every drag fail silently.
+      let fresh = null
+      try {
+        const observed = await ctx.dshComputerUse.call(
+          'get_window_state',
+          { window: win, include_screenshot: true, include_text: false },
+          exec.signal,
+          turnMeta,
+        )
+        const shot = observed && observed.value && Array.isArray(observed.value.screenshots)
+          ? observed.value.screenshots[0]
+          : null
+        if (shot && shot.width && shot.height) {
+          fresh = { width: shot.width, height: shot.height }
+          if (state) state.lastShotMeta = { ...(state.lastShotMeta || {}), width: shot.width, height: shot.height }
+        }
+      } catch { /* paging still tries; the swipe loop reports the stall */ }
       const paged = await pageThroughByKeys(ctx, win, ind, exec, turnMeta, probe, {
-        width: Number(state && state.lastShotMeta && state.lastShotMeta.width) || undefined,
-        height: Number(state && state.lastShotMeta && state.lastShotMeta.height) || undefined,
+        width: fresh && fresh.width,
+        height: fresh && fresh.height,
         y,
         direction: to,
       })
