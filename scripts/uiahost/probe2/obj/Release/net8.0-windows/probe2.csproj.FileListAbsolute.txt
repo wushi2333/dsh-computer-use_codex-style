@@ -1,0 +1,5 @@
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe2\obj\Release\net8.0-windows\probe2.GeneratedMSBuildEditorConfig.editorconfig
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe2\obj\Release\net8.0-windows\probe2.AssemblyInfoInputs.cache
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe2\obj\Release\net8.0-windows\probe2.AssemblyInfo.cs
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe2\obj\Release\net8.0-windows\probe2.csproj.CoreCompileInputs.cache
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe2\obj\Release\net8.0-windows\probe2.sourcelink.json

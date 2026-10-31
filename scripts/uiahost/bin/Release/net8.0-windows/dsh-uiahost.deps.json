@@ -1,0 +1,23 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "dsh-uiahost/1.0.0": {
+        "runtime": {
+          "dsh-uiahost.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "dsh-uiahost/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

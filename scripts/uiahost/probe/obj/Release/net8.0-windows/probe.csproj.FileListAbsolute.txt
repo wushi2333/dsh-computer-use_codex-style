@@ -1,0 +1,15 @@
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\bin\Release\net8.0-windows\probe.exe
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\bin\Release\net8.0-windows\probe.deps.json
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\bin\Release\net8.0-windows\probe.runtimeconfig.json
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\bin\Release\net8.0-windows\probe.dll
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\bin\Release\net8.0-windows\probe.pdb
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\obj\Release\net8.0-windows\probe.GeneratedMSBuildEditorConfig.editorconfig
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\obj\Release\net8.0-windows\probe.AssemblyInfoInputs.cache
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\obj\Release\net8.0-windows\probe.AssemblyInfo.cs
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\obj\Release\net8.0-windows\probe.csproj.CoreCompileInputs.cache
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\obj\Release\net8.0-windows\probe.sourcelink.json
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\obj\Release\net8.0-windows\probe.dll
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\obj\Release\net8.0-windows\refint\probe.dll
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\obj\Release\net8.0-windows\probe.pdb
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\obj\Release\net8.0-windows\probe.genruntimeconfig.cache
+C:\AITask\dsh-client-config\plugins\dsh-computer-use\scripts\uiahost\probe\obj\Release\net8.0-windows\ref\probe.dll
