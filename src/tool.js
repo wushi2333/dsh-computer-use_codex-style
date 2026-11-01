@@ -18,6 +18,7 @@ import { getCapabilities, capabilityGuidance } from './capabilities.js'
 import { runScript } from './drivers/index.js'
 import { parseJsonLine, frameObservation, rememberFrame, recallFrame } from './capture/frames.js'
 export { parseJsonLine, frameObservation, rememberFrame, recallFrame } from './capture/frames.js'
+import { OUTPUT_SCHEMA, WIN_SCHEMA, WIN_PARAM, sleepRespectingSignal } from './shared/index.js'
 import { captureGuidance, noteWedge, isWedged, friendlyActionError } from './errors/index.js'
 export { captureGuidance, noteWedge, isWedged, friendlyActionError } from './errors/index.js'
 
@@ -117,14 +118,6 @@ export const Config = Schema.object({
   // (commits 0b11afb/bd2ef99); the option had no consumer left. Audit P2-10.
 })
 
-const OUTPUT_SCHEMA = {
-  // `value` carries arbitrary tool output (object, array, string, number...), so the
-  // schema is intentionally open. The host validator rejects an untyped `properties.value`
-  // (both `{}` and `{type:'json'}` fail), so we declare no properties at all and accept
-  // any object shape via additionalProperties.
-  type: 'object',
-  additionalProperties: true,
-}
 
 const BROWSER_SKILL = 'computer-use-browser'
 
@@ -458,16 +451,6 @@ function healthTool(ctx, state, config, startError) {
 
 const WAIT_MAX_MS = 60_000
 
-/** Sleeping that honours the tool-call abort signal. */
-function sleepRespectingSignal(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) { reject(new Error('wait aborted')); return }
-    const timer = setTimeout(() => { cleanup(); resolve() }, ms)
-    const onAbort = () => { cleanup(); reject(new Error('wait aborted')) }
-    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener?.('abort', onAbort) }
-    signal?.addEventListener?.('abort', onAbort)
-  })
-}
 
 /**
  * Desktop `wait`: the missing counterpart of the browser's `tab_pw_wait_for_timeout`.
@@ -670,21 +653,6 @@ const UIA_ACT_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), '
 // document-URL export, and region cropping.
 // ---------------------------------------------------------------------------
 
-// Author-facing value schema for a window handle. `required` is a per-property
-// annotation in the harness DSL; an object node must NOT carry a `required` array
-// (schema.ts assertAuthorKeys rejects it).
-const WIN_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  properties: {
-    app: { type: 'string', required: true },
-    id: { type: 'integer', required: true },
-    title: { type: 'string' },
-  },
-}
-
-/** A `window` parameter (required) built from {@link WIN_SCHEMA}. */
-const WIN_PARAM = { ...WIN_SCHEMA, required: true }
 
 /** Write a base64 image to a temp file, crop it with System.Drawing, return base64 PNG. */
 const CROP_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'crop-image.ps1')
@@ -2733,6 +2701,7 @@ async function admitImages(ctx, images) {
   }
   return []
 }
+
 
 
 
