@@ -13,7 +13,7 @@ import { execFileSync } from 'node:child_process'
 import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { computerUsePrompt, documentationSummary, promptAssetStatus, BROWSER_REQUIRED_FOR } from './prompt.js'
-import { getUiaHost, closeUiaHost } from './uiahost-client.js'
+import { getUiaHost, getUiaHostReady, prewarmUiaHost, closeUiaHost } from './uiahost-client.js'
 
 export const name = 'tool-computer-use'
 export const inject = ['tools', 'dshComputerUse', 'systemPrompt']
@@ -295,6 +295,12 @@ async function registerDesktop(ctx, state, config) {
   // P0-3 / P0-4: read and set tick states through the persistent UIA host.
   registerTool(ctx, state, readOptionsTool(ctx, state))
   registerTool(ctx, state, setOptionsTool(ctx, state))
+  // Warm the host in the background so its ~3.5 s PowerShell start-up is paid at plugin
+  // load, not on the first read_options call. Fire-and-forget: a failure here is harmless
+  // (the first real call retries) and it must never delay or fail plugin registration.
+  if (config.prewarmUiaHost !== false) {
+    setTimeout(() => { prewarmUiaHost().catch(() => { }) }, 0)
+  }
   const exposed = desktops.concat(extras)
   for (const spec of exposed) {
     try {
@@ -1902,7 +1908,7 @@ export function readOptionsTool(ctx, state) {
       const win = args && args.window
       const hwnd = Number(win && win.id)
       if (!Number.isInteger(hwnd) || hwnd <= 0) throw new Error('window.id is required')
-      const host = getUiaHost()
+      const host = await getUiaHostReady()
       const res = await host.read(hwnd)
       if (res.ok !== true) throw new Error(String(res.error || 'could not read the page'))
       return {
@@ -1939,7 +1945,7 @@ export function setOptionsTool(ctx, state) {
       const hwnd = Number(win && win.id)
       if (!Number.isInteger(hwnd) || hwnd <= 0) throw new Error('window.id is required')
       const target = String((args && args.target) || '').toUpperCase().replace(/[^A-E]/g, '')
-      const host = getUiaHost()
+      const host = await getUiaHostReady()
       const res = await host.set(hwnd, target)
       if (res.ok !== true) throw new Error(String(res.error || 'could not set the options'))
       return {
@@ -3143,3 +3149,4 @@ async function admitImages(ctx, images) {
   }
   return []
 }
+

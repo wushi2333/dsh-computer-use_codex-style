@@ -81,6 +81,36 @@ export class UiaHostClient {
 
 let singleton = null
 
+/** The in-flight warm-up promise while the process starts; null once it has finished. */
+let warming = null
+
+/**
+ * Start the host ahead of the first real call, so its ~3.5 s PowerShell start-up
+ * (process spawn + UIA assembly load, measured 2026-11-01) does not land on top of a
+ * tool call. Never throws: a failed warm-up just means the first real call pays the cost.
+ */
+export function prewarmUiaHost(script = HOST_SCRIPT) {
+  if (singleton && singleton.child.exitCode === null) return Promise.resolve(singleton)
+  if (warming) return warming
+  warming = (async () => {
+    const host = new UiaHostClient(script)
+    singleton = host
+    try {
+      const pong = await host.ping()
+      if (pong && pong.ok === true) return host
+    } catch { /* caller will retry on the real call */ }
+    return host
+  })().finally(() => { warming = null })
+  return warming
+}
+
+/** Wait for an in-flight warm-up before handing back the singleton, so the first real
+ *  call is charged a fast read, not a fresh spawn. */
+export async function getUiaHostReady(script = HOST_SCRIPT) {
+  if (warming) { try { await warming } catch { } }
+  return getUiaHost(script)
+}
+
 /** 进程内单例：第一次调用开始常驻，之后所有请求都复用它。 */
 export function getUiaHost(script = HOST_SCRIPT) {
   if (!singleton || singleton.child.exitCode !== null) singleton = new UiaHostClient(script)
@@ -89,4 +119,5 @@ export function getUiaHost(script = HOST_SCRIPT) {
 
 export function closeUiaHost() {
   if (singleton) { singleton.close(); singleton = null }
+  warming = null
 }
