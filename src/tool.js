@@ -7,6 +7,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { nativeHelperCandidates, pluginRoot } from './paths.js'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
@@ -572,23 +573,76 @@ export function cropImageBase64(base64, mimeType, region, origin, frame) {
   if (frame && Number.isFinite(frame.width)) w = Math.min(w, Math.max(1, frame.width - x))
   if (frame && Number.isFinite(frame.height)) h = Math.min(h, Math.max(1, frame.height - y))
   const inExt = /png/i.test(String(mimeType || '')) ? 'png' : 'jpg'
-  let dir = null
-  try {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-crop-'))
-    const inPath = path.join(dir, `in.${inExt}`)
-    const outPath = path.join(dir, 'out.png')
-    fs.writeFileSync(inPath, Buffer.from(base64, 'base64'))
-    execFileSync('powershell.exe', [
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', CROP_SCRIPT,
-      '-InPath', inPath, '-OutPath', outPath,
-      '-X', String(x), '-Y', String(y), '-W', String(w), '-H', String(h),
-    ], { timeout: 15_000, windowsHide: true })
-    return fs.readFileSync(outPath).toString('base64')
-  } catch {
-    return null
-  } finally {
-    try { if (dir) fs.rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ }
+  // Try os.tmpdir() first (the normal case). If the crop tool cannot write there — a
+  // restricted sandbox can forbid the CHILD process (helper or powershell) writing under
+  // %TEMP% even when this process can — fall back to a temp dir under the plugin root,
+  // which is where this code already lives and is therefore writable.
+  const tryIn = (baseDir) => {
+    let dir = null
+    try {
+      dir = fs.mkdtempSync(path.join(baseDir, 'cu-crop-'))
+    } catch {
+      return null
+    }
+    try {
+      const inPath = path.join(dir, `in.${inExt}`)
+      const outPath = path.join(dir, 'out.png')
+      fs.writeFileSync(inPath, Buffer.from(base64, 'base64'))
+      // Prefer the Rust helper's one-shot crop (no powershell.exe process); fall back to
+      // scripts/crop-image.ps1 when no usable helper wrote the output.
+      let wrote = cropWithHelper(inPath, outPath, x, y, w, h)
+      if (!wrote) {
+        try {
+          execFileSync('powershell.exe', [
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', CROP_SCRIPT,
+            '-InPath', inPath, '-OutPath', outPath,
+            '-X', String(x), '-Y', String(y), '-W', String(w), '-H', String(h),
+          ], { timeout: 15_000, windowsHide: true })
+          wrote = fs.existsSync(outPath)
+        } catch { wrote = false }
+      }
+      if (!wrote) return null
+      return fs.readFileSync(outPath).toString('base64')
+    } catch {
+      return null
+    } finally {
+      try { if (dir) fs.rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ }
+    }
   }
+  const tmpBase = path.join(pluginRoot(), '.cu-tmp')
+  try { fs.mkdirSync(tmpBase, { recursive: true }) } catch { /* best effort */ }
+  return tryIn(os.tmpdir()) ?? tryIn(tmpBase)
+}
+
+/**
+ * P1 migration: crop via the Rust helper's env-triggered one-shot mode
+ * (DSH_CU_CROP_IN/OUT/X/Y/W/H). Returns true only when a helper binary actually wrote
+ * outPath; false means "no usable helper", so the caller falls back to the ps1 script.
+ * Any failure is a silent false so the ps1 fallback runs — behaviour stays identical while
+ * the powershell call is phased out.
+ */
+function cropWithHelper(inPath, outPath, x, y, w, h) {
+  for (const candidate of nativeHelperCandidates()) {
+    try {
+      if (!fs.existsSync(candidate)) continue
+      execFileSync(candidate, [], {
+        timeout: 15_000,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          DSH_CU_CROP_IN: inPath,
+          DSH_CU_CROP_OUT: outPath,
+          DSH_CU_CROP_X: String(x),
+          DSH_CU_CROP_Y: String(y),
+          DSH_CU_CROP_W: String(w),
+          DSH_CU_CROP_H: String(h),
+        },
+      })
+      if (fs.existsSync(outPath)) return true
+    } catch { /* try next candidate / fall back to ps1 */ }
+  }
+  return false
 }
 
 // ---------------------------------------------------------------------------
@@ -2237,6 +2291,8 @@ async function admitImages(ctx, images) {
   }
   return []
 }
+
+
 
 
 

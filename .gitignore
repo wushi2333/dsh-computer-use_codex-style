@@ -63,3 +63,5 @@ parity/*.png
 parity/*.jpg
 parity/*.jpeg
 parity/_verify-all-*.txt
+.cu-tmp/
+

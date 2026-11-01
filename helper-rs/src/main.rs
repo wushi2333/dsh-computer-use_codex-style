@@ -128,6 +128,22 @@ fn main() {
     if cursor_manager {
         std::process::exit(run_system_cursor_manager(parent_pid));
     }
+    // P1 migration: one-shot image crop, replacing scripts/crop-image.ps1 (System.Drawing)
+    // with the Rust `image` crate — no powershell.exe process. Triggered via the ENVIRONMENT
+    // (like DSH_CU_PRINT_BUILD), so the argv surface stays the exact official one.
+    //   DSH_CU_CROP_IN / DSH_CU_CROP_OUT    input / output png paths (required)
+    //   DSH_CU_CROP_X / _Y / _W / _H        region (W/H <= 0 => to the edge; defaults 0)
+    if let Ok(in_path) = std::env::var("DSH_CU_CROP_IN") {
+        let out_path = std::env::var("DSH_CU_CROP_OUT").unwrap_or_default();
+        let env_i = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+        let (x, y, w, h) = (
+            env_i("DSH_CU_CROP_X"),
+            env_i("DSH_CU_CROP_Y"),
+            env_i("DSH_CU_CROP_W"),
+            env_i("DSH_CU_CROP_H"),
+        );
+        std::process::exit(run_crop_image_oneshot(&in_path, &out_path, x, y, w, h));
+    }
     if let Some(payload) = prev_notify.as_deref() {
         // Official: the notify hook calls back with the previous payload so the
         // helper can restore the user's original notify config on turn end.
@@ -213,6 +229,45 @@ fn main() {
             break;
         }
         let _ = stdout.flush();
+    }
+}
+
+/// P1 migration: one-shot crop for `scripts/crop-image.ps1` parity. Decodes InPath (jpg/png),
+/// crops [x,y,w,h] (w/h <= 0 => to the edge, clamped into bounds), writes OutPath as PNG.
+/// Prints {"ok":true,"out":...} / {"ok":false,"error":...} and returns the exit code
+/// (0 write / 1 fail), matching the ps1 contract's exit semantics exactly.
+fn run_crop_image_oneshot(in_path: &str, out_path: &str, x: i64, y: i64, w: i64, h: i64) -> i32 {
+    if out_path.is_empty() {
+        eprintln!("crop-image: empty out path");
+        println!("{{\"ok\":false,\"error\":\"empty out path\"}}");
+        return 1;
+    }
+    let result = (|| -> Result<(), String> {
+        let img = image::open(in_path).map_err(|e| format!("open {in_path}: {e}"))?;
+        let (iw, ih) = (img.width() as i64, img.height() as i64);
+        let x0 = x.max(0).min((iw - 1).max(0));
+        let y0 = y.max(0).min((ih - 1).max(0));
+        let cw = if w <= 0 { iw - x0 } else { w.min(iw - x0) };
+        let ch = if h <= 0 { ih - y0 } else { h.min(ih - y0) };
+        if cw <= 0 || ch <= 0 {
+            return Err("empty crop region".to_string());
+        }
+        let sub = img.crop_imm(x0 as u32, y0 as u32, cw as u32, ch as u32);
+        sub.save(out_path).map_err(|e| format!("save {out_path}: {e}"))?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            let esc = out_path.replace('\\', "\\\\").replace('"', "\\\"");
+            println!("{{\"ok\":true,\"out\":\"{esc}\"}}");
+            0
+        }
+        Err(msg) => {
+            eprintln!("crop-image: {msg}");
+            let esc = msg.replace('\\', "\\\\").replace('"', "\\\"");
+            println!("{{\"ok\":false,\"error\":\"{esc}\"}}");
+            1
+        }
     }
 }
 
