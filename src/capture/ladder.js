@@ -22,6 +22,7 @@
 import { execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import { nativeHelperCandidates } from '../paths.js'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -42,6 +43,14 @@ const GDI_CAPTURE_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)
  */
 export function runCaptureScript(hwnd, options = {}) {
   if (!Number.isInteger(hwnd) || hwnd <= 0) return { ok: false, error: 'bad window id' }
+  // P1 migration: the Rust helper already owns the full capture_hwnd ladder (WGC -> GDI,
+  // nudge, overlay masking) — a superset of gdi-capture.ps1. Its one-shot mode is preferred;
+  // the ps1 is the fallback when no helper wrote a frame (nudgeOnly always uses ps1, because
+  // the helper's nudge is folded into its own capture path, not a standalone no-output op).
+  if (!options.nudgeOnly && options.outPath) {
+    const viaHelper = captureWithHelper(hwnd, options.outPath)
+    if (viaHelper) return viaHelper
+  }
   const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', GDI_CAPTURE_SCRIPT, '-Hwnd', String(hwnd)]
   if (options.nudgeOnly) args.push('-NudgeOnly')
   else if (options.outPath) args.push('-OutPath', String(options.outPath))
@@ -54,6 +63,36 @@ export function runCaptureScript(hwnd, options = {}) {
     return parseJsonLine(error && error.stdout)
       || { ok: false, error: String(error && error.message ? error.message : error) }
   }
+}
+
+/**
+ * P1 migration: capture via the Rust helper's env-triggered one-shot mode
+ * (DSH_CU_GDI_CAPTURE_HWND/OUT), which writes a PNG and prints the same geometry JSON
+ * gdi-capture.ps1 does. Returns the parsed verdict when a helper wrote the frame, else null
+ * so runCaptureScript falls back to the ps1.
+ */
+function captureWithHelper(hwnd, outPath) {
+  for (const candidate of nativeHelperCandidates()) {
+    try {
+      if (!fs.existsSync(candidate)) continue
+      const raw = execFileSync(candidate, [], {
+        encoding: 'utf8',
+        timeout: 20_000,
+        windowsHide: true,
+        maxBuffer: 4 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          DSH_CU_GDI_CAPTURE_HWND: String(hwnd),
+          DSH_CU_GDI_CAPTURE_OUT: outPath,
+        },
+      })
+      if (fs.existsSync(outPath)) {
+        return parseJsonLine(raw) || { ok: true, error: '' }
+      }
+    } catch { /* try next candidate / fall back to ps1 */ }
+  }
+  return null
 }
 
 /**
@@ -170,27 +209,41 @@ export function swipeViaScript(hwnd, box) {
  * the model can read the page and act by element name or keyboard.
  */
 export function gdiWindowFrame(hwnd) {
-  let dir = null
-  try {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-gdi-'))
-    const outPath = path.join(dir, 'frame.png')
-    const res = runCaptureScript(hwnd, { outPath })
-    if (!res || res.ok !== true) return { ok: false, error: (res && res.error) || 'capture failed', geometry: res }
-    if (!fs.existsSync(outPath)) return { ok: false, error: 'no png written' }
-    const buf = fs.readFileSync(outPath)
-    if (!buf.length) return { ok: false, error: 'empty png' }
-    return {
-      ok: true,
-      data: buf.toString('base64'),
-      width: Number(res.width) || 0,
-      height: Number(res.height) || 0,
-      geometry: res,
+  // A restricted sandbox can forbid the child (helper/powershell) writing under %TEMP% even
+  // when this process can; retry under the plugin root, which is writable. (Same fallback as
+  // cropImageBase64.)
+  const attempt = (baseDir) => {
+    let dir = null
+    try {
+      dir = fs.mkdtempSync(path.join(baseDir, 'cu-gdi-'))
+    } catch { return null }
+    try {
+      const outPath = path.join(dir, 'frame.png')
+      const res = runCaptureScript(hwnd, { outPath })
+      if (!res || res.ok !== true) return null
+      if (!fs.existsSync(outPath)) return null
+      const buf = fs.readFileSync(outPath)
+      if (!buf.length) return null
+      return {
+        ok: true,
+        data: buf.toString('base64'),
+        width: Number(res.width) || 0,
+        height: Number(res.height) || 0,
+        geometry: res,
+      }
+    } catch {
+      return null
+    } finally {
+      try { if (dir) fs.rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ }
     }
-  } catch (error) {
-    return { ok: false, error: String(error && error.message ? error.message : error) }
-  } finally {
-    try { if (dir) fs.rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ }
   }
+  const tmpBase = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '.cu-tmp')
+  try { fs.mkdirSync(tmpBase, { recursive: true }) } catch { /* best effort */ }
+  const first = attempt(os.tmpdir())
+  if (first) return first
+  const second = attempt(tmpBase)
+  if (second) return second
+  return { ok: false, error: 'capture failed (helper and ps1 both produced no frame)' }
 }
 
 /** Shape a raw frame into the helper's observation shape (image + screenshot entry). */

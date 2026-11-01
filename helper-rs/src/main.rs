@@ -144,6 +144,15 @@ fn main() {
         );
         std::process::exit(run_crop_image_oneshot(&in_path, &out_path, x, y, w, h));
     }
+    // P1 migration: one-shot GDI capture, replacing scripts/gdi-capture.ps1. It reuses the
+    // helper's OWN capture_hwnd (WGC -> GDI ladder, nudge, overlay masking), so the Rust
+    // path is a superset of the ps1's GDI-only PrintWindow. Env-triggered like the crop mode.
+    //   DSH_CU_GDI_CAPTURE_HWND=<hwnd>   DSH_CU_GDI_CAPTURE_OUT=<png path>
+    if let Ok(hwnd_raw) = std::env::var("DSH_CU_GDI_CAPTURE_HWND") {
+        let out_path = std::env::var("DSH_CU_GDI_CAPTURE_OUT").unwrap_or_default();
+        let hwnd: isize = hwnd_raw.trim().parse().unwrap_or(0);
+        std::process::exit(run_gdi_capture_oneshot(hwnd, &out_path));
+    }
     if let Some(payload) = prev_notify.as_deref() {
         // Official: the notify hook calls back with the previous payload so the
         // helper can restore the user's original notify config on turn end.
@@ -269,6 +278,67 @@ fn run_crop_image_oneshot(in_path: &str, out_path: &str, x: i64, y: i64, w: i64,
             1
         }
     }
+}
+
+/// P1 migration: one-shot GDI/WGC capture for `scripts/gdi-capture.ps1` parity. Reuses the
+/// helper's `capture::capture_hwnd` (WGC -> GDI ladder, nudge, overlay masking — a superset of
+/// the ps1's GDI-only PrintWindow), converts the returned JPEG frame to PNG, writes OutPath,
+/// and prints one JSON verdict with the same geometry fields gdi-capture.ps1 emitted.
+fn run_gdi_capture_oneshot(hwnd: isize, out_path: &str) -> i32 {
+    if out_path.is_empty() {
+        eprintln!("gdi-capture: empty out path");
+        println!("{{\"ok\":false,\"error\":\"empty out path\"}}");
+        return 1;
+    }
+    let frame = match capture::capture_hwnd(hwnd) {
+        Ok(f) => f,
+        Err(e) => {
+            let msg = e.to_string();
+            eprintln!("gdi-capture: {msg}");
+            let esc = msg.replace('\\', "\\\\").replace('"', "\\\"");
+            println!("{{\"ok\":false,\"error\":\"{esc}\"}}");
+            return 1;
+        }
+    };
+    // CaptureFrame carries JPEG bytes; decode then re-encode as PNG so the caller's
+    // image/png assumption (frameObservation) holds unchanged.
+    let img = match image::load_from_memory(&frame.jpeg_bytes) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("gdi-capture: decode frame: {e}");
+            println!("{{\"ok\":false,\"error\":\"decode frame failed\"}}");
+            return 1;
+        }
+    };
+    if let Err(e) = img.save(out_path) {
+        eprintln!("gdi-capture: save {out_path}: {e}");
+        let esc = format!("save {out_path}: {e}").replace('\\', "\\\\").replace('"', "\\\"");
+        println!("{{\"ok\":false,\"error\":\"{esc}\"}}");
+        return 1;
+    }
+    let bytes = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+    let (w, h) = (frame.logical_w, frame.logical_h);
+    // Screen metrics for the oversize check (matches gdi-capture.ps1's GetSystemMetrics(0/1)).
+    let (sw, sh) = unsafe {
+        (
+            windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
+            ),
+            windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN,
+            ),
+        )
+    };
+    let oversize = sw > 0 && sh > 0 && (frame.phys_w > sw || frame.phys_h > sh);
+    println!(
+        "{{\"ok\":true,\"nudged\":true,\"width\":{w},\"height\":{h},\"bytes\":{bytes},\
+\"window\":{{\"left\":{ol},\"top\":{ot},\"width\":{w},\"height\":{h}}},\
+\"screen\":{{\"width\":{sw},\"height\":{sh}}},\"oversize\":{os}}}",
+        ol = frame.origin_x,
+        ot = frame.origin_y,
+        os = if oversize { "true" } else { "false" },
+    );
+    0
 }
 
 fn watch_parent(pid: u32) {
