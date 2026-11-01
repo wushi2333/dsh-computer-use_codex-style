@@ -15,6 +15,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { computerUsePrompt, documentationSummary, promptAssetStatus, BROWSER_REQUIRED_FOR } from './prompt.js'
 import { getUiaHost, getUiaHostReady, prewarmUiaHost, closeUiaHost } from './uiahost-client.js'
 import { getCapabilities, capabilityGuidance } from './capabilities.js'
+import { runScript } from './drivers/index.js'
 
 export const name = 'tool-computer-use'
 export const inject = ['tools', 'dshComputerUse', 'systemPrompt']
@@ -658,7 +659,6 @@ async function cachedCdpProbe(state, window, maxAgeMs = 60_000) {
   return value
 }
 
-const UIA_TREE_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'uia-tree.ps1')
 const UIA_ACT_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'uia-act.ps1')
 
 // ---------------------------------------------------------------------------
@@ -1173,50 +1173,10 @@ export function captureGuidance(degraded) {
     + (oversize ? ' The window is LARGER THAN THE SCREEN: resize it to fit the desktop and the capture will work.' : '')
 }
 
-/** Extract live document URLs from a .NET UIA node list (Document role). */
-export function collectDocumentUrls(nodes) {
-  const seen = new Set()
-  const out = []
-  for (const node of Array.isArray(nodes) ? nodes : []) {
-    if (!node) continue
-    const role = String(node.role || '').toLowerCase()
-    const value = String(node.value || '')
-    if ((role === 'document' || role === '文档') && /^https?:\/\//i.test(value) && !seen.has(value)) {
-      seen.add(value)
-      out.push({ url: value, title: String(node.name || '') })
-    }
-  }
-  return out
-}
+// Page probing lives in ./probing/index.js (P0 split); re-exported for existing imports.
+export { collectDocumentUrls, parsePageIndicator } from './probing/index.js'
 
 /** Shared sequential-scroll loop for scroll_to. */
-/**
- * Read a "current/total" page indicator out of a window's UIA text.
- *
- * `scroll_to` is wheel-driven, but wheel is not universal: the
- * moxueyuan image gallery (`/image/preview?...img-1.jpg…img-10.jpg`) ignores it
- * completely — 52 pulses ran and the indicator stayed at `4/10`. A page counter is the
- * cheap universal signal that paging has NOT happened, and it is present in exactly
- * those viewers (PDF `2/13`, gallery `4/10`, slide decks).
- *
- * Candidates inside a longer slash run (a URL such as `…/2026/01/12/…`) are rejected:
- * the match must not be preceded or followed by a digit or another slash.
- *
- * @param {string} text any text (usually the UIA fallback tree dump)
- * @returns {{current: number, total: number}|null} the widest plausible indicator
- */
-export function parsePageIndicator(text) {
-  const src = String(text || '')
-  let best = null
-  for (const m of src.matchAll(/(^|[^\d/])(\d{1,3})\s*\/\s*(\d{1,3})(?![\d/])/g)) {
-    const current = Number(m[2])
-    const total = Number(m[3])
-    if (!Number.isFinite(current) || !Number.isFinite(total)) continue
-    if (total < 2 || total > 999 || current < 1 || current > total) continue
-    if (!best || total > best.total) best = { current, total }
-  }
-  return best
-}
 
 /** Ask the window for its page indicator via the .NET UIA walk (best effort, ~150 ms). */
 export function readPageIndicator(hwnd) {
@@ -1641,11 +1601,7 @@ export function formatUiaFallback(nodes) {
 export function uiaTreeFallback(hwnd, maxNodes = 800) {
   if (!Number.isInteger(hwnd) || hwnd <= 0) return null
   try {
-    const raw = execFileSync(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', UIA_TREE_SCRIPT, '-Hwnd', String(hwnd), '-MaxNodes', String(maxNodes)],
-      { encoding: 'utf8', timeout: 20_000, windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
-    ).trim()
+    const raw = runScript('uia-tree.ps1', ['-Hwnd', String(hwnd), '-MaxNodes', String(maxNodes)], { timeoutMs: 20_000 })
     if (!raw) return []
     const parsed = JSON.parse(raw)
     return Array.isArray(parsed) ? parsed : [parsed]
