@@ -306,6 +306,61 @@ function Do-Act([int]$hwnd, [string]$name) {
   }
 }
 
+function Do-Dialog([int]$hwnd) {
+  # Report any confirmation sheet currently on screen so the caller can decide whether a
+  # 交卷 click actually opened a "是否确认交卷" prompt, or the click was swallowed. Detection
+  # only — it never clicks; a submit path must never fire blind.
+  [void][UiaHostNative]::SetForegroundWindow([IntPtr]$hwnd)
+  $root = Get-Root $hwnd
+  $nodes = Get-Nodes $root 600
+  $wr = New-Object UiaHostNative+RECT
+  [void][UiaHostNative]::GetWindowRect([IntPtr]$hwnd, [ref]$wr)
+
+  $buttons = New-Object System.Collections.ArrayList
+  $texts = New-Object System.Collections.ArrayList
+  foreach ($el in $nodes) {
+    $r = Get-Rect $el
+    if ($r.Width -le 0) { continue }
+    $n = ''
+    try { $n = [string]$el.Current.Name } catch { continue }
+    $n = $n.Trim()
+    if ($n.Length -eq 0) { continue }
+    $role = ''
+    try { $role = ([string]$el.Current.ControlType.ProgrammaticName) -replace 'ControlType\.', '' } catch { }
+    if ($role -eq 'Button') {
+      [void]$buttons.Add(@{ name = $n; x = [int]$r.Left - $wr.L; y = [int]$r.Top - $wr.T; w = [int]$r.Width; h = [int]$r.Height })
+    } elseif ($role -eq 'Text' -and $n.Length -ge 4 -and $n.Length -le 60) {
+      [void]$texts.Add($n)
+    }
+  }
+
+  # Is this a confirmation prompt? Heuristics that match what moxueyuan actually shows:
+  # the word 确认/交卷/提交/未答 in body text, plus an explicit confirm-style button
+  # (确定/提交/确认) and a cancel-style button (取消/否/再想想). All three together.
+  $joined = ($texts -join ' ')
+  $confirmWords = @('确认', '交卷', '提交', '未答', '还有', '剩余')
+  $confirmBtn = @('确定', '提交', '确认', '是的', '交卷')
+  $cancelBtn = @('取消', '否', '再想想', '继续答题', '返回')
+
+  $hasConfirmWord = $false
+  foreach ($w in $confirmWords) { if ($joined.Contains($w)) { $hasConfirmWord = $true; break } }
+  $yes = $null; $no = $null
+  foreach ($b in $buttons) {
+    foreach ($w in $confirmBtn) { if ($null -eq $yes -and $b.name.Contains($w)) { $yes = $b } }
+    foreach ($w in $cancelBtn) { if ($null -eq $no -and $b.name.Contains($w)) { $no = $b } }
+  }
+  $isDialog = ($hasConfirmWord -and $null -ne $yes -and $null -ne $no)
+
+  return @{
+    dialog   = $isDialog
+    body     = ($texts | Select-Object -First 4) -join ' | '
+    buttons  = @($buttons | ForEach-Object { $_.name })
+    confirm  = $(if ($yes) { $yes.name } else { '' })
+    cancel   = $(if ($no) { $no.name } else { '' })
+    confirmAt = $(if ($yes) { "$($yes.x),$($yes.y)" } else { '' })
+  }
+}
+
 function Do-Tree([int]$hwnd, [int]$max) {
   $root = Get-Root $hwnd
   $nodes = Get-Nodes $root $max
@@ -349,6 +404,7 @@ while ($true) {
       'set'  { $r = Do-Set $hwnd ([string]$req.target); $r.ok = $true; Out-Json $r }
       'post' { $r = Do-Post $hwnd @($req.points); $r.ok = $true; Out-Json $r }
       'act'  { $r = Do-Act $hwnd ([string]$req.name); if ($null -eq $r.ok) { $r.ok = $true }; Out-Json $r }
+      'dialog' { $r = Do-Dialog $hwnd; $r.ok = $true; Out-Json $r }
       'tree' { $r = Do-Tree $hwnd ([int]$req.max); $r.ok = $true; Out-Json $r }
       default { Out-Err "unknown op: $op" }
     }

@@ -70,6 +70,7 @@ export class UiaHostClient {
   set(hwnd, target) { return this.request({ op: 'set', hwnd, target }) }
   post(hwnd, points) { return this.request({ op: 'post', hwnd, points }) }
   act(hwnd, name) { return this.request({ op: 'act', hwnd, name }) }
+  dialog(hwnd) { return this.request({ op: 'dialog', hwnd }) }
   tree(hwnd, max = 500) { return this.request({ op: 'tree', hwnd, max }) }
 
   close() {

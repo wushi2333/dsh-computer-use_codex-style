@@ -1912,6 +1912,21 @@ export function classifyQuestionType(type, question, optionCount) {
   return '未知'
 }
 
+/**
+ * Decide whether the collected screen text + button names describe a submit confirmation
+ * sheet (P2-10). Mirrors the rule in scripts/uiahost.ps1 Do-Dialog so it can be tested:
+ * confirmation body wording AND a confirm-style button AND a cancel-style button, all
+ * three at once — any one alone is a false positive (every page has a "关闭" button).
+ */
+export function looksLikeConfirmDialog(body, buttons) {
+  const text = String(body || '')
+  const names = Array.isArray(buttons) ? buttons.map((b) => String(b || '')) : []
+  const hasWord = /确认|交卷|提交|未答|还有|剩余/.test(text)
+  const confirm = names.find((n) => /确定|提交|确认|是的|交卷/.test(n)) || ''
+  const cancel = names.find((n) => /取消|否|再想想|继续答题|返回/.test(n)) || ''
+  return { dialog: Boolean(hasWord && confirm && cancel), confirm, cancel }
+}
+
 /** `computer_use_read_options` — question + per-option {letter, text, checked, x, y}. */
 export function readOptionsTool(ctx, state) {
   return defineTool({
@@ -2018,6 +2033,12 @@ export function uiaActTool(ctx, state) {
           + '(default true). A step that returned ok but changed nothing is the exact failure that made a '
           + 'multi-select page look answered when it was not, so this is on unless you know better.',
       },
+      checkDialog: {
+        type: 'boolean',
+        description: 'After a submit-style step (交卷/提交/submit), report whether a confirmation sheet '
+          + 'opened and which button submits (default true). Stops "I clicked 交卷 so it submitted" from '
+          + 'being an assumption.',
+      },
     },
     output: { schema: OUTPUT_SCHEMA, render(_a, v) { return renderValue(v) } },
     async execute(args, exec) {
@@ -2067,6 +2088,26 @@ export function uiaActTool(ctx, state) {
         acted,
         ok: acted.every((a) => a.ok && a.applied !== false),
         unchanged: acted.filter((a) => a.unchanged).map((a) => a.name),
+      }
+      // P2-10: after a submit-style click, say whether a confirmation sheet appeared.
+      // A 交卷 is a two-step thing (交卷 -> 提交); reporting the prompt here is what stops
+      // "I clicked 交卷, so it must be submitted" from being an assumption.
+      if (args && args.checkDialog !== false && acted.some((a) => a.ok && /交卷|提交|submit/i.test(a.name))) {
+        try {
+          const dlg = await (await getUiaHostReady()).dialog(hwnd)
+          if (dlg && dlg.ok === true) {
+            value.dialog = {
+              present: dlg.dialog === true,
+              body: String(dlg.body || ''),
+              buttons: Array.isArray(dlg.buttons) ? dlg.buttons : [],
+              confirm: String(dlg.confirm || ''),
+            }
+            if (dlg.dialog === true) {
+              value.nextStep = 'a confirmation sheet is open — click "' + String(dlg.confirm || '提交')
+                + '" (uia_act names:"' + String(dlg.confirm || '提交') + '") to actually submit'
+            }
+          }
+        } catch { /* dialog probe is best-effort; never fail the act on it */ }
       }
       const wantObserve = args && args.observe !== false
       if (wantObserve) {

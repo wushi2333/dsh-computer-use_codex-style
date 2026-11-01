@@ -16,6 +16,7 @@ import {
   frameObservation,
   friendlyActionError,
   judgeActStep,
+  looksLikeConfirmDialog,
   parseJsonLine,
   parsePageIndicator,
   recallFrame,
@@ -426,6 +427,20 @@ test('classifyQuestionType reads the label, else the wording, else the option co
   assert.equal(classifyQuestionType('', '某题干', 4), '未知')
   assert.equal(classifyQuestionType('', '', 0), '未知')
 })
+test('looksLikeConfirmDialog needs wording + confirm button + cancel button', () => {
+  // The real moxueyuan submit sheet.
+  const yes = looksLikeConfirmDialog('还有未答题目，是否确认交卷？', ['取消', '确定'])
+  assert.equal(yes.dialog, true)
+  assert.equal(yes.confirm, '确定')
+  assert.equal(yes.cancel, '取消')
+
+  // A button alone is not a dialog: every page has a 关闭 button.
+  assert.equal(looksLikeConfirmDialog('课程列表', ['关闭', '确定']).dialog, false)
+  // Wording alone is not a dialog either.
+  assert.equal(looksLikeConfirmDialog('确认交卷', []).dialog, false)
+  // Two buttons with no confirmation wording is just chrome, not a prompt.
+  assert.equal(looksLikeConfirmDialog('综合排序 | 课程分类', ['确定', '取消']).dialog, false)
+})
 test('judgeActStep distinguishes applied / unchanged / unverifiable', () => {  // The page changed: the click really did something.
   assert.deepEqual(judgeActStep('A ○', 'A ●', true), { applied: true })
 
@@ -443,3 +458,4 @@ test('judgeActStep distinguishes applied / unchanged / unverifiable', () => {  /
   assert.deepEqual(judgeActStep('', 'something', true), {})
   assert.deepEqual(judgeActStep('something', '', true), {})
 })
+
