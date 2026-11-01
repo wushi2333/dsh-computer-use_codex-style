@@ -133,3 +133,8 @@ node -e "import('./src/uiahost-client.js').then(async m=>{const h=m.getUiaHost()
 - **新增工具前先问**：它是否在 DSH 宿主进程中真能跑通？（见 §5.2——屏幕像素不行）
 - **失败必须说话**：任何降级/失败路径都要返回人能读懂的 `guidance`，不要静默。
 - **改完跑测试**：`npm run test:units` + `tool-names` 至少这两个，全绿再提交。
+- **拆文件不要靠手数行号**：P0 拆 `tool.js` 时，按行号切块把 `cachedCdpProbe` + 两个
+  `*_SCRIPT` 常量误搬进了 `ui-tree/`，测试用 `path is not defined` 才抓出来。正确做法：
+  先用 grep 定位"下一处 `^function`/`^export`/分隔注释"作为边界，切完立刻
+  `node --check` 两边 + 跑单测 + 冒烟 `import('./src/tool.js')` 确认 re-export 闭环。
+  纯函数块才搬；带 `ctx`/`state`/`execFileSync`/`path` 的不要搬。
