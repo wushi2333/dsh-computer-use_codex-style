@@ -96,27 +96,36 @@ plugins/dsh-computer-use/
 
 | # | 问题 | 状态 |
 | --- | --- | --- |
-| 1 | `tool.js` 是上帝文件 | **部分解决**：3052 → 2629 行，拆出 ui-tree/capture/probing/errors |
+| 1 | `tool.js` 是上帝文件 | **大部分解决**：3052 → 2245 行，拆出 8 个独立模块 |
 | 2 | 三套执行器无统一 Driver 接口 | **已解决**：`src/drivers/index.js` 为唯一门面 |
 | 3 | 能力探测是"事后"的 | **已解决**：`src/capabilities.js` + `health.capabilities` |
-| 4 | PowerShell 脚本是二等公民 | 未做（P1：contract-isation / 迁 Rust） |
-| 5 | 错误话术耦合会话状态 | **已拆出** `src/errors/index.js`（仍读写 state，但集中一处） |
+| 4 | PowerShell 脚本是二等公民 | 进行中（P1：uia-tree 已契约化；其余待加） |
+| 5 | 错误话术耦合会话状态 | **已拆出** `src/errors/index.js` |
 
-### P0 已完成（逐提交，行为不变，测试全绿）
-- `src/capabilities.js`：`probeCapabilities()` 事前探测 uia/screenCap/psHelper + `requireCapability()` 门禁
-- `src/drivers/index.js`：`helper.call` / `runScript` / `runPsCommand` / `requireCapability` / `uia.*`
-- `src/ui-tree/index.js`：`parseTreeLine/classify/compress/deadTreeSignal/formatUiaFallback`
-- `src/probing/index.js`：`collectDocumentUrls` / `parsePageIndicator`
-- `src/capture/frames.js`：`parseJsonLine` / `frameObservation` / `rememberFrame` / `recallFrame`
-- `src/errors/index.js`：`captureGuidance` / `noteWedge` / `isWedged` / `friendlyActionError`
-- 以上均由 `tool.js` re-export，现有 import 路径不变。
+### P0 已完成（逐提交，行为不变，每步 36/36 绿）
+依赖图现在是干净的 DAG，全部模块都不反向依赖 `tool.js`：
 
-### P0 有意**未**做：`tools/`（每个工具一文件）与降级链搬家
-原因：6 个 `*Tool(...)` 工厂都反向依赖 `tool.js` 内的 `observeWithLadder` / `uiaTreeFallback`
-/ `runScrollTo` / `WIN_PARAM` / `OUTPUT_SCHEMA`；`observeWithLadder`/`captureFallback` 等降级链
-又反向依赖 `ui-tree` / `probing` / `cachedCdpProbe`。硬搬会形成 **capture→tool.js→capture** 这类
-循环依赖。正确顺序（后续做）：先把公共底座 `WIN_PARAM` / `OUTPUT_SCHEMA` / `observeWithLadder`
-等搬到 `src/shared/`，再把工具体搬到 `src/tools/`。**为了勾清单制造循环依赖是错的**——所以停在这里。
+```
+node 内置 ── shared/            (OUTPUT_SCHEMA, WIN_SCHEMA, WIN_PARAM, sleepRespectingSignal)
+          ├─ ui-tree/           (parseTreeLine…classify…deadTreeSignal) 纯函数
+          ├─ probing/           (collectDocumentUrls, parsePageIndicator) 纯函数
+          ├─ errors/            (captureGuidance, noteWedge, isWedged, friendlyActionError)
+          ├─ drivers/           (helper.call, runScript, runPsCommand, requireCapability, uia.*)
+          ├─ capabilities/      (probeCapabilities, getCapabilities, requireCapability)
+          ├─ cdp/               (listProcessRows, probeCdp, cachedCdpProbe)
+          ├─ uia-fallback/      (uiaTreeFallback, formatUiaFallback)
+          ├─ capture/frames     (parseJsonLine, frameObservation, rememberFrame, recallFrame)
+          └─ capture/ladder     (runCaptureScript…captureFallback, observeWithLadder)
+tool.js  = 装配 + 6 个 *Tool 工厂 + 少数辅助，import 上面这些，并 re-export 以保 import 路径不变
+```
+
+### P0 停在这里的原因（`tools/` 未完成，如实记录）
+6 个 `*Tool(...)` 工厂仍依赖 `tool.js` 内的**第二批辅助**：`defineTool`、`renderValue`、
+`extractInteractiveElements`、`summarizeTree`、`runScrollTo`、`uiaActFallback`、`BROWSER_SKILL`。
+要把工具体搬进 `src/tools/`，必须先照 `shared/` 的做法把这批辅助再扒一层（它们又分别依赖
+`pageThroughByKeys`/`readPageIndicator`/`ui-act` 脚本等）。**这是又一轮独立重构**，且属可选优化；
+现在硬拆只会得到 6 个各自回边 import 一堆的半成品，比现状更乱。**为勾清单制造脆弱中间态是错的**，
+故 P0 到此：主要目标（去上帝文件、统一 Driver、事前能力）已达成，`tools/` 拆分的准确前置条件写在此处供后续做。
 
 ---
 
