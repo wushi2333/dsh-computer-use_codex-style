@@ -92,20 +92,31 @@ plugins/dsh-computer-use/
 
 ---
 
-## 6. 已知架构债（P0 要解决的）
+## 6. 架构债与 P0 进展
 
-| # | 问题 | 现状 |
+| # | 问题 | 状态 |
 | --- | --- | --- |
-| 1 | `tool.js` 是上帝文件 | 2919 行，混了装配/工具/捕获/UIA/探测/错误 7 类职责 |
-| 2 | 三套执行器无统一 Driver 接口 | 降级逻辑散落在调用点 |
-| 3 | 能力探测是"事后"的 | 调 `CopyFromScreen` 失败才知道不行 |
-| 4 | PowerShell 脚本是二等公民 | 13 个 ps1 无 schema/无单测，`uiahost.ps1` 协议只在注释里 |
-| 5 | 错误话术耦合会话状态 | `friendlyActionError` 依赖 `state`（wedge 记忆） |
+| 1 | `tool.js` 是上帝文件 | **部分解决**：3052 → 2629 行，拆出 ui-tree/capture/probing/errors |
+| 2 | 三套执行器无统一 Driver 接口 | **已解决**：`src/drivers/index.js` 为唯一门面 |
+| 3 | 能力探测是"事后"的 | **已解决**：`src/capabilities.js` + `health.capabilities` |
+| 4 | PowerShell 脚本是二等公民 | 未做（P1：contract-isation / 迁 Rust） |
+| 5 | 错误话术耦合会话状态 | **已拆出** `src/errors/index.js`（仍读写 state，但集中一处） |
 
-**P0 目标**（本文件写就时正在做）：
-- 拆 `tool.js` → `drivers/` + `capture/` + `ui-tree/` + `probing/` + `tools/` + `errors/`
-- 引入 `Driver` 统一接口 + `probeCapabilities()` 事前能力表
-- 行为不变，逐步搬运，每步跑 30 个单测保证不回归
+### P0 已完成（逐提交，行为不变，测试全绿）
+- `src/capabilities.js`：`probeCapabilities()` 事前探测 uia/screenCap/psHelper + `requireCapability()` 门禁
+- `src/drivers/index.js`：`helper.call` / `runScript` / `runPsCommand` / `requireCapability` / `uia.*`
+- `src/ui-tree/index.js`：`parseTreeLine/classify/compress/deadTreeSignal/formatUiaFallback`
+- `src/probing/index.js`：`collectDocumentUrls` / `parsePageIndicator`
+- `src/capture/frames.js`：`parseJsonLine` / `frameObservation` / `rememberFrame` / `recallFrame`
+- `src/errors/index.js`：`captureGuidance` / `noteWedge` / `isWedged` / `friendlyActionError`
+- 以上均由 `tool.js` re-export，现有 import 路径不变。
+
+### P0 有意**未**做：`tools/`（每个工具一文件）与降级链搬家
+原因：6 个 `*Tool(...)` 工厂都反向依赖 `tool.js` 内的 `observeWithLadder` / `uiaTreeFallback`
+/ `runScrollTo` / `WIN_PARAM` / `OUTPUT_SCHEMA`；`observeWithLadder`/`captureFallback` 等降级链
+又反向依赖 `ui-tree` / `probing` / `cachedCdpProbe`。硬搬会形成 **capture→tool.js→capture** 这类
+循环依赖。正确顺序（后续做）：先把公共底座 `WIN_PARAM` / `OUTPUT_SCHEMA` / `observeWithLadder`
+等搬到 `src/shared/`，再把工具体搬到 `src/tools/`。**为了勾清单制造循环依赖是错的**——所以停在这里。
 
 ---
 
