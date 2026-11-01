@@ -184,6 +184,10 @@ export function documentRect(hwnd) {
  */
 export function swipeViaScript(hwnd, box) {
   if (!Number.isInteger(hwnd) || hwnd <= 0) return { ok: false, error: 'bad window id' }
+  // P1 migration: the helper has an interpolated-SendInput swipe one-shot that replaces
+  // uia-swipe.ps1. Preferred; ps1 is the fallback when no usable helper is present.
+  const viaHelper = swipeWithHelper(hwnd, box)
+  if (viaHelper) return viaHelper
   const args = [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', UIA_SWIPE_SCRIPT,
     '-Hwnd', String(hwnd),
@@ -199,6 +203,45 @@ export function swipeViaScript(hwnd, box) {
     return parseJsonLine(error && error.stdout)
       || { ok: false, error: String(error && error.message ? error.message : error) }
   }
+}
+
+/**
+ * P1 migration: swipe via the Rust helper's env-triggered one-shot mode
+ * (DSH_CU_SWIPE_*). Returns the parsed verdict when a helper actually ran (ok true OR false —
+ * a helper that reports a real refusal is authoritative, so we do NOT fall back on a
+ * well-formed ok:false), or null when no helper binary could run so the ps1 is tried.
+ */
+function swipeWithHelper(hwnd, box) {
+  for (const candidate of nativeHelperCandidates()) {
+    try {
+      if (!fs.existsSync(candidate)) continue
+      const raw = execFileSync(candidate, [], {
+        encoding: 'utf8',
+        timeout: 20_000,
+        windowsHide: true,
+        maxBuffer: 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          DSH_CU_SWIPE_HWND: String(hwnd),
+          DSH_CU_SWIPE_FROMX: String(Math.round(box.fromX)),
+          DSH_CU_SWIPE_FROMY: String(Math.round(box.fromY)),
+          DSH_CU_SWIPE_TOX: String(Math.round(box.toX)),
+          DSH_CU_SWIPE_TOY: String(Math.round(box.toY)),
+          DSH_CU_SWIPE_DURATION: '350',
+          DSH_CU_SWIPE_STEPS: '14',
+        },
+      })
+      const parsed = parseJsonLine(raw)
+      if (parsed && typeof parsed.ok === 'boolean') return parsed
+    } catch (e) {
+      // A helper that ran and printed a verdict but exited non-zero: honour the verdict.
+      const parsed = parseJsonLine(e && e.stdout)
+      if (parsed && typeof parsed.ok === 'boolean') return parsed
+      // otherwise try next candidate / fall back to ps1
+    }
+  }
+  return null
 }
 
 /**

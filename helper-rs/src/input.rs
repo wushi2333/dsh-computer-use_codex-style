@@ -384,6 +384,65 @@ pub fn drag_points(x1: f64, y1: f64, x2: f64, y2: f64) -> Result<(), Error> {
     ])
 }
 
+/// P1 migration: interpolated SendInput swipe used to replace scripts/uia-swipe.ps1.
+///
+/// WMPF/page readers bind a drag to the move events between down and up; a single
+/// start->end jump (drag_points) is not recognised. This walks `steps` intermediate
+/// MOVE events with the window-relative client coordinates mapped to screen, matching
+/// the ps1's New-Mouse loop. `from`/`to` are window-relative CLIENT coords; they are
+/// clamped into the client rect and converted with ClientToScreen, then to virtual-desk
+/// absolute. Sleeps ~duration/steps between steps so the gesture has real timing.
+pub fn swipe_client(
+    hwnd: isize,
+    from: (i32, i32),
+    to: (i32, i32),
+    duration_ms: i32,
+    steps: i32,
+) -> Result<(), Error> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+
+    let h = HWND(hwnd as *mut core::ffi::c_void);
+    let mut cr = RECT::default();
+    if unsafe { GetClientRect(h, &mut cr) }.is_err() {
+        return Err(Error::type_err("GetClientRect failed"));
+    }
+    let cw = cr.right - cr.left;
+    let ch = cr.bottom - cr.top;
+    if cw <= 0 || ch <= 0 {
+        return Err(Error::type_err("empty client rect"));
+    }
+    let clampx = |x: i32| x.max(1).min(cw - 2);
+    let clampy = |y: i32| y.max(1).min(ch - 2);
+    let screen = |x: i32, y: i32| -> (i32, i32) {
+        let mut p = POINT { x, y };
+        let _ = unsafe { ClientToScreen(h, &mut p) };
+        (p.x, p.y)
+    };
+    let (sx, sy) = screen(clampx(from.0), clampy(from.1));
+    let (ex, ey) = screen(clampx(to.0), clampy(to.1));
+
+    let steps = steps.max(1);
+    let per = ((duration_ms - 40).max(1) / steps).max(1);
+    let (asx, asy) = abs_point(sx as f64, sy as f64);
+    send(&[mouse(asx, asy, 0, abs_flags(MOUSEEVENTF_MOVE))])?;
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    send(&[mouse(asx, asy, 0, abs_flags(MOUSEEVENTF_LEFTDOWN))])?;
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    for i in 1..=steps {
+        let t = i as f64 / steps as f64;
+        let mx = sx as f64 + (ex - sx) as f64 * t;
+        let my = sy as f64 + (ey - sy) as f64 * t;
+        let (ax, ay) = abs_point(mx, my);
+        send(&[mouse(ax, ay, 0, abs_flags(MOUSEEVENTF_MOVE))])?;
+        std::thread::sleep(std::time::Duration::from_millis(per as u64));
+    }
+    let (aex, aey) = abs_point(ex as f64, ey as f64);
+    send(&[mouse(aex, aey, 0, abs_flags(MOUSEEVENTF_LEFTUP))])?;
+    Ok(())
+}
+
 pub fn scroll_at(x: f64, y: f64, scroll_x: f64, scroll_y: f64) -> Result<(), Error> {
     let (ax, ay) = abs_point(x, y);
     let dy = if scroll_y != 0.0 { -scroll_y } else { scroll_x };

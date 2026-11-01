@@ -153,6 +153,19 @@ fn main() {
         let hwnd: isize = hwnd_raw.trim().parse().unwrap_or(0);
         std::process::exit(run_gdi_capture_oneshot(hwnd, &out_path));
     }
+    // P1 migration: one-shot interpolated swipe, replacing scripts/uia-swipe.ps1.
+    //   DSH_CU_SWIPE_HWND / _FROMX / _FROMY / _TOX / _TOY [ / _DURATION / _STEPS ]
+    if let Ok(hwnd_raw) = std::env::var("DSH_CU_SWIPE_HWND") {
+        let hwnd: isize = hwnd_raw.trim().parse().unwrap_or(0);
+        let env_i = |k: &str, d: i64| std::env::var(k).ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(d);
+        let fx = env_i("DSH_CU_SWIPE_FROMX", 0) as i32;
+        let fy = env_i("DSH_CU_SWIPE_FROMY", 0) as i32;
+        let tx = env_i("DSH_CU_SWIPE_TOX", 0) as i32;
+        let ty = env_i("DSH_CU_SWIPE_TOY", 0) as i32;
+        let dur = env_i("DSH_CU_SWIPE_DURATION", 350) as i32;
+        let steps = env_i("DSH_CU_SWIPE_STEPS", 12) as i32;
+        std::process::exit(run_swipe_oneshot(hwnd, (fx, fy), (tx, ty), dur, steps));
+    }
     if let Some(payload) = prev_notify.as_deref() {
         // Official: the notify hook calls back with the previous payload so the
         // helper can restore the user's original notify config on turn end.
@@ -339,6 +352,28 @@ fn run_gdi_capture_oneshot(hwnd: isize, out_path: &str) -> i32 {
         os = if oversize { "true" } else { "false" },
     );
     0
+}
+
+/// P1 migration: one-shot interpolated swipe for `scripts/uia-swipe.ps1` parity. Maps
+/// window-relative client points to screen and drives input::swipe_client. Prints one JSON
+/// verdict {ok,from,to} / {ok:false,error} and exits 0/1.
+fn run_swipe_oneshot(hwnd: isize, from: (i32, i32), to: (i32, i32), duration_ms: i32, steps: i32) -> i32 {
+    match input::swipe_client(hwnd, from, to, duration_ms, steps) {
+        Ok(()) => {
+            println!(
+                "{{\"ok\":true,\"from\":\"{}, {}\",\"to\":\"{}, {}\"}}",
+                from.0, from.1, to.0, to.1
+            );
+            0
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            eprintln!("uia-swipe: {msg}");
+            let esc = msg.replace('\\', "\\\\").replace('"', "\\\"");
+            println!("{{\"ok\":false,\"error\":\"{esc}\"}}");
+            1
+        }
+    }
 }
 
 fn watch_parent(pid: u32) {
