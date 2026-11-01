@@ -99,8 +99,28 @@ plugins/dsh-computer-use/
 | 1 | `tool.js` 是上帝文件 | **大部分解决**：3052 → 2245 行，拆出 8 个独立模块 |
 | 2 | 三套执行器无统一 Driver 接口 | **已解决**：`src/drivers/index.js` 为唯一门面 |
 | 3 | 能力探测是"事后"的 | **已解决**：`src/capabilities.js` + `health.capabilities` |
-| 4 | PowerShell 脚本是二等公民 | 进行中（P1：uia-tree 已契约化；其余待加） |
+| 4 | PowerShell 脚本是二等公民 | **已契约化**：ci-smoke/uia-tree/uia-post/uia-ticks/uia-act/uia-swipe/gdi-capture/crop-image 均有契约头；删 2 个死脚本 |
 | 5 | 错误话术耦合会话状态 | **已拆出** `src/errors/index.js` |
+
+### P1 迁移评估（ps1 → Rust helper 一次性子命令）：先别迁 `uia-tree`
+试做一个最简项 `uia-tree`（helper 已有 `UiaClient::dump`，加环境变量触发 `DSH_CU_UIA_TREE_HWND`
+一次打印 JSON 即走，`cargo check`/`build` 通过、普通窗口与 ps1 输出**逐字段一致**）。但实测暴露
+**决定性差异**：
+
+| 窗口 | Rust `dump` 节点 | ps1 `uia-tree` 节点 | 结论 |
+| --- | --- | --- | --- |
+| 普通窗口（微信主窗 7406840） | 3 | 3 | 一致 |
+| 普通窗口（magpie） | 1 | 0 | Rust 更好 |
+| **WMPF 小程序窗（微信 13435994）** | **31（只有外框/窗格/按钮）** | **76（含 ListItem×40 / Image×29 / Document）** | **ps1 完胜** |
+
+原因：ps1 的 `.NET UIAutomation` `FindAll(Descendants)` + 缓存重建能**穿透** WMPF 的匿名容器
+到达内容层；而 helper 的 `IUIAutomation ControlViewWalker` cache-walk 对同一窗口只挖到外框。
+**`uia-tree.ps1` 不是"重复实现"，而是专为 WMPF 深挖存在的补刀**。迁过去会让最关键的微信小程序
+考试页从 76 节点退化到 31 外框。
+
+**结论**：**"最简单"的那个反而最不该迁**。迁移候选应按"普通窗口即可胜任"来挑
+（如 `crop-image`/`gdi-capture` 这类纯 GDI/像素处理、不依赖 UIA 深挖的），而不是 `uia-tree`。
+探测代码（main.rs 的 `DSH_CU_UIA_TREE_HWND` 分支）已验证可行但**已回滚**——结论入库，代码不留半成品。
 
 ### P0 已完成（逐提交，行为不变，每步 36/36 绿）
 依赖图现在是干净的 DAG，全部模块都不反向依赖 `tool.js`：
