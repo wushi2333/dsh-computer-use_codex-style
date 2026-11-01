@@ -284,11 +284,8 @@ async function registerDesktop(ctx, state, config) {
   // NOTE: there is NO harness-provided desktop `wait` — an earlier assumption of that
   // was wrong; this plugin owns it. Register it once, here.
   registerTool(ctx, state, waitTool(ctx, state))
-  // Read-only CDP probe (detect/enable CDP for Chromium/WebView2 hosts).
-  registerTool(ctx, state, cdpProbeTool(ctx, state))
-  // Long-document + polling helpers (one-call scroll-to-end, wait-until, doc URLs).
+  // Long-document + polling helpers (one-call scroll, wait-until, doc URLs).
   registerTool(ctx, state, scrollToTool(ctx, state))
-  registerTool(ctx, state, reachLastPageTool(ctx, state))
   registerTool(ctx, state, waitUntilTool(ctx, state))
   registerTool(ctx, state, documentsTool(ctx, state))
   registerTool(ctx, state, uiaActTool(ctx, state))
@@ -437,7 +434,7 @@ function healthTool(ctx, state, config, startError) {
 }
 
 // ---------------------------------------------------------------------------
-// Standalone, helper-independent tools: `wait` and `computer_use_cdp_probe`.
+// Standalone, helper-independent tools: `wait`, `scroll_to`, `wait_until`, `documents`.
 // ---------------------------------------------------------------------------
 
 const WAIT_MAX_MS = 60_000
@@ -634,39 +631,9 @@ async function probeCdp(args) {
   }
 }
 
-function cdpProbeTool() {
-  return defineTool({
-    name: 'computer_use_cdp_probe',
-    description:
-      'Detect whether a window belongs to a Chromium/WebView2 host and whether its CDP endpoint is reachable, '
-      + 'so DOM-level automation can replace pixel clicks when possible. Reports the debugging port/ws endpoint, '
-      + 'DevToolsActivePort files, or the exact enablement step. WeChat WMPF/Radium renderers expose no CDP and stay '
-      + 'pixel-driven. Read-only.',
-    parameters: {
-      window: {
-        type: 'object',
-        additionalProperties: false,
-        description: 'Window to probe (its app identifier names the process).',
-        properties: {
-          app: { type: 'string', required: true },
-          id: { type: 'integer', required: true },
-          title: { type: 'string' },
-        },
-      },
-      process: { type: 'string', description: 'Process name or full exe path to probe instead of a window.' },
-      pid: { type: 'integer', description: 'Explicit process id to probe.' },
-    },
-    output: { schema: OUTPUT_SCHEMA, render(_args, value) { return renderValue(value) } },
-    async execute(args) {
-      return { value: await probeCdp(args && typeof args === 'object' ? args : {}) }
-    },
-    isConcurrencySafe() { return true },
-    presentCall() { return { card: 'generic', title: 'computer_use_cdp_probe' } },
-  })
-}
 
 // ---------------------------------------------------------------------------
-// Long-document / polling helpers: scroll_to, reach_last_page, wait_until,
+// Long-document / polling helpers: scroll_to, wait_until,
 // document-URL export, and region cropping.
 // ---------------------------------------------------------------------------
 
@@ -1193,11 +1160,11 @@ export function collectDocumentUrls(nodes) {
   return out
 }
 
-/** Shared sequential-scroll loop for scroll_to / reach_last_page. */
+/** Shared sequential-scroll loop for scroll_to. */
 /**
  * Read a "current/total" page indicator out of a window's UIA text.
  *
- * `scroll_to` / `reach_last_page` are wheel-driven, but wheel is not universal: the
+ * `scroll_to` is wheel-driven, but wheel is not universal: the
  * moxueyuan image gallery (`/image/preview?...img-1.jpg…img-10.jpg`) ignores it
  * completely — 52 pulses ran and the indicator stayed at `4/10`. A page counter is the
  * cheap universal signal that paging has NOT happened, and it is present in exactly
@@ -1470,7 +1437,7 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps, probe = 
       result.guidance = 'No "current/total" page counter could be read for this window, so paging cannot be measured. '
         + 'One interpolated swipe was issued inside the visible document rectangle: '
         + (textMoved
-          ? 'the accessibility text CHANGED, so the gesture landed — call reach_last_page again to continue.'
+          ? 'the accessibility text CHANGED, so the gesture landed — call scroll_to again to continue.'
           : frameMoved
             ? 'the frame changed but the text did not — possibly a transient paint; re-read the page before trusting it.'
             : 'nothing observable changed. GDI frames can be stale on Chromium, so this is UNKNOWN rather than a '
@@ -1485,15 +1452,17 @@ export function scrollToTool(ctx, state) {
   return defineTool({
     name: 'computer_use_scroll_to',
     description:
-      'Scroll a window to the bottom (default) or top, or toward an approximate percent, in ONE call by issuing '
-      + 'several SEQUENTIAL wheel scrolls. This replaces the "one scroll per round-trip" dance and avoids the batch '
-      + 'coalescing that makes many parallel scrolls a no-op. Pass x/y inside the scrollable pane.',
+      'Scroll a window toward the bottom (default) or top, or an approximate percent, in ONE call by issuing '
+      + 'several SEQUENTIAL wheel scrolls (this replaces the "one scroll per round-trip" dance and avoids the batch '
+      + 'coalescing that makes parallel scrolls a no-op). For a long document you want to reach the END of, pass '
+      + 'to:"bottom" with a bigger budget, e.g. steps:40 delta:40000 — that is what the old reach_last_page did. '
+      + 'Pass x/y inside the scrollable pane.',
     parameters: {
       window: WIN_PARAM,
       to: { type: 'string', enum: ['bottom', 'top'], description: 'Direction (default bottom).' },
       percent: { type: 'integer', description: 'Approximate target percent 0-100; >=50 scrolls down, <50 up.' },
-      steps: { type: 'integer', description: 'Max scroll pulses (default 12, clamp 1..80).' },
-      delta: { type: 'integer', description: 'Pixels per pulse (default 12000, clamp 200..60000).' },
+      steps: { type: 'integer', description: 'Max scroll pulses (default 12; pass 40 to reach the end of a long document; clamp 1..80).' },
+      delta: { type: 'integer', description: 'Pixels per pulse (default 12000; 40000 reaches long documents fast; clamp 200..60000).' },
       x: { type: 'number', description: 'X inside the scroll pane (default window centre).' },
       y: { type: 'number', description: 'Y inside the scroll pane (default window centre).' },
     },
@@ -1503,30 +1472,6 @@ export function scrollToTool(ctx, state) {
     },
     isConcurrencySafe() { return false },
     presentCall(a) { return { card: 'generic', title: 'computer_use_scroll_to', rawInput: a && typeof a === 'object' ? a : {} } },
-  })
-}
-
-export function reachLastPageTool(ctx, state) {
-  return defineTool({
-    name: 'computer_use_reach_last_page',
-    description:
-      'Scroll a long document to its LAST page in one call (a computer_use_scroll_to(bottom) with a bigger default pulse budget). '
-      + 'For readers/viewers that only count completion when the last page is reached.',
-    parameters: {
-      window: WIN_PARAM,
-      steps: { type: 'integer', description: 'Max scroll pulses (default 40, clamp 1..80).' },
-      delta: { type: 'integer', description: 'Pixels per pulse (default 40000).' },
-      x: { type: 'number', description: 'X inside the scroll pane (default window centre).' },
-      y: { type: 'number', description: 'Y inside the scroll pane (default window centre).' },
-    },
-    output: { schema: OUTPUT_SCHEMA, render(_a, v) { return renderValue(v) } },
-    async execute(args, exec) {
-      const a = args && typeof args === 'object' ? { ...args, to: 'bottom' } : { to: 'bottom' }
-      if (a.delta === undefined) a.delta = 40000
-      return { value: await runScrollTo(ctx, state, a, exec, 40) }
-    },
-    isConcurrencySafe() { return false },
-    presentCall(a) { return { card: 'generic', title: 'computer_use_reach_last_page', rawInput: a && typeof a === 'object' ? a : {} } },
   })
 }
 
@@ -3088,5 +3033,6 @@ async function admitImages(ctx, images) {
   }
   return []
 }
+
 
 

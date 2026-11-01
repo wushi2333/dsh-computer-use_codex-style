@@ -189,10 +189,8 @@ flowchart TB
 | `computer_use_uia_act` | 开启 | 按**元素名**用 UIA pattern（`SelectionItem`/`Invoke`/`LegacyIAccessible`）操作控件：不需要截图、不需要坐标，因此在 WGC 截不到的静态窗口上也能用；用 `"A、选项|下一题"` 链式多步，返回动作后的文本树。**自带两步验证**：①`verify`（默认开）比对动作前后页面文本，报告 `applied`/`unchanged`——页面忽略的点击不再被当成成功；②`checkDialog`（默认开）在动作名含 交卷/提交 时探测确认弹窗，返回 `{dialog, body, buttons, confirm, nextStep}`，第二步不当成理所当然。**注意**：裸 `Text` 节点（小程序选项）无任何 pattern，兜底点击只代表"点发出去了"，需另行验证 |
 | `computer_use_wait` | 开启 | 固定等待（可选顺带重新观察），不占一次 helper 往返 |
 | `computer_use_wait_until` | 开启 | 轮询到文本出现 / 截图变化 / 超时为止 |
-| `computer_use_scroll_to` | 开启 | 用多次顺序滚轮脉冲滚到底/顶/约百分比（脉冲间 70ms，因为应用会合并快速脉冲） |
-| `computer_use_reach_last_page` | 开启 | 用更大的脉冲预算一次滚到最后一页——分页阅读器/PDF 查看器的首选 |
+| `computer_use_scroll_to` | 开启 | 用多次顺序滚轮脉冲滚到底/顶/约百分比（脉冲间 70ms，因为应用会合并快速脉冲）。要滚到长文档末尾传 steps:40 delta:40000 |
 | `computer_use_documents` | 开启 | 导出活动文档 URL（`Document` 角色的 ValuePattern），PDF/查看器课件可直接取内容而不必逐页翻 |
-| `computer_use_cdp_probe` | 开启 | 只读探测：窗口是否为 Chromium 宿主、CDP 端点是否可达——用于判定"能不能走 DOM 自动化"（微信 WMPF/Radium 不行） |
 | `click_element`、`scroll_element` | 需显式开启 | 旧版 window-v1 别名 |
 | `session_note`、`session_state`、`diagnostic_state`、`end_turn` | 诊断 | 会话草稿、状态转储与回合控制 |
 
@@ -434,7 +432,7 @@ DSH官方的Computer Use采用设计思路不大一致。如果希望使用Codex
 - 两步确认交互用 `computer_use_uia_act`：点第一个控件（如 `交卷`），`checkDialog` 会报告确认弹窗与真正提交的按钮；**最后一步提交刻意保持为独立的显式动作**。
 - 交卷可以稳定用 `computer_use_uia_act`：点 `交卷` → 确认弹窗点 `提交`。已端到端验证（40/40，100 分）。
 - `computer_use_uia_act` 的点击兜底（给没有任何 UIA pattern 的节点）在注入事件上打了 helper 的 `SYNTHETIC_TAG`（`dwExtraInfo`），所以它自己的点击不会再被当成"人工输入"。
-- `computer_use_scroll_to` / `computer_use_reach_last_page` 不再只信滚轮。阶梯是：滚轮 → `Page_Down` → `Right` → `Next` → **插值 swipe**（`scripts/uia-swipe.ps1`：14 个中间移动、350ms、带 `SYNTHETIC_TAG`、**不需要 helper 捕获会话**；helper 自带的 `drag` 只有 4 个事件、中间没有移动，网页阅读器不认）。**是否真的翻动**用三信号判定，最硬的先判：页码「当前/总页」→ UIA 树文本 diff（`documentSnapshot()`，还能识别 `最后一页了` → `lastPage`）→ GDI 帧哈希；**帧相同只会降级为 `unknown`**，因为 `PrintWindow` 对 Chromium 表面常返回陈旧帧。返回体给出 `page`、`pageProbe`、`swipe:{ok,from:'document-rect'|'window-rect'}`、`moved:'text'|'frame'|'unknown'`、`lastPage`、`guidance`。树里第一个 `Document` 常常是**别的后台课程**，所以文档矩形要过“能塞进当前窗口”的检查，不合格就退回窗口矩形，保证 swipe 落在可见文档里。已证伪的一条路：**UIA ScrollPattern**——第一个可滚动节点是隐藏文档（`VerticalScrollPercent` 始终 `-1`），按“可见 + VerticallyScrollable”过滤后，81 个元素的树里一个都没有。
+- `computer_use_scroll_to` 不再只信滚轮。阶梯是：滚轮 → `Page_Down` → `Right` → `Next` → **插值 swipe**（`scripts/uia-swipe.ps1`：14 个中间移动、350ms、带 `SYNTHETIC_TAG`、**不需要 helper 捕获会话**；helper 自带的 `drag` 只有 4 个事件、中间没有移动，网页阅读器不认）。**是否真的翻动**用三信号判定，最硬的先判：页码「当前/总页」→ UIA 树文本 diff（`documentSnapshot()`，还能识别 `最后一页了` → `lastPage`）→ GDI 帧哈希；**帧相同只会降级为 `unknown`**，因为 `PrintWindow` 对 Chromium 表面常返回陈旧帧。返回体给出 `page`、`pageProbe`、`swipe:{ok,from:'document-rect'|'window-rect'}`、`moved:'text'|'frame'|'unknown'`、`lastPage`、`guidance`。树里第一个 `Document` 常常是**别的后台课程**，所以文档矩形要过“能塞进当前窗口”的检查，不合格就退回窗口矩形，保证 swipe 落在可见文档里。已证伪的一条路：**UIA ScrollPattern**——第一个可滚动节点是隐藏文档（`VerticalScrollPercent` 始终 `-1`），按“可见 + VerticallyScrollable”过滤后，81 个元素的树里一个都没有。
 
 另外，**比桌面还大**的窗口永远合成不了。捕获脚本会同时报出屏幕与窗口矩形，所以提示会**直接说明**这件事，并把窗口缩到屏幕内即可。
 
@@ -455,3 +453,4 @@ MIT —— 见 [LICENSE](LICENSE)。
 - `parity/golden-ax/` 与 `parity/ax-rich/` 包含官方 helper 产出的无障碍树样本，作为 parity 门禁的对比基线。
 
 如果你要再分发本项目，请按你获取这些文件时所依据的条款复核它们。
+

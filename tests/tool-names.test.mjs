@@ -69,7 +69,7 @@ test('P2-6 every documented computer_use_* tool is really registered', () => {
 test('P2-6 every registered tool is documented somewhere', () => {
   const registered = registeredNames()
   const documented = documentedNames(walk(ROOT))
-  assert.ok(registered.size >= 7, `expected the standalone tools, found ${registered.size}`)
+  assert.ok(registered.size >= 5, `expected the standalone tools, found ${registered.size}`)
   const silent = [...registered].filter(name => !documented.has(name))
   assert.deepEqual(silent, [], 'registered tools with no documentation')
 })
