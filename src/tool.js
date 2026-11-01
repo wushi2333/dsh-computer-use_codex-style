@@ -14,6 +14,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { computerUsePrompt, documentationSummary, promptAssetStatus, BROWSER_REQUIRED_FOR } from './prompt.js'
 import { getUiaHost, getUiaHostReady, prewarmUiaHost, closeUiaHost } from './uiahost-client.js'
+import { getCapabilities, capabilityGuidance } from './capabilities.js'
 
 export const name = 'tool-computer-use'
 export const inject = ['tools', 'dshComputerUse', 'systemPrompt']
@@ -94,6 +95,12 @@ export const Config = Schema.object({
   // common round-trip sink (each field costs an observe→act→observe cycle), and
   // the guidance now names it as the preferred path for 2+ field forms.
   enabledTools: Schema.array(Schema.string()).default(['batch_actions', 'scroll_element', 'fill_form']),
+  /**
+   * How long a cached capability probe (uia / screenCap / psHelper) stays valid, in ms.
+   * Probing is cheap but not free; health and any tool that consults capabilities reuse
+   * the result for this long. Set to 0 to re-probe on every health call.
+   */
+  capabilityProbeMs: Schema.number().default(300_000),
   /**
    * When true (default), the FIRST time an app's UIA provider wedges, that app's
    * accessibility text is served from the .NET ControlView fallback for the rest of
@@ -371,6 +378,13 @@ function healthTool(ctx, state, config, startError) {
         browserUnlocked: Boolean(state.browserUnlocked),
         browserSkill: BROWSER_SKILL,
         tools: { exposed: state.exposedNames, enabled: config.enabledTools },
+        // Capability table: what this host can actually do *before* a tool is run. This is
+        // the answer to "why did pixel readback fail" — screenCap:false means there is no
+        // interactive desktop here, so any pixel-based readback is impossible, not buggy.
+        capabilities: (() => {
+          const caps = getCapabilities(state, { maxAgeMs: config.capabilityProbeMs || 5 * 60_000 })
+          return { ...caps, guidance: capabilityGuidance(caps) }
+        })(),
         // P0-1: how many observations needed the repaint nudge / PrintWindow / stale
         // frame, so "the capture keeps failing" is answerable from health instead of
         // from the model's memory of a timeout.
