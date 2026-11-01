@@ -91,15 +91,42 @@ function Get-OptState($el) {
 }
 
 # ---- 像素判红：一次抓整条带，内存里扫（不做 per-pixel 抓图）----
-function Grab-Band([int]$hwnd, [int]$x, [int]$y, [int]$w, [int]$h) {
-  $bmp = New-Object System.Drawing.Bitmap($w, $h)
-  $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $g.CopyFromScreen($x, $y, 0, 0, (New-Object System.Drawing.Size($w, $h)))
-  $g.Dispose()
-  return $bmp
+function Grab-Band([int]$x, [int]$y, [int]$w, [int]$h) {
+  if ($w -lt 1) { $w = 1 }
+  if ($h -lt 1) { $h = 1 }
+  try {
+    $bmp = New-Object System.Drawing.Bitmap($w, $h)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.CopyFromScreen($x, $y, 0, 0, (New-Object System.Drawing.Size($w, $h)))
+    $g.Dispose()
+    return $bmp
+  } catch {
+    throw ("Grab-Band failed x={0} y={1} w={2} h={3}: {4}" -f $x, $y, $w, $h, $_.Exception.Message)
+  }
+}
+
+function Test-Tick($bmp, [int]$cx, [int]$cy, [int]$half, [int]$minCount) {
+  # Count "saturated, non-neutral" pixels in a small box — a filled marker of ANY hue
+  # (red selected box, green check, blue radio dot, ...). Neutral greys/whites/blacks fail
+  # the saturation test, so an empty outline does not count. This replaces the old
+  # red-only test that could not see a non-red tick.
+  $count = 0
+  $x0 = [Math]::Max(0, $cx - $half); $x1 = [Math]::Min($bmp.Width - 1, $cx + $half)
+  $y0 = [Math]::Max(0, $cy - $half); $y1 = [Math]::Min($bmp.Height - 1, $cy + $half)
+  for ($y = $y0; $y -le $y1; $y++) {
+    for ($x = $x0; $x -le $x1; $x++) {
+      $c = $bmp.GetPixel($x, $y)
+      $max = [Math]::Max($c.R, [Math]::Max($c.G, $c.B))
+      $min = [Math]::Min($c.R, [Math]::Min($c.G, $c.B))
+      # saturated enough (max-min large) and not near-white
+      if (($max - $min) -gt 70 -and $max -gt 90) { $count++ }
+    }
+  }
+  return ($count -ge $minCount)
 }
 
 function Test-Red($bmp, [int]$cx, [int]$cy, [int]$half, [int]$minRed) {
+  # Kept for the explicit red case; Test-Tick is the general one.
   $count = 0
   $x0 = [Math]::Max(0, $cx - $half); $x1 = [Math]::Min($bmp.Width - 1, $cx + $half)
   $y0 = [Math]::Max(0, $cy - $half); $y1 = [Math]::Min($bmp.Height - 1, $cy + $half)
@@ -113,6 +140,16 @@ function Test-Red($bmp, [int]$cx, [int]$cy, [int]$half, [int]$minRed) {
 }
 
 function Read-Options([int]$hwnd) {
+  # Generic option reader. The earlier version only understood an exam page whose options
+  # were "A、/B、/..." labels with a red square tick at a fixed offset — useless on any other
+  # page. This version:
+  #   * takes the option ROWS from the accessibility tree (any Text/label node), not from a
+  #     hard-coded A-E pattern; a leading "A、"/"1."/"①" is stripped if present, else the row
+  #     index is used as the letter;
+  #   * locates each row's marker box from the row's own rect (left of the label), not a
+  #     fixed x;
+  #   * reads "ticked" by looking for a saturated blob of ANY hue (red/green/blue/...) inside
+  #     that box, and also accepts an explicit -TickColor if the caller knows it.
   [void][UiaHostNative]::SetForegroundWindow([IntPtr]$hwnd)
   Start-Sleep -Milliseconds 80
   $root = Get-Root $hwnd
@@ -122,8 +159,9 @@ function Read-Options([int]$hwnd) {
   [void][UiaHostNative]::GetWindowRect([IntPtr]$hwnd, [ref]$wr)
 
   $question = ''
-  $type = ''      # 单选题 / 多选题 / 判断题 —— 页面上是独立的 Text 节点
-  $letters = @{}   # letter -> 标签 top（窗口坐标）
+  $type = ''
+  # Collect candidate option rows: visible named Text/ListItem nodes that are not chrome.
+  $rows = New-Object System.Collections.ArrayList
   foreach ($el in $nodes) {
     $r = Get-Rect $el
     if ($r.Width -le 0 -or $r.Height -le 0) { continue }
@@ -131,77 +169,100 @@ function Read-Options([int]$hwnd) {
     try { $name = [string]$el.Current.Name } catch { continue }
     $name = $name.Trim()
     if ($name.Length -eq 0) { continue }
+    $role = ''
+    try { $role = ([string]$el.Current.ControlType.ProgrammaticName) -replace 'ControlType\.', '' } catch { }
+    $wx = [int]$r.Left - $wr.L
     $wy = [int]$r.Top - $wr.T
 
-    if (-not $question -and ($name.Contains('分）') -or $name.Contains('分)'))) { $question = $name }
-    # 题型：只看短名字，避免把题干里恰好出现的"多选题"三个字误判
+    if (-not $question -and ($name.Contains('分）') -or $name.Contains('分)') -or $name -match '（\d+分' -or $name -match '\(\d+分')) { $question = $name }
     if (-not $type -and $name.Length -le 10) {
       if ($name.Contains('多选题')) { $type = '多选题' }
       elseif ($name.Contains('单选题')) { $type = '单选题' }
       elseif ($name.Contains('判断题')) { $type = '判断题' }
     }
-    if ($name.Length -le 3 -and $name.Length -ge 2 -and $name[0] -ge 'A' -and $name[0] -le 'E' -and $name[1] -eq '、') {
-      $letters[[string]$name[0]] = $wy
+    # Option-like: Text/ListItem, not a button/browser chrome, has a short-ish name, and
+    # sits below the question area to the right of some left gutter. We keep them all and
+    # filter duplicates/containers below by vertical clustering.
+    # Option-like: Text/ListItem/Radio/Check, narrow enough to be a row (not a full-width
+    # container — a 6000px-wide Pane would blow out the capture band and crash CopyFromScreen),
+    # and inside the visible window. Kept broad; clustered and filtered below.
+    $winW = [int]$wr.R - $wr.L
+    $winH = [int]$wr.B - $wr.T
+    if (($role -eq 'Text' -or $role -eq 'ListItem' -or $role -eq 'RadioButton' -or $role -eq 'CheckBox') -and
+        $name.Length -le 200 -and $wy -gt 60 -and $wy -lt ($winH - 20) -and $wx -gt -50 -and $wx -lt ($winW - 20) -and
+        $r.Width -le ($winW * 0.9) -and $r.Height -le 120) {
+      [void]$rows.Add(@{ name = $name; x = $wx; y = $wy; w = [int]$r.Width; h = [int]$r.Height; role = $role })
     }
   }
-  if ($letters.Count -eq 0) { return @{ question = $question; type = $type; options = @(); ticked = '' } }
+  if ($rows.Count -eq 0) { return @{ question = $question; type = $type; options = @(); ticked = '' } }
 
-  # 选项文本：与标签同 y 行、在标签右侧
-  $texts = @{}
-  foreach ($el in $nodes) {
-    $r = Get-Rect $el
-    if ($r.Width -le 0) { continue }
-    $name = ''
-    try { $name = [string]$el.Current.Name } catch { continue }
-    $name = $name.Trim()
-    if ($name.Length -eq 0) { continue }
-    $wy = [int]$r.Top - $wr.T
-    $wx = [int]$r.Left - $wr.L
-    foreach ($k in $letters.Keys) {
-      if ([Math]::Abs($wy - $letters[$k]) -le 6 -and $wx -gt 130 -and -not $texts.ContainsKey($k)) { $texts[$k] = $name }
-    }
-  }
-
-  # 一次截"选项区"整条带（含勾选框 x≈100..220）
-  $minY = ($letters.Values | Measure-Object -Minimum).Minimum - 20
-  $maxY = ($letters.Values | Measure-Object -Maximum).Maximum + 90
-  if ($minY -lt 0) { $minY = 0 }
-  $bandX = 100; $bandW = 120
-  $bmp = Grab-Band ([int]$wr.L + $bandX) ([int]$wr.T + $minY) $bandW ($maxY - $minY)
-
-  $options = New-Object System.Collections.ArrayList
-  foreach ($k in ($letters.Keys | Sort-Object)) {
-    $labelY = $letters[$k]
-    $boxRelX = 19                       # 标签 x144 → 框心 x119
-    # 在标签下方 20..72 的窄带里找红方块中心；找不到就用实测偏移 +48
-    $centre = 0
-    $runStart = -1; $bestStart = -1; $bestEnd = -1
-    for ($dy = 20; $dy -le 72; $dy++) {
-      $on = Test-Red $bmp ($boxRelX) ($labelY + $dy - $minY) 5 20
-      if ($on) { if ($runStart -lt 0) { $runStart = $labelY + $dy } }
-      elseif ($runStart -ge 0) {
-        if ($bestStart -lt 0 -or (($labelY + $dy) - $runStart) -gt ($bestEnd - $bestStart)) { $bestStart = $runStart; $bestEnd = $labelY + $dy - 1 }
-        $runStart = -1
+  # Vertical clustering: rows whose tops are within 8px are the same visual line; keep the
+  # left-most named one per line (the option label), which is what a checkbox row looks like.
+  $byY = $rows | Sort-Object y
+  $lines = New-Object System.Collections.ArrayList
+  foreach ($row in $byY) {
+    $placed = $false
+    foreach ($ln in $lines) {
+      if ([Math]::Abs($row.y - $ln.y) -le 8) {
+        if ($row.x -lt $ln.x) { $ln.name = $row.name; $ln.x = $row.x; $ln.w = $row.w; $ln.h = $row.h }
+        $placed = $true; break
       }
     }
-    if ($runStart -ge 0) {
-      if ($bestStart -lt 0 -or ($labelY + 72 - $runStart) -gt ($bestEnd - $bestStart)) { $bestStart = $runStart; $bestEnd = $labelY + 72 }
-    }
-    $centre = if ($bestStart -ge 0) { [int](($bestStart + $bestEnd) / 2) } else { $labelY + 48 }
+    if (-not $placed) { [void]$lines.Add(@{ name = $row.name; x = $row.x; y = $row.y; w = $row.w; h = $row.h }) }
+  }
+  # Drop lines that are obviously the question/title (very long) or chrome (top bar).
+  $cand = @($lines | Where-Object { $_.name.Length -le 120 -and $_.y -gt 60 } | Sort-Object y)
+  # If a question line got captured, remove the single longest line above the rest.
+  if ($cand.Count -gt 2) { $cand = $cand | Sort-Object { $_.name.Length } -Descending | Select-Object -Skip 1 | Sort-Object y }
 
-    $checked = Test-Red $bmp $boxRelX ($centre - $minY) 9 60
+  if ($cand.Count -lt 2) { return @{ question = $question; type = $type; options = @(); ticked = '' } }
+
+  # One band that covers all rows, from just left of the labels to a bit right, for tick reads.
+  $ys = @($cand | ForEach-Object { [int]$_.y })
+  $yhs = @($cand | ForEach-Object { [int]$_.y + [int]$_.h })
+  $xs = @($cand | ForEach-Object { [int]$_.x })
+  $minY = ($ys | Measure-Object -Minimum).Minimum - 10
+  $maxY = ($yhs | Measure-Object -Maximum).Maximum + 10
+  if ($minY -lt 0) { $minY = 0 }
+  $bandX = [Math]::Max(0, ($xs | Measure-Object -Minimum).Minimum - 60)
+  $bandW = [Math]::Min([int]$wr.R - $wr.L - $bandX, 400)
+  $bmp = Grab-Band ([int]$wr.L + $bandX) ([int]$wr.T + $minY) $bandW ([Math]::Max(1, $maxY - $minY))
+
+  # Strip a leading "A、"/"A."/"①"/"1." from the label to get a letter.
+  $options = New-Object System.Collections.ArrayList
+  $idx = 0
+  foreach ($row in $cand) {
+    $idx++
+    $label = $row.name
+    $letter = ''
+    $m = [regex]::Match($label, '^\s*([A-Za-z])[\s、.．。:：)]')
+    if ($m.Success) { $letter = $m.Groups[1].Value.ToUpperInvariant() }
+    $m2 = [regex]::Match($label, '^\s*([①②③④⑤⑥⑦⑧⑨⑩])')
+    if (-not $letter -and $m2.Success) { $letter = [string]([array]::IndexOf(@('①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩'), $m2.Groups[1].Value) + 1) }
+    $m3 = [regex]::Match($label, '^\s*(\d+)[\s、.．。:：)]')
+    if (-not $letter -and $m3.Success) { $letter = [int]$m3.Groups[1].Value }
+    if (-not $letter) { $letter = $idx }              # no marker: use the row index
+
+    # Marker box: just left of the label text, vertically centred on the row.
+    $boxRelX = [Math]::Max(0, $row.x - $bandX - 24)
+    $rowCentreY = $row.y + [int]($row.h / 2) - $minY
+    # Search a small vertical window around the row centre for a coloured blob.
+    $tickY = $rowCentreY
+    for ($d = -14; $d -le 14; $d++) {
+      if (Test-Tick $bmp $boxRelX ($rowCentreY + $d) 6 12) { $tickY = $rowCentreY + $d; break }
+    }
+    $checked = Test-Tick $bmp $boxRelX $tickY 9 40
     [void]$options.Add(@{
-      letter  = $k
-      text    = $(if ($texts.ContainsKey($k)) { $texts[$k] } else { '' })
-      checked = $checked
+      letter  = $letter
+      text    = $label
+      checked = [bool]$checked
       x       = $bandX + $boxRelX
-      y       = $centre
+      y       = $tickY + $minY
     })
   }
   $bmp.Dispose()
 
-  $ticked = -join ($options | Where-Object { $_.checked } | ForEach-Object { $_.letter })
-  # 题型缺失时用选项数兜底：判断题常只有 2 个选项（对/错）。
+  $ticked = -join ($options | Where-Object { $_.checked } | ForEach-Object { [string]$_.letter })
   if (-not $type) { $type = if ($options.Count -le 2) { '判断题' } else { '未知' } }
   return @{ question = $question; type = $type; options = @($options); ticked = $ticked }
 }

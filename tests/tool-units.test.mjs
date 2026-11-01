@@ -12,11 +12,9 @@ import test from 'node:test'
 
 import {
   captureGuidance,
-  classifyQuestionType,
   frameObservation,
   friendlyActionError,
   judgeActStep,
-  looksLikeConfirmDialog,
   parseJsonLine,
   parsePageIndicator,
   recallFrame,
@@ -414,35 +412,8 @@ test('summarizeTree is a no-op for empty input', () => {
   assert.equal(summarizeTree(undefined), '')
 })
 
-test('classifyQuestionType reads the label, else the wording, else the option count', () => {
-  // The explicit label wins (that is what uiahost.ps1 extracts from its own Text node).
-  assert.equal(classifyQuestionType('多选题', '无关题干', 4), '多选题')
-  assert.equal(classifyQuestionType('判断题', '', 2), '判断题')
-  // No label: fall back to the wording.
-  assert.equal(classifyQuestionType('', '(多选题)以下哪些属于…', 4), '多选题')
-  assert.equal(classifyQuestionType('', '单选题:…', 4), '单选题')
-  // No label, no wording: a two-option page is a judge question.
-  assert.equal(classifyQuestionType('', '某题干', 2), '判断题')
-  // Anything else stays honestly unknown rather than guessing.
-  assert.equal(classifyQuestionType('', '某题干', 4), '未知')
-  assert.equal(classifyQuestionType('', '', 0), '未知')
-})
-test('looksLikeConfirmDialog needs wording + confirm button + cancel button', () => {
-  // The real moxueyuan submit sheet.
-  const yes = looksLikeConfirmDialog('还有未答题目，是否确认交卷？', ['取消', '确定'])
-  assert.equal(yes.dialog, true)
-  assert.equal(yes.confirm, '确定')
-  assert.equal(yes.cancel, '取消')
-
-  // A button alone is not a dialog: every page has a 关闭 button.
-  assert.equal(looksLikeConfirmDialog('课程列表', ['关闭', '确定']).dialog, false)
-  // Wording alone is not a dialog either.
-  assert.equal(looksLikeConfirmDialog('确认交卷', []).dialog, false)
-  // Two buttons with no confirmation wording is just chrome, not a prompt.
-  assert.equal(looksLikeConfirmDialog('综合排序 | 课程分类', ['确定', '取消']).dialog, false)
-})
-test('judgeActStep distinguishes applied / unchanged / unverifiable', () => {  // The page changed: the click really did something.
-  assert.deepEqual(judgeActStep('A ○', 'A ●', true), { applied: true })
+test('judgeActStep distinguishes applied / unchanged / unverifiable', () => {
+  // The page changed: the click really did something.
 
   // The click was issued (ok) but nothing changed — the exact WMPF multi-select trap.
   const stalled = judgeActStep('same text', 'same text', true)

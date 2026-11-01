@@ -292,12 +292,8 @@ async function registerDesktop(ctx, state, config) {
   registerTool(ctx, state, waitUntilTool(ctx, state))
   registerTool(ctx, state, documentsTool(ctx, state))
   registerTool(ctx, state, uiaActTool(ctx, state))
-  // P0-3 / P0-4: read and set tick states through the persistent UIA host.
-  registerTool(ctx, state, readOptionsTool(ctx, state))
-  registerTool(ctx, state, setOptionsTool(ctx, state))
-  // Warm the host in the background so its ~3.5 s PowerShell start-up is paid at plugin
-  // load, not on the first read_options call. Fire-and-forget: a failure here is harmless
-  // (the first real call retries) and it must never delay or fail plugin registration.
+  // Warm the persistent UIA host in the background for uia_act's dialog probe, so its
+  // ~3 s PowerShell start-up is paid at plugin load. Fire-and-forget; never fatal.
   if (config.prewarmUiaHost !== false) {
     setTimeout(() => { prewarmUiaHost().catch(() => { }) }, 0)
   }
@@ -1881,129 +1877,6 @@ export function judgeActStep(before, after, ok) {
     }
   }
   return { applied: true }
-}
-
-// ---------------------------------------------------------------------------
-// Persistent-UIA options tools (P0-2/3/4).
-//
-// These go through scripts/uiahost.ps1 (see src/uiahost-client.js) rather than the
-// helper, because the work they do — locating a checkbox by scanning pixels and reading
-// its tick state — is neither a UIA pattern nor a coordinate click the helper can verify.
-// Keeping a PowerShell process alive turns the old 1.5-2 s per read into ~180 ms.
-// ---------------------------------------------------------------------------
-
-/**
- * Classify an exam question from the labels the page exposes (P2-9).
- *
- * The type lives in its own short Text node ("(单选题)"/"(多选题)"/"(判断题)"), and the
- * scripts/uiahost.ps1 read keeps it. This mirrors that rule in JS so it can be tested
- * and so callers can re-derive the type from the question string when the node is absent.
- * When neither the label nor the wording says so, fall back on the option count: a judge
- * question has two options (对/错).
- */
-export function classifyQuestionType(type, question, optionCount) {
-  const label = String(type || '').trim()
-  if (label === '单选题' || label === '多选题' || label === '判断题') return label
-  const text = String(question || '')
-  if (/多\s*选/.test(text)) return '多选题'
-  if (/单\s*选/.test(text)) return '单选题'
-  if (/判\s*断/.test(text)) return '判断题'
-  if (Number.isInteger(optionCount) && optionCount > 0 && optionCount <= 2) return '判断题'
-  return '未知'
-}
-
-/**
- * Decide whether the collected screen text + button names describe a submit confirmation
- * sheet (P2-10). Mirrors the rule in scripts/uiahost.ps1 Do-Dialog so it can be tested:
- * confirmation body wording AND a confirm-style button AND a cancel-style button, all
- * three at once — any one alone is a false positive (every page has a "关闭" button).
- */
-export function looksLikeConfirmDialog(body, buttons) {
-  const text = String(body || '')
-  const names = Array.isArray(buttons) ? buttons.map((b) => String(b || '')) : []
-  const hasWord = /确认|交卷|提交|未答|还有|剩余/.test(text)
-  const confirm = names.find((n) => /确定|提交|确认|是的|交卷/.test(n)) || ''
-  const cancel = names.find((n) => /取消|否|再想想|继续答题|返回/.test(n)) || ''
-  return { dialog: Boolean(hasWord && confirm && cancel), confirm, cancel }
-}
-
-/** `computer_use_read_options` — question + per-option {letter, text, checked, x, y}. */
-export function readOptionsTool(ctx, state) {
-  return defineTool({
-    name: 'computer_use_read_options',
-    description:
-      'Read a multiple-choice page: returns the question text and, for each option, its letter, label, '
-      + 'whether it is TICKED, and the real checkbox position. Tick state is read from PIXELS (a tick is a '
-      + 'red square), so it works on WebView2/WMPF pages whose options expose no UIA pattern at all — the '
-      + 'one place where neither element names nor a read of the tree can tell you what is selected. '
-      + 'Runs against the persistent UIA host (≈180 ms, vs 1.5-2 s for a fresh process).',
-    parameters: { window: WIN_PARAM },
-    output: { schema: OUTPUT_SCHEMA, render(_a, v) { return renderValue(v) } },
-    async execute(args) {
-      const win = args && args.window
-      const hwnd = Number(win && win.id)
-      if (!Number.isInteger(hwnd) || hwnd <= 0) throw new Error('window.id is required')
-      const host = await getUiaHostReady()
-      const res = await host.read(hwnd)
-      if (res.ok !== true) throw new Error(String(res.error || 'could not read the page'))
-      return {
-        value: {
-          question: String(res.question || ''),
-          type: classifyQuestionType(res.type, res.question, (Array.isArray(res.options) ? res.options.length : 0)),
-          options: Array.isArray(res.options) ? res.options : [],
-          ticked: String(res.ticked || ''),
-          // A hint for the next move: multi-select goes to set_options, everything else
-          // can go through uia_act's SelectionItem path.
-          multiSelect: res.type === '多选题',
-          ms: res.ms,
-        },
-      }
-    },
-    isConcurrencySafe() { return false },
-    presentCall(a) { return { card: 'generic', title: 'computer_use_read_options', rawInput: a && typeof a === 'object' ? a : {} } },
-  })
-}
-
-/** `computer_use_set_options` — make the ticked set exactly `target`, verified by re-reading. */
-export function setOptionsTool(ctx, state) {
-  return defineTool({
-    name: 'computer_use_set_options',
-    description:
-      'Make a multiple-choice question\'s ticked options EXACTLY the letters in `target` (e.g. "ACDE"), '
-      + 'then verify by re-reading every tick from pixels. It clicks ONE differing option per round and '
-      + 're-reads the row positions each time, because these pages reflow after every tick — batching a set '
-      + 'of coordinates is what makes this class of page silently wrong. Returns '
-      + '{before, after, target, matched} so success is a fact, not an assumption.',
-    parameters: {
-      window: WIN_PARAM,
-      target: { type: 'string', description: 'The exact set of letters that should be ticked, e.g. "ACDE" (no separators). Use "" to clear all.' },
-    },
-    output: { schema: OUTPUT_SCHEMA, render(_a, v) { return renderValue(v) } },
-    async execute(args) {
-      const win = args && args.window
-      const hwnd = Number(win && win.id)
-      if (!Number.isInteger(hwnd) || hwnd <= 0) throw new Error('window.id is required')
-      const target = String((args && args.target) || '').toUpperCase().replace(/[^A-E]/g, '')
-      const host = await getUiaHostReady()
-      const res = await host.set(hwnd, target)
-      if (res.ok !== true) throw new Error(String(res.error || 'could not set the options'))
-      return {
-        value: {
-          question: String(res.question || ''),
-          type: String(res.type || ''),
-          before: String(res.before || ''),
-          after: String(res.after || ''),
-          target: String(res.target || target),
-          matched: res.matched === true,
-          rounds: res.rounds,
-          log: Array.isArray(res.log) ? res.log : [],
-          ms: res.ms,
-        },
-      }
-    },
-    isConcurrencySafe() { return false },
-    presentCall(a) { return { card: 'generic', title: 'computer_use_set_options', rawInput: a && typeof a === 'object' ? a : {} } },
-  })
 }
 
 /** `computer_use_uia_act` — act by element name (UIA patterns, then a click fallback), then optionally re-observe. */
