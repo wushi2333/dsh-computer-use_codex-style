@@ -16,6 +16,8 @@ import { computerUsePrompt, documentationSummary, promptAssetStatus, BROWSER_REQ
 import { getUiaHost, getUiaHostReady, prewarmUiaHost, closeUiaHost } from './uiahost-client.js'
 import { getCapabilities, capabilityGuidance } from './capabilities.js'
 import { runScript } from './drivers/index.js'
+import { parseJsonLine, frameObservation, rememberFrame, recallFrame } from './capture/frames.js'
+export { parseJsonLine, frameObservation, rememberFrame, recallFrame } from './capture/frames.js'
 
 export const name = 'tool-computer-use'
 export const inject = ['tools', 'dshComputerUse', 'systemPrompt']
@@ -778,11 +780,6 @@ export function runCaptureScript(hwnd, options = {}) {
  * `Command failed: powershell.exe …` instead of "no element matching …", which is the
  * one sentence the model needs to fix its call.
  */
-export function parseJsonLine(text) {
-  const line = String(text || '').split(/\r?\n/).find((l) => l.trim().startsWith('{'))
-  if (!line) return null
-  try { return JSON.parse(line) } catch { return null }
-}
 
 /** Force a repaint so the helper's own WGC capture session can produce a frame. */
 export function nudgeWindow(hwnd) {
@@ -912,56 +909,8 @@ export function gdiWindowFrame(hwnd) {
 }
 
 /** Shape a raw frame into the helper's observation shape (image + screenshot entry). */
-export function frameObservation(frame, extra = {}) {
-  return {
-    ok: true,
-    value: {
-      accessibility: null,
-      screenshots: [{
-        id: 'screenshot-0',
-        width: frame.width,
-        height: frame.height,
-        originX: 0,
-        originY: 0,
-        source: extra.source || 'gdi-printwindow',
-        ...extra.screenshot,
-      }],
-      ...(extra.value || {}),
-    },
-    images: [{
-      data: frame.data,
-      mimeType: 'image/png',
-      width: frame.width,
-      height: frame.height,
-      originX: 0,
-      originY: 0,
-    }],
-  }
-}
 
-/** Remember the last good frame per window so a later timeout can serve it as stale. */
-export function rememberFrame(state, hwnd, frame) {
-  if (!Number.isInteger(hwnd) || hwnd <= 0 || !frame || !frame.data) return
-  state.frameCache = state.frameCache instanceof Map ? state.frameCache : new Map()
-  state.frameCache.set(hwnd, {
-    data: frame.data,
-    width: Number(frame.width) || 0,
-    height: Number(frame.height) || 0,
-    at: Date.now(),
-  })
-  // One stale frame per window is enough; bound the map so a long session cannot
-  // accumulate every window it ever captured.
-  if (state.frameCache.size > 6) {
-    const oldest = [...state.frameCache.entries()].sort((a, b) => a[1].at - b[1].at)[0]
-    if (oldest) state.frameCache.delete(oldest[0])
-  }
-}
 
-export function recallFrame(state, hwnd) {
-  if (!Number.isInteger(hwnd) || !(state.frameCache instanceof Map)) return null
-  const hit = state.frameCache.get(hwnd)
-  return hit && hit.data ? hit : null
-}
 
 function bumpCaptureStat(state, key) {
   state.captureStats = state.captureStats instanceof Map ? state.captureStats : new Map()
@@ -2871,6 +2820,7 @@ async function admitImages(ctx, images) {
   }
   return []
 }
+
 
 
 
