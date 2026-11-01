@@ -41,3 +41,51 @@ test('uia-tree.ps1 : invalid handle -> stdout is valid JSON [], exit 1, no uncau
   assert.equal(parsed.length, 0, 'invalid handle yields an empty array')
   assert.equal(r.code, 1, 'hard failure before output -> exit 1')
 })
+
+// --- WMPF critical-path scripts: stdout must ALWAYS be one valid JSON object, even when
+// the handle is bogus. These are the routes the exam flow depends on; a null/empty stdout
+// here is indistinguishable from "the action silently failed", so the contract is tested.
+
+function runOne(script, args) {
+  try {
+    const out = execFileSync('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(ROOT, 'scripts', script), ...args],
+      { encoding: 'utf8', timeout: 30_000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    return { code: 0, out: String(out || '').trim() }
+  } catch (e) {
+    return { code: e.status == null ? -1 : e.status, out: String(e.stdout || '').trim() }
+  }
+}
+
+function assertJsonObject(r, label) {
+  const firstLine = r.out.split(/\r?\n/).find((l) => l.trim().startsWith('{'))
+  assert.ok(firstLine, `${label}: stdout must contain a JSON object, got: ${r.out.slice(0, 120)}`)
+  let parsed
+  try { parsed = JSON.parse(firstLine) } catch { parsed = undefined }
+  assert.equal(typeof parsed, 'object', `${label}: first JSON line must parse`)
+  assert.ok(parsed && 'ok' in parsed, `${label}: JSON must carry an "ok" field`)
+  return parsed
+}
+
+test('uia-post.ps1 : invalid handle -> valid JSON with ok + per-point FAIL marker', () => {
+  const r = runOne('uia-post.ps1', ['-Hwnd', '1', '-Points', '5,5'])
+  const parsed = assertJsonObject(r, 'uia-post')
+  // Contract: posting issues messages and reports per-point; on a dead handle PostMessage
+  // returns false, so the point is tagged :FAIL. ok:true still means "issued", not "worked".
+  assert.ok(/5,5:FAIL@/.test(parsed.clicked || ''), `expected :FAIL marker, got ${parsed.clicked}`)
+})
+
+test('uia-ticks.ps1 : invalid handle -> valid JSON, ok:false, exit 2', () => {
+  const r = runOne('uia-ticks.ps1', ['-Hwnd', '1', '-Points', '5,5'])
+  const parsed = assertJsonObject(r, 'uia-ticks')
+  assert.equal(parsed.ok, false)
+  assert.equal(r.code, 2, 'window-not-visible -> exit 2')
+})
+
+test('uia-act.ps1 : invalid handle -> valid JSON, ok:false, exit 1 (no empty stdout)', () => {
+  const r = runOne('uia-act.ps1', ['-Hwnd', '1', '-Name', 'x'])
+  const parsed = assertJsonObject(r, 'uia-act')
+  assert.equal(parsed.ok, false)
+  assert.equal(r.code, 1, 'no automation element -> exit 1')
+  assert.match(String(parsed.error || ''), /automation element/i)
+})

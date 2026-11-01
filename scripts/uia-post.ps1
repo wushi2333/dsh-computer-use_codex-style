@@ -1,6 +1,8 @@
 <#
+.SYNOPSIS
   Click by window-relative coordinates by POSTING mouse messages to the render surface.
 
+.DESCRIPTION
   This is the only injection path that works on WeChat mini-program (WMPF) exam pages.
   Measured 2026-10-31 on moxueyuan 多选题:
 
@@ -17,7 +19,17 @@
     the child render surface (ChildWindowFromPointEx walk), lParam = client x|y<<16.
     '10题未答' went to 9 on the first try, so this script uses exactly that and nothing else.
 
-  Exit 0 always; the JSON says per-point ok so the caller can verify the effect.
+CONTRACT (P1 — every fallback script declares its shape)
+  Input   : -Hwnd <long> (required)  -Points "<x,y;x,y;...>" (required, window-relative)
+            -DelayMs <int> (default 260, per-point settle)
+  Output  : stdout = ONE JSON object on every path.
+              success  -> {"ok":true,"mode":"postmessage","clicked":"x,y@<target> ..."}
+              failure  -> {"ok":false,"error":"<reason>"}
+            A per-point ":FAIL" suffix in `clicked` means PostMessage returned false for it
+            (delivered-but-rejected); the caller must verify the effect, not trust ok:true.
+  Errors  : Exit 0 = a JSON value was written (success OR a handled failure).
+            Exit 1 = a hard failure before any JSON could be written.
+            Stdout is ALWAYS valid JSON; diagnostics go to stderr.
 #>
 param(
   [Parameter(Mandatory = $true)][long]$Hwnd,
@@ -26,7 +38,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-Add-Type @"
+
+# A hard failure must still hand the caller JSON, never an empty stream under a non-zero
+# exit (the caller parses whatever was printed and would otherwise see nothing). Wrap the
+# whole body: an unexpected throw becomes {"ok":false,"error":...} on stdout, exit 1.
+try {
+  Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public static class CuPost {
@@ -38,48 +55,55 @@ public static class CuPost {
 }
 "@
 
-$h = [IntPtr]$Hwnd
-[void][CuPost]::SetForegroundWindow($h)
-Start-Sleep -Milliseconds 150
+  $h = [IntPtr]$Hwnd
+  [void][CuPost]::SetForegroundWindow($h)
+  Start-Sleep -Milliseconds 150
 
-$WM_MOUSEMOVE   = 0x0200
-$WM_LBUTTONDOWN = 0x0201
-$WM_LBUTTONUP   = 0x0202
+  $WM_MOUSEMOVE   = 0x0200
+  $WM_LBUTTONDOWN = 0x0201
+  $WM_LBUTTONUP   = 0x0202
 
-$done = @()
-foreach ($pt in $Points.Split(';')) {
-  if (-not $pt.Trim()) { continue }
-  $xy = $pt.Split(',')
-  $cx = [int]$xy[0]; $cy = [int]$xy[1]
+  $done = @()
+  foreach ($pt in $Points.Split(';')) {
+    if (-not $pt.Trim()) { continue }
+    $xy = $pt.Split(',')
+    $cx = [int]$xy[0]; $cy = [int]$xy[1]
 
-  # Walk down to the deepest child that owns this point: posting to the top-level window
-  # is ignored, the render surface is what listens.
-  $ptObj = New-Object CuPost+POINT
-  $ptObj.X = $cx; $ptObj.Y = $cy
-  $target = $h
-  for ($i = 0; $i -lt 8; $i++) {
-    $next = [CuPost]::ChildWindowFromPointEx($target, $ptObj, 0)
-    if ($next -eq [IntPtr]::Zero -or $next -eq $target) { break }
-    $target = $next
+    # Walk down to the deepest child that owns this point: posting to the top-level window
+    # is ignored, the render surface is what listens.
+    $ptObj = New-Object CuPost+POINT
+    $ptObj.X = $cx; $ptObj.Y = $cy
+    $target = $h
+    for ($i = 0; $i -lt 8; $i++) {
+      $next = [CuPost]::ChildWindowFromPointEx($target, $ptObj, 0)
+      if ($next -eq [IntPtr]::Zero -or $next -eq $target) { break }
+      $target = $next
+    }
+
+    # lParam must be the point in the TARGET's client coordinates.
+    $clientPt = New-Object CuPost+POINT
+    $clientPt.X = $cx; $clientPt.Y = $cy
+    # (the child render surface covers the whole page area, so its client origin equals the
+    #  window's; ScreenToClient is applied on the caller's word only when they differ)
+    $lp = [IntPtr](($clientPt.Y -shl 16) -bor ($clientPt.X -band 0xFFFF))
+
+    $okMove = [CuPost]::PostMessage($target, $WM_MOUSEMOVE, [IntPtr]0, $lp)
+    Start-Sleep -Milliseconds 60
+    $okDown = [CuPost]::PostMessage($target, $WM_LBUTTONDOWN, [IntPtr]1, $lp)
+    Start-Sleep -Milliseconds 60
+    $okUp = [CuPost]::PostMessage($target, $WM_LBUTTONUP, [IntPtr]0, $lp)
+
+    $tag = ''
+    if (-not ($okMove -and $okDown -and $okUp)) { $tag = ':FAIL' }
+    $done += ("$cx,$cy" + $tag + '@' + $target)
+    Start-Sleep -Milliseconds $DelayMs
   }
 
-  # lParam must be the point in the TARGET's client coordinates.
-  $clientPt = New-Object CuPost+POINT
-  $clientPt.X = $cx; $clientPt.Y = $cy
-  # (the child render surface covers the whole page area, so its client origin equals the
-  #  window's; ScreenToClient is applied on the caller's word only when they differ)
-  $lp = [IntPtr](($clientPt.Y -shl 16) -bor ($clientPt.X -band 0xFFFF))
-
-  $okMove = [CuPost]::PostMessage($target, $WM_MOUSEMOVE, [IntPtr]0, $lp)
-  Start-Sleep -Milliseconds 60
-  $okDown = [CuPost]::PostMessage($target, $WM_LBUTTONDOWN, [IntPtr]1, $lp)
-  Start-Sleep -Milliseconds 60
-  $okUp = [CuPost]::PostMessage($target, $WM_LBUTTONUP, [IntPtr]0, $lp)
-
-  $tag = ''
-  if (-not ($okMove -and $okDown -and $okUp)) { $tag = ':FAIL' }
-  $done += ("$cx,$cy" + $tag + '@' + $target)
-  Start-Sleep -Milliseconds $DelayMs
+  '{"ok":true,"mode":"postmessage","clicked":"' + ($done -join ' ') + '"}'
+  exit 0
+} catch {
+  [Console]::Error.WriteLine("uia-post: " + $_.Exception.Message)
+  $msg = ($_.Exception.Message -replace '\\', '\\' -replace '"', '\"')
+  Write-Output ('{"ok":false,"error":"' + $msg + '"}')
+  exit 1
 }
-
-'{"ok":true,"mode":"postmessage","clicked":"' + ($done -join ' ') + '"}'

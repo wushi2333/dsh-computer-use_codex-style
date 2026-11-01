@@ -1,6 +1,8 @@
 <#
+.SYNOPSIS
   Read a checkbox/tick's ON/OFF state from PIXELS.
 
+.DESCRIPTION
   Why pixels: on WeChat mini-program (WMPF) exam pages the option rows are plain Text
   nodes that expose no SelectionItem / Toggle / Invoke pattern at all (verified with the
   full UIA walk, pats=TextPattern,ScrollItemPattern), so neither uia_act nor the tree's
@@ -8,14 +10,17 @@
   white check; an empty box is a thin grey outline on white. Counting red pixels is
   therefore the only trustworthy read-back.
 
-  Params:
-    -Hwnd    window handle
-    -Points  "x,y;x,y;..." window-relative CENTRES of the ticks to inspect
-    -Size    half-size of the sampled square (default 9 => 18x18)
-    -MinRed  red-pixel count that counts as ON (default 60)
-
-  Output: {"ok":true,"ticks":[{"x":..,"y":..,"red":N,"on":true|false},...]}
-  Also writes the sampled crops to %TEMP%\cu-ticks\NN.png when -Dump is given.
+CONTRACT (P1 — every fallback script declares its shape)
+  Input   : -Hwnd <long> (required)  -Points "<x,y;x,y;...>" (required, window-relative
+            CENTRES of the ticks)  -Size <int> (default 9 = half-size of the sampled square)
+            -MinRed <int> (default 60 = red-pixel count that counts as ON)  -Dump (switch,
+            also writes the sampled crops to %TEMP%\cu-ticks\NN.png)
+  Output  : stdout = ONE JSON object on every path.
+              success  -> {"ok":true,"ticks":[{"x":..,"y":..,"red":N,"on":bool},...]}
+              failure  -> {"ok":false,"error":"<reason>"}
+  Errors  : Exit 0 = success JSON written.
+            Exit 2 = "window not visible" (JSON {"ok":false,...} written).
+            Stdout is ALWAYS valid JSON; diagnostics go to stderr.
 #>
 param(
   [Parameter(Mandatory = $true)][long]$Hwnd,

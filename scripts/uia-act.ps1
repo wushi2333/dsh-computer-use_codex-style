@@ -1,18 +1,32 @@
 <#
+.SYNOPSIS
   Act on a UIA element by (partial) name — no screenshot, no coordinates.
 
+.DESCRIPTION
   Windows Graphics Capture only delivers a frame when the window changes, so a
   static window (exam/form pages) cannot be captured at all and coordinate
   clicks become impossible. This helper finds controls through the same
   .NET UIAutomation ControlView walk that uia-tree.ps1 uses and drives them
-  through UIA patterns (SelectionItem / Invoke / LegacyIAccessible).
+  through UIA patterns (SelectionItem / Invoke / LegacyIAccessible); when a node
+  exposes no pattern (H5 plain-Text options) it falls back to a tagged SendInput
+  click at the rect UIA reports.
 
-  Params:
-    -Hwnd    window handle
-    -Name    element name or a distinctive substring (first match wins)
-    -Action  select | invoke | default   (default: select, then invoke, then legacy)
-    -Dump    after acting, print the resulting tree (same format as uia-tree.ps1)
-    -MaxNodes limit for -Dump
+CONTRACT (P1 — every fallback script declares its shape)
+  Input   : -Hwnd <long> (required)  -Name <string> (required, exact then substring)
+            -Action <select|invoke|legacy|auto> (default auto)  -Dump (switch, then print
+            the resulting tree in uia-tree.ps1's format)  -MaxNodes <int> (default 220)
+  Output  : stdout = ONE JSON object on every path.
+              success  -> {"ok":true,"action":"select|invoke|legacy|click",
+                           "matched":"<name>","control":"<type>","at":"x,y"|""}
+              failure  -> {"ok":false,"error":"<reason>"}
+            ok:true means the action was ISSUED, not that the effect happened — the caller
+            verifies via uia_act.verify / a re-read (H5 plain Text nodes especially).
+  Errors  : Exit 0 = acted (ok may still be false if no pattern/rect worked; JSON written).
+            Exit 1 = no automation element for that hwnd (JSON {"ok":false,...} written).
+            Exit 2 = no element matched -Name (JSON {"ok":false,...} written).
+            Stdout is ALWAYS valid JSON; diagnostics go to stderr.
+  With -Dump, after the JSON line the resulting tree is also printed (a second block the
+  caller splits on the leading '{' of the first line).
 #>
 param(
   [Parameter(Mandatory = $true)][long]$Hwnd,
@@ -29,7 +43,9 @@ Add-Type -AssemblyName UIAutomationTypes
 $AE = [System.Windows.Automation.AutomationElement]
 $TS = [System.Windows.Automation.TreeScope]
 
-$root = $AE::FromHandle([IntPtr]$Hwnd)
+# FromHandle throws (not returns null) for a bogus handle under ErrorActionPreference=Stop;
+# catch it so the caller still gets a JSON refusal on exit 1 instead of an empty stdout.
+try { $root = $AE::FromHandle([IntPtr]$Hwnd) } catch { $root = $null }
 if ($null -eq $root) { Write-Output '{"ok":false,"error":"no automation element for that hwnd"}'; exit 1 }
 
 $needle = $Name.Trim()
