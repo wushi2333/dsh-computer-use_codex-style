@@ -128,6 +128,19 @@ fn main() {
     if cursor_manager {
         std::process::exit(run_system_cursor_manager(parent_pid));
     }
+    // P0 helper-mode discovery: one-shot "what do you support?" probe. JS calls this once
+    // per exe per session and caches the answer, so a caller never wastes time running
+    // helper binaries that lack a given one-shot mode (the stale-binary case). Printed as
+    // {"modes":["crop","gdi","swipe"]}; a legacy helper that knows nothing about this env
+    // prints nothing and exits — which the JS side treats as "no modes".
+    if (std::env::var_os("DSH_CU_MODES").is_some()) {
+        println!(
+            "{{\"modes\":[{}],\"rev\":\"{}\"}}",
+            ["crop", "gdi", "swipe"].iter().map(|m| format!("\"{m}\"")).collect::<Vec<_>>().join(","),
+            BUILD_REVISION
+        );
+        std::process::exit(0);
+    }
     // P1 migration: one-shot image crop, replacing scripts/crop-image.ps1 (System.Drawing)
     // with the Rust `image` crate — no powershell.exe process. Triggered via the ENVIRONMENT
     // (like DSH_CU_PRINT_BUILD), so the argv surface stays the exact official one.
@@ -2840,4 +2853,5 @@ mod tests {
         assert_eq!(index_of(&vanished), None);
     }
 }
+
 

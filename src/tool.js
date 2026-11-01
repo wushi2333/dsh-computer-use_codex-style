@@ -9,6 +9,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { nativeHelperCandidates, pluginRoot } from './paths.js'
 import { recordEvent, telemetrySummary } from './telemetry.js'
+import { capableHelper } from './helper-modes.js'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
@@ -626,32 +627,33 @@ export function cropImageBase64(base64, mimeType, region, origin, frame, state =
  * Any failure is a silent false so the ps1 fallback runs — behaviour stays identical while
  * the powershell call is phased out.
  */
+
 function cropWithHelper(inPath, outPath, x, y, w, h, state = null) {
-  for (const candidate of nativeHelperCandidates()) {
-    try {
-      if (!fs.existsSync(candidate)) continue
-      execFileSync(candidate, [], {
-        timeout: 15_000,
-        windowsHide: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          DSH_CU_CROP_IN: inPath,
-          DSH_CU_CROP_OUT: outPath,
-          DSH_CU_CROP_X: String(x),
-          DSH_CU_CROP_Y: String(y),
-          DSH_CU_CROP_W: String(w),
-          DSH_CU_CROP_H: String(h),
-        },
-      })
-      if (fs.existsSync(outPath)) {
-        recordEvent(state, 'driver', 'crop.helper', {})
-        return true
-      }
-    } catch { /* try next candidate / fall back to ps1 */ }
-  }
+  const candidate = capableHelper(state, 'crop')
+  if (!candidate) return false
+  try {
+    execFileSync(candidate, [], {
+      timeout: 15_000,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        DSH_CU_CROP_IN: inPath,
+        DSH_CU_CROP_OUT: outPath,
+        DSH_CU_CROP_X: String(x),
+        DSH_CU_CROP_Y: String(y),
+        DSH_CU_CROP_W: String(w),
+        DSH_CU_CROP_H: String(h),
+      },
+    })
+    if (fs.existsSync(outPath)) {
+      recordEvent(state, 'driver', 'crop.helper', {})
+      return true
+    }
+  } catch { /* fall back to ps1 */ }
   return false
 }
+
 
 // ---------------------------------------------------------------------------
 // Capture degradation (P0-1): Windows Graphics Capture needs a repaint, and a

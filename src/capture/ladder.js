@@ -24,6 +24,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { nativeHelperCandidates } from '../paths.js'
 import { recordEvent } from '../telemetry.js'
+import { capableHelper } from '../helper-modes.js'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -73,28 +74,30 @@ export function runCaptureScript(hwnd, options = {}, state = null) {
  * gdi-capture.ps1 does. Returns the parsed verdict when a helper wrote the frame, else null
  * so runCaptureScript falls back to the ps1.
  */
+
 function captureWithHelper(hwnd, outPath, state = null) {
-  for (const candidate of nativeHelperCandidates()) {
-    try {
-      if (!fs.existsSync(candidate)) continue
-      const raw = execFileSync(candidate, [], {
-        encoding: 'utf8',
-        timeout: 20_000,
-        windowsHide: true,
-        maxBuffer: 4 * 1024 * 1024,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          DSH_CU_GDI_CAPTURE_HWND: String(hwnd),
-          DSH_CU_GDI_CAPTURE_OUT: outPath,
-        },
-      })
-      if (fs.existsSync(outPath)) {
-        recordEvent(state, 'driver', 'gdi.helper', { hwnd })
-        return parseJsonLine(raw) || { ok: true, error: '' }
-      }
-    } catch { /* try next candidate / fall back to ps1 */ }
-  }
+  // P0: one probe per session tells us which exe supports the 'gdi' one-shot; no more
+  // walking every (possibly stale) candidate on each call.
+  const candidate = capableHelper(state, 'gdi')
+  if (!candidate) return null
+  try {
+    const raw = execFileSync(candidate, [], {
+      encoding: 'utf8',
+      timeout: 20_000,
+      windowsHide: true,
+      maxBuffer: 4 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        DSH_CU_GDI_CAPTURE_HWND: String(hwnd),
+        DSH_CU_GDI_CAPTURE_OUT: outPath,
+      },
+    })
+    if (fs.existsSync(outPath)) {
+      recordEvent(state, 'driver', 'gdi.helper', { hwnd })
+      return parseJsonLine(raw) || { ok: true, error: '' }
+    }
+  } catch { /* fall back to ps1 */ }
   return null
 }
 
@@ -215,41 +218,43 @@ export function swipeViaScript(hwnd, box, state = null) {
  * a helper that reports a real refusal is authoritative, so we do NOT fall back on a
  * well-formed ok:false), or null when no helper binary could run so the ps1 is tried.
  */
+
 function swipeWithHelper(hwnd, box, state = null) {
-  for (const candidate of nativeHelperCandidates()) {
-    try {
-      if (!fs.existsSync(candidate)) continue
-      const raw = execFileSync(candidate, [], {
-        encoding: 'utf8',
-        timeout: 20_000,
-        windowsHide: true,
-        maxBuffer: 1024 * 1024,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          DSH_CU_SWIPE_HWND: String(hwnd),
-          DSH_CU_SWIPE_FROMX: String(Math.round(box.fromX)),
-          DSH_CU_SWIPE_FROMY: String(Math.round(box.fromY)),
-          DSH_CU_SWIPE_TOX: String(Math.round(box.toX)),
-          DSH_CU_SWIPE_TOY: String(Math.round(box.toY)),
-          DSH_CU_SWIPE_DURATION: '350',
-          DSH_CU_SWIPE_STEPS: '14',
-        },
-      })
-      const parsed = parseJsonLine(raw)
-      if (parsed && typeof parsed.ok === 'boolean') {
-        recordEvent(state, 'driver', 'swipe.helper', { hwnd, ok: parsed.ok })
-        return parsed
-      }
-    } catch (e) {
-      // A helper that ran and printed a verdict but exited non-zero: honour the verdict.
-      const parsed = parseJsonLine(e && e.stdout)
-      if (parsed && typeof parsed.ok === 'boolean') {
-        recordEvent(state, 'driver', 'swipe.helper', { hwnd, ok: parsed.ok })
-        return parsed
-      }
-      // otherwise try next candidate / fall back to ps1
+  const candidate = capableHelper(state, 'swipe')
+  if (!candidate) return null
+  const run = (stdout, err) => {
+    const parsed = parseJsonLine(stdout)
+    if (parsed && typeof parsed.ok === 'boolean') {
+      recordEvent(state, 'driver', 'swipe.helper', { hwnd, ok: parsed.ok })
+      return parsed
     }
+    return null
+  }
+  try {
+    const raw = execFileSync(candidate, [], {
+      encoding: 'utf8',
+      timeout: 20_000,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        DSH_CU_SWIPE_HWND: String(hwnd),
+        DSH_CU_SWIPE_FROMX: String(Math.round(box.fromX)),
+        DSH_CU_SWIPE_FROMY: String(Math.round(box.fromY)),
+        DSH_CU_SWIPE_TOX: String(Math.round(box.toX)),
+        DSH_CU_SWIPE_TOY: String(Math.round(box.toY)),
+        DSH_CU_SWIPE_DURATION: '350',
+        DSH_CU_SWIPE_STEPS: '14',
+      },
+    })
+    const verdict = run(raw)
+    if (verdict) return verdict
+  } catch (e) {
+    // A helper that ran and printed a verdict but exited non-zero: honour the verdict.
+    const verdict = run(e && e.stdout)
+    if (verdict) return verdict
+    // otherwise fall back to ps1
   }
   return null
 }
@@ -451,6 +456,7 @@ export async function observeWithLadder(ctx, state, exec, turnMeta, window, opti
  *   - nothing else.
  * Measured on 40-question exam pages: ~1.5k tokens down to ~200.
  */
+
 
 
 
