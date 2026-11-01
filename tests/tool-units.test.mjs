@@ -12,6 +12,7 @@ import test from 'node:test'
 
 import {
   captureGuidance,
+  classifyQuestionType,
   frameObservation,
   friendlyActionError,
   judgeActStep,
@@ -412,8 +413,20 @@ test('summarizeTree is a no-op for empty input', () => {
   assert.equal(summarizeTree(undefined), '')
 })
 
-test('judgeActStep distinguishes applied / unchanged / unverifiable', () => {
-  // The page changed: the click really did something.
+test('classifyQuestionType reads the label, else the wording, else the option count', () => {
+  // The explicit label wins (that is what uiahost.ps1 extracts from its own Text node).
+  assert.equal(classifyQuestionType('多选题', '无关题干', 4), '多选题')
+  assert.equal(classifyQuestionType('判断题', '', 2), '判断题')
+  // No label: fall back to the wording.
+  assert.equal(classifyQuestionType('', '(多选题)以下哪些属于…', 4), '多选题')
+  assert.equal(classifyQuestionType('', '单选题:…', 4), '单选题')
+  // No label, no wording: a two-option page is a judge question.
+  assert.equal(classifyQuestionType('', '某题干', 2), '判断题')
+  // Anything else stays honestly unknown rather than guessing.
+  assert.equal(classifyQuestionType('', '某题干', 4), '未知')
+  assert.equal(classifyQuestionType('', '', 0), '未知')
+})
+test('judgeActStep distinguishes applied / unchanged / unverifiable', () => {  // The page changed: the click really did something.
   assert.deepEqual(judgeActStep('A ○', 'A ●', true), { applied: true })
 
   // The click was issued (ok) but nothing changed — the exact WMPF multi-select trap.

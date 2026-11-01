@@ -1892,6 +1892,26 @@ export function judgeActStep(before, after, ok) {
 // Keeping a PowerShell process alive turns the old 1.5-2 s per read into ~180 ms.
 // ---------------------------------------------------------------------------
 
+/**
+ * Classify an exam question from the labels the page exposes (P2-9).
+ *
+ * The type lives in its own short Text node ("(单选题)"/"(多选题)"/"(判断题)"), and the
+ * scripts/uiahost.ps1 read keeps it. This mirrors that rule in JS so it can be tested
+ * and so callers can re-derive the type from the question string when the node is absent.
+ * When neither the label nor the wording says so, fall back on the option count: a judge
+ * question has two options (对/错).
+ */
+export function classifyQuestionType(type, question, optionCount) {
+  const label = String(type || '').trim()
+  if (label === '单选题' || label === '多选题' || label === '判断题') return label
+  const text = String(question || '')
+  if (/多\s*选/.test(text)) return '多选题'
+  if (/单\s*选/.test(text)) return '单选题'
+  if (/判\s*断/.test(text)) return '判断题'
+  if (Number.isInteger(optionCount) && optionCount > 0 && optionCount <= 2) return '判断题'
+  return '未知'
+}
+
 /** `computer_use_read_options` — question + per-option {letter, text, checked, x, y}. */
 export function readOptionsTool(ctx, state) {
   return defineTool({
@@ -1914,8 +1934,12 @@ export function readOptionsTool(ctx, state) {
       return {
         value: {
           question: String(res.question || ''),
+          type: classifyQuestionType(res.type, res.question, (Array.isArray(res.options) ? res.options.length : 0)),
           options: Array.isArray(res.options) ? res.options : [],
           ticked: String(res.ticked || ''),
+          // A hint for the next move: multi-select goes to set_options, everything else
+          // can go through uia_act's SelectionItem path.
+          multiSelect: res.type === '多选题',
           ms: res.ms,
         },
       }
@@ -1951,6 +1975,7 @@ export function setOptionsTool(ctx, state) {
       return {
         value: {
           question: String(res.question || ''),
+          type: String(res.type || ''),
           before: String(res.before || ''),
           after: String(res.after || ''),
           target: String(res.target || target),
@@ -3149,4 +3174,5 @@ async function admitImages(ctx, images) {
   }
   return []
 }
+
 

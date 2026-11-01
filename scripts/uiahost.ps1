@@ -122,6 +122,7 @@ function Read-Options([int]$hwnd) {
   [void][UiaHostNative]::GetWindowRect([IntPtr]$hwnd, [ref]$wr)
 
   $question = ''
+  $type = ''      # 单选题 / 多选题 / 判断题 —— 页面上是独立的 Text 节点
   $letters = @{}   # letter -> 标签 top（窗口坐标）
   foreach ($el in $nodes) {
     $r = Get-Rect $el
@@ -133,11 +134,17 @@ function Read-Options([int]$hwnd) {
     $wy = [int]$r.Top - $wr.T
 
     if (-not $question -and ($name.Contains('分）') -or $name.Contains('分)'))) { $question = $name }
+    # 题型：只看短名字，避免把题干里恰好出现的"多选题"三个字误判
+    if (-not $type -and $name.Length -le 10) {
+      if ($name.Contains('多选题')) { $type = '多选题' }
+      elseif ($name.Contains('单选题')) { $type = '单选题' }
+      elseif ($name.Contains('判断题')) { $type = '判断题' }
+    }
     if ($name.Length -le 3 -and $name.Length -ge 2 -and $name[0] -ge 'A' -and $name[0] -le 'E' -and $name[1] -eq '、') {
       $letters[[string]$name[0]] = $wy
     }
   }
-  if ($letters.Count -eq 0) { return @{ question = $question; options = @(); ticked = '' } }
+  if ($letters.Count -eq 0) { return @{ question = $question; type = $type; options = @(); ticked = '' } }
 
   # 选项文本：与标签同 y 行、在标签右侧
   $texts = @{}
@@ -194,7 +201,9 @@ function Read-Options([int]$hwnd) {
   $bmp.Dispose()
 
   $ticked = -join ($options | Where-Object { $_.checked } | ForEach-Object { $_.letter })
-  return @{ question = $question; options = @($options); ticked = $ticked }
+  # 题型缺失时用选项数兜底：判断题常只有 2 个选项（对/错）。
+  if (-not $type) { $type = if ($options.Count -le 2) { '判断题' } else { '未知' } }
+  return @{ question = $question; type = $type; options = @($options); ticked = $ticked }
 }
 
 function Do-Post([int]$hwnd, [string[]]$points) {
@@ -258,6 +267,7 @@ function Do-Set([int]$hwnd, [string]$target) {
   $final = Read-Options $hwnd
   return @{
     question = $final.question
+    type     = $final.type
     before   = $before
     after    = $final.ticked
     target   = $wantStr
