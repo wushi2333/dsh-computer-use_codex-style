@@ -23,6 +23,7 @@ import { execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { nativeHelperCandidates } from '../paths.js'
+import { recordEvent } from '../telemetry.js'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -41,16 +42,17 @@ const GDI_CAPTURE_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)
  * @param {{ nudgeOnly?: boolean, outPath?: string }} options
  * @returns {{ok: boolean, width?: number, height?: number, window?: object, screen?: object, oversize?: boolean, error?: string}}
  */
-export function runCaptureScript(hwnd, options = {}) {
+export function runCaptureScript(hwnd, options = {}, state = null) {
   if (!Number.isInteger(hwnd) || hwnd <= 0) return { ok: false, error: 'bad window id' }
   // P1 migration: the Rust helper already owns the full capture_hwnd ladder (WGC -> GDI,
   // nudge, overlay masking) — a superset of gdi-capture.ps1. Its one-shot mode is preferred;
   // the ps1 is the fallback when no helper wrote a frame (nudgeOnly always uses ps1, because
   // the helper's nudge is folded into its own capture path, not a standalone no-output op).
   if (!options.nudgeOnly && options.outPath) {
-    const viaHelper = captureWithHelper(hwnd, options.outPath)
+    const viaHelper = captureWithHelper(hwnd, options.outPath, state)
     if (viaHelper) return viaHelper
   }
+  if (!options.nudgeOnly && options.outPath) recordEvent(state, 'driver', 'gdi.ps1_fallback', { hwnd })
   const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', GDI_CAPTURE_SCRIPT, '-Hwnd', String(hwnd)]
   if (options.nudgeOnly) args.push('-NudgeOnly')
   else if (options.outPath) args.push('-OutPath', String(options.outPath))
@@ -71,7 +73,7 @@ export function runCaptureScript(hwnd, options = {}) {
  * gdi-capture.ps1 does. Returns the parsed verdict when a helper wrote the frame, else null
  * so runCaptureScript falls back to the ps1.
  */
-function captureWithHelper(hwnd, outPath) {
+function captureWithHelper(hwnd, outPath, state = null) {
   for (const candidate of nativeHelperCandidates()) {
     try {
       if (!fs.existsSync(candidate)) continue
@@ -88,6 +90,7 @@ function captureWithHelper(hwnd, outPath) {
         },
       })
       if (fs.existsSync(outPath)) {
+        recordEvent(state, 'driver', 'gdi.helper', { hwnd })
         return parseJsonLine(raw) || { ok: true, error: '' }
       }
     } catch { /* try next candidate / fall back to ps1 */ }
@@ -117,9 +120,9 @@ const UIA_SWIPE_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)),
  * Hash the window's current pixels (GDI, so it works on windows WGC cannot frame).
  * Second signal for "did the page actually move" when no page counter is readable.
  */
-export function frameHash(hwnd) {
+export function frameHash(hwnd, state = null) {
   try {
-    const frame = gdiWindowFrame(hwnd)
+    const frame = gdiWindowFrame(hwnd, state)
     if (!frame || frame.ok !== true || !frame.data) return null
     return crypto.createHash('sha1').update(frame.data).digest('hex')
   } catch {
@@ -182,12 +185,13 @@ export function documentRect(hwnd) {
  * session that a window WGC cannot frame never has. This script walks the pointer with N
  * intermediate moves and stamps SYNTHETIC_TAG, so it works on both counts.
  */
-export function swipeViaScript(hwnd, box) {
+export function swipeViaScript(hwnd, box, state = null) {
   if (!Number.isInteger(hwnd) || hwnd <= 0) return { ok: false, error: 'bad window id' }
   // P1 migration: the helper has an interpolated-SendInput swipe one-shot that replaces
   // uia-swipe.ps1. Preferred; ps1 is the fallback when no usable helper is present.
-  const viaHelper = swipeWithHelper(hwnd, box)
+  const viaHelper = swipeWithHelper(hwnd, box, state)
   if (viaHelper) return viaHelper
+  recordEvent(state, 'driver', 'swipe.ps1_fallback', { hwnd })
   const args = [
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', UIA_SWIPE_SCRIPT,
     '-Hwnd', String(hwnd),
@@ -211,7 +215,7 @@ export function swipeViaScript(hwnd, box) {
  * a helper that reports a real refusal is authoritative, so we do NOT fall back on a
  * well-formed ok:false), or null when no helper binary could run so the ps1 is tried.
  */
-function swipeWithHelper(hwnd, box) {
+function swipeWithHelper(hwnd, box, state = null) {
   for (const candidate of nativeHelperCandidates()) {
     try {
       if (!fs.existsSync(candidate)) continue
@@ -233,11 +237,17 @@ function swipeWithHelper(hwnd, box) {
         },
       })
       const parsed = parseJsonLine(raw)
-      if (parsed && typeof parsed.ok === 'boolean') return parsed
+      if (parsed && typeof parsed.ok === 'boolean') {
+        recordEvent(state, 'driver', 'swipe.helper', { hwnd, ok: parsed.ok })
+        return parsed
+      }
     } catch (e) {
       // A helper that ran and printed a verdict but exited non-zero: honour the verdict.
       const parsed = parseJsonLine(e && e.stdout)
-      if (parsed && typeof parsed.ok === 'boolean') return parsed
+      if (parsed && typeof parsed.ok === 'boolean') {
+        recordEvent(state, 'driver', 'swipe.helper', { hwnd, ok: parsed.ok })
+        return parsed
+      }
       // otherwise try next candidate / fall back to ps1
     }
   }
@@ -251,7 +261,7 @@ function swipeWithHelper(hwnd, box) {
  * lease behind a coordinate click. It still beats "no screenshot at all" —
  * the model can read the page and act by element name or keyboard.
  */
-export function gdiWindowFrame(hwnd) {
+export function gdiWindowFrame(hwnd, state = null) {
   // A restricted sandbox can forbid the child (helper/powershell) writing under %TEMP% even
   // when this process can; retry under the plugin root, which is writable. (Same fallback as
   // cropImageBase64.)
@@ -262,7 +272,7 @@ export function gdiWindowFrame(hwnd) {
     } catch { return null }
     try {
       const outPath = path.join(dir, 'frame.png')
-      const res = runCaptureScript(hwnd, { outPath })
+      const res = runCaptureScript(hwnd, { outPath }, state)
       if (!res || res.ok !== true) return null
       if (!fs.existsSync(outPath)) return null
       const buf = fs.readFileSync(outPath)
@@ -412,6 +422,9 @@ export async function observeWithLadder(ctx, state, exec, turnMeta, window, opti
     const msg = String(thrown && thrown.message ? thrown.message : thrown)
     if (!/capture timed out|window capture timed out|covered by another window|no trustworthy frame/i.test(msg)) throw thrown
     const degraded = await captureFallback(state, hwnd, attempt)
+    // P2: one structured event per degraded observation — the answer to
+    // "which capture path did this observation actually use".
+    recordEvent(state, 'capture', degraded.path || 'none', { hwnd, stale: Boolean(degraded.stale) })
     if (!degraded.result) throw thrown
     const value = degraded.result.value && typeof degraded.result.value === 'object' ? degraded.result.value : {}
     degraded.result.value = value
@@ -438,6 +451,8 @@ export async function observeWithLadder(ctx, state, exec, turnMeta, window, opti
  *   - nothing else.
  * Measured on 40-question exam pages: ~1.5k tokens down to ~200.
  */
+
+
 
 
 

@@ -8,6 +8,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { nativeHelperCandidates, pluginRoot } from './paths.js'
+import { recordEvent, telemetrySummary } from './telemetry.js'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
@@ -382,6 +383,9 @@ function healthTool(ctx, state, config, startError) {
         browserUnlocked: Boolean(state.browserUnlocked),
         browserSkill: BROWSER_SKILL,
         tools: { exposed: state.exposedNames, enabled: config.enabledTools },
+        // P2: degradation telemetry — counters per degradation path + recent events,
+        // next to capabilities. The "which path did it actually take" answer.
+        telemetry: telemetrySummary(state),
         // Capability table: what this host can actually do *before* a tool is run. This is
         // the answer to "why did pixel readback fail" — screenCap:false means there is no
         // interactive desktop here, so any pixel-based readback is impossible, not buggy.
@@ -561,7 +565,7 @@ export function normalizeRegion(region) {
  * Cropping must therefore subtract that origin and clamp inside the frame,
  * otherwise a rectangle near the bottom edge collapses to a 1-pixel strip.
  */
-export function cropImageBase64(base64, mimeType, region, origin, frame) {
+export function cropImageBase64(base64, mimeType, region, origin, frame, state = null) {
   const rg = normalizeRegion(region)
   if (!rg || !base64) return null
   const ox = origin && Number.isFinite(origin.x) ? origin.x : 0
@@ -590,7 +594,8 @@ export function cropImageBase64(base64, mimeType, region, origin, frame) {
       fs.writeFileSync(inPath, Buffer.from(base64, 'base64'))
       // Prefer the Rust helper's one-shot crop (no powershell.exe process); fall back to
       // scripts/crop-image.ps1 when no usable helper wrote the output.
-      let wrote = cropWithHelper(inPath, outPath, x, y, w, h)
+      let wrote = cropWithHelper(inPath, outPath, x, y, w, h, state)
+      if (!wrote) recordEvent(state, 'driver', 'crop.ps1_fallback', {})
       if (!wrote) {
         try {
           execFileSync('powershell.exe', [
@@ -621,7 +626,7 @@ export function cropImageBase64(base64, mimeType, region, origin, frame) {
  * Any failure is a silent false so the ps1 fallback runs — behaviour stays identical while
  * the powershell call is phased out.
  */
-function cropWithHelper(inPath, outPath, x, y, w, h) {
+function cropWithHelper(inPath, outPath, x, y, w, h, state = null) {
   for (const candidate of nativeHelperCandidates()) {
     try {
       if (!fs.existsSync(candidate)) continue
@@ -639,7 +644,10 @@ function cropWithHelper(inPath, outPath, x, y, w, h) {
           DSH_CU_CROP_H: String(h),
         },
       })
-      if (fs.existsSync(outPath)) return true
+      if (fs.existsSync(outPath)) {
+        recordEvent(state, 'driver', 'crop.helper', {})
+        return true
+      }
     } catch { /* try next candidate / fall back to ps1 */ }
   }
   return false
@@ -718,7 +726,7 @@ export function readPageIndicator(hwnd) {
  *
  * @returns {Promise<{from: number, to: number, total: number, key: string|null}>}
  */
-async function pageThroughByKeys(ctx, win, start, exec, turnMeta, probe, opts = {}) {
+async function pageThroughByKeys(ctx, state, win, start, exec, turnMeta, probe, opts = {}) {
   const hwnd = Number(win && win.id)
   const out = { from: start.current, to: start.current, total: start.total, key: null }
   const gap = () => new Promise((resolve) => setTimeout(resolve, 90))
@@ -766,7 +774,7 @@ async function pageThroughByKeys(ctx, win, start, exec, turnMeta, probe, opts = 
     try {
       // Interpolated SendInput swipe first (no lease, real pointer motion); fall back to
       // the helper's 4-event drag only when the script itself failed.
-      const viaScript = swipeViaScript(hwnd, { fromX, fromY: cy, toX, toY: cy })
+      const viaScript = swipeViaScript(hwnd, { fromX, fromY: cy, toX, toY: cy }, state)
       if (!viaScript || viaScript.ok !== true) {
         await ctx.dshComputerUse.call(
           'drag',
@@ -877,7 +885,7 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps, probe = 
           if (state) state.lastShotMeta = { ...(state.lastShotMeta || {}), width: shot.width, height: shot.height }
         }
       } catch { /* paging still tries; the swipe loop reports the stall */ }
-      const paged = await pageThroughByKeys(ctx, win, ind, exec, turnMeta, probe, {
+      const paged = await pageThroughByKeys(ctx, state, win, ind, exec, turnMeta, probe, {
         width: fresh && fresh.width,
         height: fresh && fresh.height,
         y,
@@ -909,7 +917,7 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps, probe = 
       // when neither moved we say UNKNOWN rather than false — GDI PrintWindow happily
       // returns a stale frame for a Chromium surface, so "same pixels" is not proof.
       const before = documentSnapshot(hwnd)
-      const hashBefore = frameHash(hwnd)
+      const hashBefore = frameHash(hwnd, state)
       const geo = state && state.lastShotMeta ? state.lastShotMeta : null
       const w = Number(geo && geo.width) > 0 ? Number(geo.width) : 784
       const h = Number(geo && geo.height) > 0 ? Number(geo.height) : 1628
@@ -933,7 +941,7 @@ export async function runScrollTo(ctx, state, args, exec, defaultSteps, probe = 
         toY: cy,
       })
       const after = documentSnapshot(hwnd)
-      const hashAfter = frameHash(hwnd)
+      const hashAfter = frameHash(hwnd, state)
       const textMoved = Boolean(before && after && before.text !== after.text)
       const frameMoved = Boolean(hashBefore && hashAfter && hashBefore !== hashAfter)
       result.page = null
@@ -1798,6 +1806,7 @@ function makeSidecarTool(ctx, spec, config, state, options) {
           if (Array.isArray(fb) && fb.length >= 3) {
             tree = formatUiaFallback(fb)
             source = 'uia-dotnet-fallback'
+            recordEvent(state, 'uia', 'chromium_host.dotnet_fallback', { app, nodes: fb.length })
             if (!value.accessibility || typeof value.accessibility !== 'object') value.accessibility = {}
             value.accessibility.tree = tree
             value.accessibility.semantic = { dead: false, source, nodes: fb.length }
@@ -1816,12 +1825,14 @@ function makeSidecarTool(ctx, spec, config, state, options) {
               if (Array.isArray(fb2) && fb2.length >= 3) {
                 value.accessibility.tree = formatUiaFallback(fb2)
                 value.accessibility.semantic = { dead: false, source: 'uia-dotnet-fallback', nodes: fb2.length, helperNodes: classification.total }
+                recordEvent(state, 'uia', 'dead_tree.dotnet_fallback', { app, nodes: fb2.length })
                 state.lastElements = []
                 state.lastWindow = win ? { app: win.app, id: win.id, title: win.title } : null
               } else {
                 const cdp = await cachedCdpProbe(state, win)
                 value.accessibility.tree = deadTreeSignal(classification, cdp)
                 value.accessibility.semantic = { dead: true, totalNodes: classification.total, meaningfulNodes: classification.meaningful, fallbackTried: true, cdpAttachable: Boolean(cdp && cdp.canAttach) }
+                recordEvent(state, 'uia', 'dead_tree.signal', { app, total: classification.total })
                 state.lastElements = []
                 state.lastWindow = win ? { app: win.app, id: win.id, title: win.title } : null
               }
@@ -1862,7 +1873,7 @@ function makeSidecarTool(ctx, spec, config, state, options) {
         const cropped = []
         for (const im of result.images) {
           if (!im || !im.data) { cropped.push(im); continue }
-          const out = cropImageBase64(im.data, im.mimeType, region, { x: im.originX, y: im.originY }, { width: im.width, height: im.height })
+          const out = cropImageBase64(im.data, im.mimeType, region, { x: im.originX, y: im.originY }, { width: im.width, height: im.height }, state)
           cropped.push(out ? { ...im, data: out, mimeType: 'image/png' } : im)
         }
         result.images = cropped
@@ -2291,6 +2302,9 @@ async function admitImages(ctx, images) {
   }
   return []
 }
+
+
+
 
 
 
