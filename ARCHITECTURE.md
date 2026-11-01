@@ -102,7 +102,31 @@ plugins/dsh-computer-use/
 | 4 | PowerShell 脚本是二等公民 | **已契约化**：ci-smoke/uia-tree/uia-post/uia-ticks/uia-act/uia-swipe/gdi-capture/crop-image 均有契约头；删 2 个死脚本 |
 | 5 | 错误话术耦合会话状态 | **已拆出** `src/errors/index.js` |
 
-### P1 迁移评估（ps1 → Rust helper 一次性子命令）：先别迁 `uia-tree`
+### P1/P2 终态（2026-11-01，全部推送）
+**契约化**：ci-smoke / uia-tree / uia-post / uia-ticks / uia-act / uia-swipe / gdi-capture /
+crop-image 均有契约头且实测遵守；删除死脚本 uia-click / uia-scroll（git grep 零引用）。
+
+**迁移账本**（ps1 → Rust helper 一次性子命令，全部 env 触发、argv 官方面不变、helper 失败
+自动回落 ps1 —— 回落期间零功能回退）：
+| 脚本 | 结果 | 依据 |
+| --- | --- | --- |
+| crop-image | ✅ 已迁（P1e） | 纯图像处理，与 ps1 像素级等价（80/80 px） |
+| gdi-capture | ✅ 已迁（P1f） | 复用 helper capture_hwnd（WGC→GDI+nudge，ps1 的超集） |
+| uia-swipe | ✅ 已迁（P1g） | helper input.rs 新增插值 swipe_client；沙箱禁注入无法测成功路径，失败路径 JSON 正确 |
+| uia-tree | ❌ 不迁 | Rust UIA 对 WMPF 挖不到内容（31 外框 vs ps1 76 含内容）——ps1 是 WMPF 专用补刀 |
+| uia-act/post/ticks | ❌ 不迁（暂时） | WMPF 特化：post 是唯一有效注入路径、ticks 靠像素、act 有 H5 兜底；Rust 侧无等价验证，迁了风险大于收益 |
+| uiahost / ship-helper | 不适用 | 常驻服务 / 构建工具，不属 per-action 契约层 |
+
+**P2 可观测性**：`src/telemetry.js`（recordEvent：有界计数器 + 40 条 recent 环，never
+throws）。三类事件全接线：`capture.*`（每次降级观察一条）、`uia.*`（死树/兜底三条）、
+`driver.*`（三次迁移的 helper vs ps1_fallback）。`health.telemetry = { counters, recent }`
+与 `health.capabilities` 并列——capabilities 说"这里能做什么"，telemetry 说"实际走了哪条路"。
+
+**迁移生效条件（如实）**：运行中的 release/bin helper 是旧二进制且被活的 sidecar 锁定，本会话
+无法重编。下次 `ship-helper.ps1` 发布新 release 后三个迁移真实生效；在那之前每次调用
+helper（旧版无该模式）→ 自动回落 ps1，行为与迁移前完全一致。
+
+### P1 迁移评估原始探测（uia-tree，保留作依据）
 试做一个最简项 `uia-tree`（helper 已有 `UiaClient::dump`，加环境变量触发 `DSH_CU_UIA_TREE_HWND`
 一次打印 JSON 即走，`cargo check`/`build` 通过、普通窗口与 ps1 输出**逐字段一致**）。但实测暴露
 **决定性差异**：
@@ -178,3 +202,4 @@ node -e "import('./src/uiahost-client.js').then(async m=>{const h=m.getUiaHost()
   先用 grep 定位"下一处 `^function`/`^export`/分隔注释"作为边界，切完立刻
   `node --check` 两边 + 跑单测 + 冒烟 `import('./src/tool.js')` 确认 re-export 闭环。
   纯函数块才搬；带 `ctx`/`state`/`execFileSync`/`path` 的不要搬。
+
