@@ -1,4 +1,6 @@
+import os from 'node:os'
 import path from 'node:path'
+
 import { fileURLToPath } from 'node:url'
 
 export function pluginRoot() {
@@ -66,3 +68,15 @@ export function nativeHelperCandidates(engineRoot) {
   if (process.env.DSH_COMPUTER_USE_HELPER) names.unshift(process.env.DSH_COMPUTER_USE_HELPER)
   return names
 }
+
+/**
+ * P1: ordered scratch-directory candidates for child processes (helper one-shots and
+ * powershell fallbacks both write temp files). os.tmpdir() first — the normal case; the
+ * plugin-local .cu-tmp second — child processes can get ERROR_ACCESS_DENIED under %TEMP%
+ * while the parent Node process can write (observed live), so callers must try in order
+ * and keep their own per-dir fallback logic.
+ */
+export function scratchDirCandidates() {
+  return [os.tmpdir(), path.join(pluginRoot(), '.cu-tmp')]
+}
+

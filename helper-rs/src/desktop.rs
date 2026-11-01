@@ -153,7 +153,7 @@ pub fn require_unlocked() -> Result<(), Error> {
         Err(_) => {
             // When OpenInputDesktop fails (e.g. AccessDenied on a restricted desktop),
             // the active input desktop is an isolated secure desktop.
-            return Err(Error::desktop(locked_message("SecureDesktop")));
+            return Err(Error::desktop(locked_message("SecureDesktop")).coded("desktop_locked"));
         }
     };
     if name_is_lock_desktop(&name) {
@@ -230,3 +230,4 @@ mod tests {
         assert_eq!(FOREGROUND_NO_PID, "foreground window did not report a process id");
     }
 }
+

@@ -270,49 +270,52 @@ pub struct Error {
     pub kind: ErrorKind,
     pub message: String,
     pub approval: Option<Value>,
+    /// P1: machine-readable refinement ("window_gone", "desktop_locked", "input_monitor")
+    /// set only at the sites JS classifies; None everywhere else.
+    pub code: Option<&'static str>,
 }
 
 impl Error {
     pub fn parse(msg: impl Into<String>) -> Self {
-        Self { kind: ErrorKind::Parse, message: msg.into(), approval: None }
+        Self { kind: ErrorKind::Parse, message: msg.into(), approval: None, code: None }
     }
     pub fn invalid(msg: impl Into<String>) -> Self {
-        Self { kind: ErrorKind::InvalidRequest, message: msg.into(), approval: None }
+        Self { kind: ErrorKind::InvalidRequest, message: msg.into(), approval: None, code: None }
     }
     pub fn unknown_method(method: impl std::fmt::Display) -> Self {
         Self {
             kind: ErrorKind::UnknownMethod,
             message: format!("{UNSUPPORTED_METHOD_PREFIX}{method}"),
-            approval: None,
+            approval: None,            code: None,
         }
     }
     pub fn unknown_tool(name: impl std::fmt::Display) -> Self {
         Self {
             kind: ErrorKind::UnknownMethod,
             message: format!("{UNSUPPORTED_METHOD_PREFIX}{name}"),
-            approval: None,
+            approval: None,            code: None,
         }
     }
     pub fn key(msg: impl Into<String>) -> Self {
-        Self { kind: ErrorKind::UnknownMethod, message: msg.into(), approval: None }
+        Self { kind: ErrorKind::UnknownMethod, message: msg.into(), approval: None, code: None }
     }
     pub fn type_err(msg: impl Into<String>) -> Self {
-        Self { kind: ErrorKind::Type, message: msg.into(), approval: None }
+        Self { kind: ErrorKind::Type, message: msg.into(), approval: None, code: None }
     }
     pub fn value(msg: impl Into<String>) -> Self {
-        Self { kind: ErrorKind::Value, message: msg.into(), approval: None }
+        Self { kind: ErrorKind::Value, message: msg.into(), approval: None, code: None }
     }
     pub fn desktop(msg: impl Into<String>) -> Self {
-        Self { kind: ErrorKind::Desktop, message: msg.into(), approval: None }
+        Self { kind: ErrorKind::Desktop, message: msg.into(), approval: None, code: None }
     }
     pub fn other(msg: impl Into<String>) -> Self {
-        Self { kind: ErrorKind::Other, message: msg.into(), approval: None }
+        Self { kind: ErrorKind::Other, message: msg.into(), approval: None, code: None }
     }
     pub fn interrupt() -> Self {
-        Self { kind: ErrorKind::Interrupt, message: ESCAPE_ERROR.into(), approval: None }
+        Self { kind: ErrorKind::Interrupt, message: ESCAPE_ERROR.into(), approval: None, code: None }
     }
     pub fn turn_ended() -> Self {
-        Self { kind: ErrorKind::Interrupt, message: TURN_ENDED_MESSAGE.into(), approval: None }
+        Self { kind: ErrorKind::Interrupt, message: TURN_ENDED_MESSAGE.into(), approval: None, code: None }
     }
     pub fn approval(app: &str) -> Self {
         if app == AUDIO_APP {
@@ -321,6 +324,7 @@ impl Error {
                 message: AUDIO_APPROVAL_MESSAGE.into(),
                 // APS-12: the official JS layer never offers "always" for audio.
                 approval: Some(approval_request(AUDIO_APP, AUDIO_DISPLAY, false)),
+                code: None,
             };
         }
         // The helper's own message is the official AppApprovalRequired sentence;
@@ -330,6 +334,7 @@ impl Error {
             kind: ErrorKind::Approval,
             message: format!("{APPROVAL_REQUIRED_PREFIX}{app}"),
             approval: Some(approval_request(app, app, true)),
+            code: None,
         }
     }
 
@@ -348,6 +353,7 @@ impl Error {
             kind: ErrorKind::Approval,
             message: LAUNCH_APP_NO_APPROVED.into(),
             approval: Some(approval_request(app, display, true)),
+            code: None,
         }
     }
 
@@ -370,7 +376,29 @@ impl Error {
             kind: ErrorKind::Approval,
             message: LAUNCH_APP_NO_APPROVED.into(),
             approval: Some(request),
+            code: None,
         }
+    }
+
+    /// Coarse machine-readable kind ("desktop", "approval", ...), for the error body.
+    pub fn kind_name(&self) -> &'static str {
+        match self.kind {
+            ErrorKind::Parse => "parse",
+            ErrorKind::InvalidRequest => "invalid_request",
+            ErrorKind::UnknownMethod => "unknown_method",
+            ErrorKind::Type => "type",
+            ErrorKind::Value => "value",
+            ErrorKind::Desktop => "desktop",
+            ErrorKind::Approval => "approval",
+            ErrorKind::Interrupt => "interrupt",
+            ErrorKind::Other => "other",
+        }
+    }
+
+    /// P1: attach the fine-grained machine code used by the JS error classifier.
+    pub fn coded(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
     }
 
     pub fn to_response(&self, id: Value, jsonrpc_v2: bool) -> Value {
@@ -386,7 +414,17 @@ impl Error {
                 let data = self.approval.as_ref().map(|req| json!({ "approvalRequest": req }));
                 jsonrpc_err(id, code, &self.message, data)
             }
-            _ => official_err(id, &self.message, self.approval.clone()),
+            _ => {
+                // P1: structured error classification. `kind` is the coarse ErrorKind;
+                // `code` is the fine refinement set at specific creation sites. JS reads
+                // code first and falls back to legacy message matching.
+                let mut body = official_err(id, &self.message, self.approval.clone());
+                body["kind"] = json!(self.kind_name());
+                if let Some(code) = self.code {
+                    body["code"] = json!(code);
+                }
+                body
+            }
         }
     }
 }
@@ -659,3 +697,8 @@ mod tests {
         assert!(approval_grants_from_meta(&json!({})).is_empty());
     }
 }
+
+
+
+
+

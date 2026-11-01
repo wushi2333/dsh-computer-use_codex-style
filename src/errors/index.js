@@ -64,7 +64,7 @@ export function isWedged(state, app) {
  * BOTH to errors returned as {ok:false,error} AND to exceptions thrown by `call`
  * (the sidecar throws for an unknown/closed window before returning a result).
  */
-export function friendlyActionError(state, input, rawMessage) {
+export function friendlyActionError(state, input, rawMessage, code) {
   const msg = String(rawMessage == null ? '' : rawMessage)
   // P3-8: the helper sometimes answers with an entire window list inside the error
   // text. That hides the actual sentence, so keep the head and point at the tool that
@@ -75,6 +75,28 @@ export function friendlyActionError(state, input, rawMessage) {
   const compact = msg.length > 700
     ? `${msg.slice(0, 700)}… (truncated — call list_windows for the full window list)`
     : msg
+  // P1: machine codes from the helper take precedence over message matching — they are
+  // stable across rewording. The regex fallbacks below keep old (uncoded) binaries working.
+  if (code === 'window_gone') {
+    // Stale observation state MUST be cleared even when the message is already
+    // actionable — the early `alreadyActionable` return used to skip exactly this.
+    state.lastElements = []
+    state.lastWindow = null
+    return null
+  }
+  if (code === 'desktop_locked') {
+    return new Error(`${compact} — the desktop is LOCKED; ask the user to unlock it, then retry.`)
+  }
+  if (code === 'input_monitor') {
+    return new Error(
+      `${compact} — this is the monitor seeing an injected click, and the action did NOT run. `
+      + 'Call get_window_state (include_screenshot) and retry once; batch_actions re-observes between coordinate steps automatically.',
+    )
+  }
+  if (code === 'wedged') {
+    noteWedge(state, input && input.window && input.window.app)
+    return new Error(`${compact} — NOTE: screenshots still work; retry without include_text and act by x/y coordinates.`)
+  }
   // Already carries actionable guidance (e.g. the Rust helper now appends it) — don't double it.
   if (alreadyActionable) return null
   // P1-4: the human-input monitor cannot always tell our own injected click from the

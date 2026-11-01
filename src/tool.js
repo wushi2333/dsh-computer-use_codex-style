@@ -7,7 +7,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { nativeHelperCandidates, pluginRoot } from './paths.js'
+import { nativeHelperCandidates, pluginRoot, scratchDirCandidates } from './paths.js'
 import { recordEvent, telemetrySummary } from './telemetry.js'
 import { capableHelper } from './helper-modes.js'
 import crypto from 'node:crypto'
@@ -617,7 +617,7 @@ export function cropImageBase64(base64, mimeType, region, origin, frame, state =
   }
   const tmpBase = path.join(pluginRoot(), '.cu-tmp')
   try { fs.mkdirSync(tmpBase, { recursive: true }) } catch { /* best effort */ }
-  return tryIn(os.tmpdir()) ?? tryIn(tmpBase)
+  return scratchDirCandidates().map((dir) => tryIn(dir)).find(Boolean) ?? null
 }
 
 /**
@@ -1677,7 +1677,7 @@ function makeSidecarTool(ctx, spec, config, state, options) {
           if (gate?.write) safety.finishWrite()
         }
         if (gate?.write) safety.lease.note(gate.sessionId, spec.name)
-        if (!outcome.ok) throw friendlyActionError(state, input, outcome.error) || new Error(String(outcome.error))
+        if (!outcome.ok) throw friendlyActionError(state, input, outcome.error, outcome.code) || new Error(String(outcome.error))
         return { value: outcome.value, images: [] }
       }
       const wantText = spec.name === 'get_window_state' && Boolean(input && input.include_text)
@@ -1741,7 +1741,7 @@ function makeSidecarTool(ctx, spec, config, state, options) {
               if (degraded.result) result = degraded.result
               else result = { ok: true, value: { accessibility: null }, images: [] }
             } else {
-              throw friendlyActionError(state, input, thrownMsg) || thrown
+              throw friendlyActionError(state, input, thrownMsg, thrown && thrown.code) || thrown
             }
           }
           if (result && result.approvalRequest) {

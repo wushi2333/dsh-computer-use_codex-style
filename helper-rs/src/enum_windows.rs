@@ -897,7 +897,7 @@ pub fn lookup_window(id: u64, expected_app: Option<&str>) -> Result<WindowRef, E
         }
         return Ok(found.clone());
     }
-    Err(Error::desktop(missing_window_message(id, &windows)))
+    Err(Error::desktop(missing_window_message(id, &windows)).coded("window_gone"))
 }
 
 pub fn list_apps_from_windows(windows: &[WindowRef]) -> Vec<AppInfo> {
@@ -1664,3 +1664,4 @@ mod tests {
         assert!(!app_identity_matches(canonical, r"D:\other\msedge.exe"));
     }
 }
+

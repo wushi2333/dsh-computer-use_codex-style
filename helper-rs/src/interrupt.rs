@@ -380,7 +380,7 @@ pub fn require_clean_for(root: isize) -> Result<(), Error> {
         return Ok(());
     }
     if root_is_dirty(root) {
-        return Err(Error::desktop(USER_INPUT_MESSAGE));
+        return Err(Error::desktop(USER_INPUT_MESSAGE).coded("input_monitor"));
     }
     Ok(())
 }
@@ -933,5 +933,6 @@ pub(crate) mod tests {
         assert!(!marker_expired(now + Duration::from_secs(1), now));
     }
 }
+
 
 

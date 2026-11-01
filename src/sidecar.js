@@ -132,10 +132,15 @@ class HelperProcess {
     if (!pending) return
     if (message.ok === false) {
       if (message.approvalRequest) {
-        pending.resolve({ approvalRequest: message.approvalRequest, error: message.error })
+        pending.resolve({ approvalRequest: message.approvalRequest, error: message.error, code: message.code, kind: message.kind })
         return
       }
-      pending.reject(new Error(message.error || 'computer-use helper request failed'))
+      const err = new Error(message.error || 'computer-use helper request failed')
+      // P1: structured classification from the helper (err.code wins over regex matching
+      // in errors/friendlyActionError).
+      err.code = message.code
+      err.kind = message.kind
+      pending.reject(err)
       return
     }
     if (message.ok === true) {
@@ -151,7 +156,10 @@ class HelperProcess {
         pending.resolve({ approvalRequest: approval, error: message.error.message })
         return
       }
-      pending.reject(new Error(message.error.message || 'sidecar error'))
+      const err = new Error(message.error.message || 'sidecar error')
+      err.code = message.error.code
+      err.kind = message.error.kind
+      pending.reject(err)
       return
     }
     pending.resolve(message.result)
@@ -831,3 +839,4 @@ export async function waitSpawn(child, timeoutMs) {
 function pathSep() {
   return process.platform === 'win32' ? ';' : ':'
 }
+

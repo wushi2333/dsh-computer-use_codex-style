@@ -295,11 +295,10 @@ export function gdiWindowFrame(hwnd, state = null) {
       try { if (dir) fs.rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ }
     }
   }
-  const tmpBase = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '.cu-tmp')
-  try { fs.mkdirSync(tmpBase, { recursive: true }) } catch { /* best effort */ }
-  const first = attempt(os.tmpdir())
+    try { fs.mkdirSync(tmpBase, { recursive: true }) } catch { /* best effort */ }
+  const first = attempt(scratchDirCandidates()[0])
   if (first) return first
-  const second = attempt(tmpBase)
+  const second = attempt(scratchDirCandidates()[1])
   if (second) return second
   return { ok: false, error: 'capture failed (helper and ps1 both produced no frame)' }
 }
