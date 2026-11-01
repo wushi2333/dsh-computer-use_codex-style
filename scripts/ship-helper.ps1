@@ -18,6 +18,9 @@ $env:CARGO_ENCODED_RUSTFLAGS = (@(
   ('--remap-path-prefix=' + $root + '=<repo>'),
   ('--remap-path-prefix=' + $env:USERPROFILE + '=<home>')
 ) -join $unitSeparator)
+# Audit P3-2: bake the source revision into the binary so ci-smoke can fail a
+# stale committed exe (source changed, binary not rebuilt).
+$env:DSH_CU_BUILD_GIT = (git -C $root rev-parse --short HEAD)
 Push-Location (Join-Path $root 'helper-rs')
 cargo build --release
 cargo test --release
@@ -26,6 +29,15 @@ $dest = Join-Path $root ('helper-rs\bin\' + $platform + '-' + $arch)
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 $name = if ($platform -eq 'win32') { 'dsh-computer-use.exe' } else { 'dsh-computer-use' }
 Copy-Item $target (Join-Path $dest $name) -Force
+# DSH sandbox sessions label their workspace tree Low (sandbox-windows-acl
+# grantWrite); an exe built inside such a tree inherits Low, and a Low image
+# caps the helper process at Low integrity — UIA then cannot read elevated
+# windows (e.g. v2rayN run as administrator). Raise the shipped image to High
+# so the helper runs at the host client's integrity. See
+# scripts/fix-computer-use-integrity.ps1 for the standing mirror-side fix.
+if ($platform -eq 'win32') {
+  icacls (Join-Path $dest $name) /setintegritylevel High | Out-Null
+}
 $file = Get-Item (Join-Path $dest $name)
 $hash = (Get-FileHash $file.FullName).Hash
 Write-Output ('shipped ' + $file.FullName)

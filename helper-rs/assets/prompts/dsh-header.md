@@ -99,10 +99,4 @@ guessing; they are the official documents, verbatim:
 - If the helper reports a non-empty allow list, only those app ids can be observed or driven. Ask the user to add an app to the HOST plugin `allowedApps` config rather than bypassing the list.
 - Coordinates are window-relative logical pixels; `originX`/`originY` in a screenshot are screen coordinates. Input methods activate their target window automatically.
 - Never edit or delete shipped DeepSeek Harness presets (standard, cordis, minimal, ptc). User presets live under $DSH_HOME/.agent-presets/.
-- Computer Use also keeps machine-local experience notes (`computer_use_experience`): short
-  write-ups left by earlier tasks on this machine. The first observation of a matching app carries
-  them as an `Experience notes` text block. They are advisory only - a note never blocks or
-  replaces a call, it can be outdated after an upgrade, and the current observation always wins.
-  Read them when they appear, and when a task ends with an app-specific problem you diagnosed or
-  worked around, record one short note with `action: "record"`.
 

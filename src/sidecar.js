@@ -58,6 +58,8 @@ class HelperProcess {
     this.nextId = 1
     this.kind = ''
     this.preserveOnTimeout = preserveOnTimeout
+    /** Times a request budget was enforced by killing this process (diagnostics). */
+    this.killedOnTimeout = 0
   }
 
   get alive() {
@@ -164,7 +166,16 @@ class HelperProcess {
     const id = this.nextId++
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        const error = new Error(`computer-use request timed out: ${method}`)
+        // The note after the method name is the model-visible contract: a transport
+        // timeout here KILLS the helper (below), so the next Computer Use call pays
+        // a cold start — helper spawn plus (for Chromium targets) the accessibility
+        // tree warm-up. Without the note a model that retries immediately reads the
+        // slower response as a second failure instead of the cost of the first one.
+        const error = new Error(
+          `computer-use request timed out: ${method} ` +
+            '(the helper process was killed to enforce the budget; ' +
+            'the next Computer Use call cold-starts the helper and will be slower)',
+        )
         // Official transport: a timeout kills the helper and rejects every
         // pending request, because the helper's state can no longer be trusted.
         // preserveHelperOnTimeout keeps it alive for debugging only.
@@ -179,6 +190,7 @@ class HelperProcess {
         }
         const child = this.child
         finish(reject, error)
+        this.killedOnTimeout += 1
         for (const pending of [...this.pending.values()]) {
           clearTimeout(pending.timer)
           pending.reject(error)
@@ -327,8 +339,10 @@ const NATIVE_CALLS = new Set([
   'set_value',
   'drag',
   'perform_secondary_action',
+  'select_text',
   'activate_window',
   'batch_actions',
+  'fill_form',
   'session_note',
   'session_state',
   'end_turn',
@@ -340,6 +354,9 @@ const NATIVE_CALLS = new Set([
   // Python" assertion holds.)
   'start_audio_recording',
   'stop_audio_recording',
+  // DSH extension (helper-rs/src/main.rs): clear the human-input monitor without a
+  // capture. Not listed here it would fall through to the Python catalog and fail.
+  'clear_user_input',
   'observe',
   'type',
   'keypress',
@@ -660,6 +677,22 @@ export class Sidecar {
       const listApps = Number(this.config.listAppsTimeoutMs)
       return listApps > 0 ? listApps : 20_000
     }
+    if (method === 'call' && params && params.name === 'get_window_state') {
+      // Same shape as list_apps: the accessibility dump of a heavy Electron/Chromium
+      // window is the other request that can plausibly outrun the base budget. Since
+      // AX-WEDGE the helper answers within its budget (degraded tree), so this knob
+      // only decides how long a *healthy* dump may run; keep it below the harness's
+      // 25 s tool budget. 0/absent falls back to the base budget.
+      const windowState = Number(this.config.windowStateTimeoutMs)
+      if (windowState > 0) return windowState
+    }
+    if (method === 'call' && params && params.name === 'type_text') {
+      // The landing-check ladder makes several accessibility reads per paste; on a
+      // slow window those add up. Same constraints as above. 0/absent falls back to
+      // the base budget.
+      const typeText = Number(this.config.typeTextTimeoutMs)
+      if (typeText > 0) return typeText
+    }
     return base
   }
 
@@ -700,6 +733,20 @@ export class Sidecar {
 
   rawRequest(method, params = {}, signal) {
     return this.request(method, params, signal)
+  }
+
+  /**
+   * How often each helper process was killed to enforce a request budget.
+   * Surfaced through `computer_use_health`: a rising number means some call class
+   * regularly outruns its budget (before AX-WEDGE that call was get_window_state
+   * on heavy Electron windows), and every kill costs the next call a cold start.
+   * @returns {{ native: number, python: number }}
+   */
+  killStats() {
+    return {
+      native: this.primary.killedOnTimeout,
+      python: this.python.killedOnTimeout,
+    }
   }
 
   async listTools(params = {}, signal, timeoutMs) {

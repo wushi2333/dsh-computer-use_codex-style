@@ -28,7 +28,6 @@
 - [工具面](#工具面)
 - [观察—动作—刷新循环](#观察动作刷新循环)
 - [安全模型](#安全模型)
-- [经验层](#经验层)
 - [配置](#配置)
 - [浏览器自动化](#浏览器自动化)
 - [验证](#验证)
@@ -51,7 +50,6 @@
 | **对照真机验证** | 行为对着官方插件与其 helper 做门禁：AX 树语法、覆盖层像素、光标运动、截图新鲜度、传输预算、批准文案、回合生命周期。 |
 | **Harness 原生，不是 MCP 套壳** | DSH 工具 + 随包技能，而不是一个 JavaScript REPL。插件本身是一个 DSH **bundle**：`package.json` + `cordis.patch.yml` + 包根目录下的入口模块。 |
 | **双平面、单 sidecar** | 桌面是进程级资源：指针、覆盖层、截图与批准流放在 HOST 平面；模型可见的工具放在 agent preset，普通编码会话不会拿到鼠标。 |
-| **经验层** | 任务结束后写入本机笔记，下一次任务执行前作为参考回放 —— 见[经验层](#经验层)。 |
 
 ---
 
@@ -139,7 +137,7 @@ flowchart TB
   subgraph DSH["DSH profile"]
     direction TB
     subgraph HOST["HOST 平面 — 进程级"]
-      S["dsh-computer-use<br/>服务 `dshComputerUse`<br/>指针 · 覆盖层 · 截图 · 批准<br/>回合生命周期 · 经验层"]
+      S["dsh-computer-use<br/>服务 `dshComputerUse`<br/>指针 · 覆盖层 · 截图 · 批准<br/>回合生命周期"]
     end
     subgraph PRESET["PRESET 平面 — 每个 agent preset"]
       T["dsh-computer-use/tool<br/>13 个 window2 工具<br/>+ harness 扩展"]
@@ -187,12 +185,16 @@ flowchart TB
 | 工具 | 默认 | 用途 |
 |---|---|---|
 | `batch_actions` | 开启 | 一次调用执行一串确定性动作，然后做一次 `get_window_state` |
-| `computer_use_health` | 始终 | 后端、允许列表、文档门禁、环境审计、经验层状态 |
-| `computer_use_experience` | 始终 | 读取、记录与更新本机经验笔记 |
+| `computer_use_health` | 始终 | 后端、允许列表、文档门禁、环境审计 |
+| `computer_use_uia_act` | 开启 | 按**元素名**用 UIA pattern（`SelectionItem`/`Invoke`/`LegacyIAccessible`）操作控件：不需要截图、不需要坐标，因此在 WGC 截不到的静态窗口上也能用；用 `"A、选项|下一题"` 链式多步，返回动作后的文本树。**自带两步验证**：①`verify`（默认开）比对动作前后页面文本，报告 `applied`/`unchanged`——页面忽略的点击不再被当成成功；②`checkDialog`（默认开）在动作名含 交卷/提交 时探测确认弹窗，返回 `{dialog, body, buttons, confirm, nextStep}`，第二步不当成理所当然。**注意**：裸 `Text` 节点（小程序选项）无任何 pattern，兜底点击只代表"点发出去了"，需另行验证 |
+| `computer_use_wait` | 开启 | 固定等待（可选顺带重新观察），不占一次 helper 往返 |
+| `computer_use_wait_until` | 开启 | 轮询到文本出现 / 截图变化 / 超时为止 |
+| `computer_use_scroll_to` | 开启 | 用多次顺序滚轮脉冲滚到底/顶/约百分比（脉冲间 70ms，因为应用会合并快速脉冲）。要滚到长文档末尾传 steps:40 delta:40000 |
+| `computer_use_documents` | 开启 | 导出活动文档 URL（`Document` 角色的 ValuePattern），PDF/查看器课件可直接取内容而不必逐页翻 |
 | `click_element`、`scroll_element` | 需显式开启 | 旧版 window-v1 别名 |
 | `session_note`、`session_state`、`diagnostic_state`、`end_turn` | 诊断 | 会话草稿、状态转储与回合控制 |
 
-想确认到底挂上了什么，最快的办法是 `computer_use_health`：后端、暴露的工具目录、批准策略、注入了哪些环境变量、文档门禁，经验层状态，以及覆盖层诊断（当前用哪条药丸渲染路径、推了多少帧、系统光标是否被压制、当前用哪种防捕获模式、此刻是否正处于截图遮蔽中）。
+想确认到底挂上了什么，最快的办法是 `computer_use_health`：后端、暴露的工具目录、批准策略、注入了哪些环境变量、文档门禁，以及覆盖层诊断（当前用哪条药丸渲染路径、推了多少帧、系统光标是否被压制、当前用哪种防捕获模式、此刻是否正处于截图遮蔽中）。
 
 ---
 
@@ -234,43 +236,25 @@ sequenceDiagram
 
 扩展工具面之前，先读随包的策略文档：`skills/computer-use/references/confirmations.md` 与 `skills/computer-use-browser/references/confirmations.md`。
 
----
+### 安全契约（`src/safety/`）
 
-## 经验层
+四条规则决定一次调用能不能碰桌面。它们住在 `src/safety/`，**刻意不依赖任何宿主包**——
+一个只能在整个宿主里跑起来的策略层，没有人会反复测试。
 
-每次 Computer Use 运行都会留下两类记录，下一次运行开始前会读到它们：
+| 规则 | 做什么 |
+|---|---|
+| **按会话授权** | 从未被显式授权的会话，能力是关着的。授权**不能从会话内部放宽**；被委派的子代理一律拒绝（`SUBAGENT_COMPUTER_USE_UNAVAILABLE`），并被告知「把这一步交回主代理」。宿主可以从**会话之外**用 `service.safetyGrant(sessionId, true\|false)`（契约层的 `authorize()`）翻转某个会话的授权，同一个调用里顺带收敛该会话的 schema 可见性 |
+| **schema 可见性** | 会话能力关着时，把它的工具 schema 从该 agent 的视野里摘掉，这个会话就不必为用不了的工具付费。释放必须走宿主返回的**函数**式 disposer——`restricted.dispose?.()` 是静默空操作，工具会永远不出现 |
+| **跨会话写租约** | helper 是进程级的，所有会话共用同一只鼠标。写操作在执行期间持有租约，**空闲时钟从写完那一刻重新开始**。读操作永不参与仲裁；拒绝消息会说明对方是「正在执行」还是「安静了 N 秒」 |
+| **失败结构化** | 每条拒绝都带稳定的 `code`、`retry` 判据（`never` / `retry` / `reobserve`）与「下一步做什么」。「它失败了」和「它失败了，先重新观察」需要相反的反应 |
 
-| | 经验条目（模型写） | 观测记录（机器写） |
-|---|---|---|
-| 内容 | 症状、上下文、原因推测、绕法、结果、标签、日期 | 方法、成功/错误、应用、无障碍树是否存在、窗口几何、耗时 |
-| 谁写 | 模型，在任务结束时 | 插件，每次调用都写 |
-| 可信度 | 含推断的叙述 —— **仅供参考** | 事实，不做解读 |
+契约里另外两条由更低层覆盖，本次**没有重复实现**：Rust helper 在锁屏时拒绝输入
+（`helper-rs/src/desktop.rs`）、对更高完整性级别的目标给出完整性受限说明
+（`helper-rs/src/uia.rs`）；而插件**从不把截图写到自己磁盘上**——字节交给宿主的 attachment store，
+文件生命周期归宿主。
 
-存放位置（在插件目录内，已 gitignore，永不发布）：
-
-```text
-.experience/
-  lessons.jsonl      一行一条经验（规范存储）
-  lessons.md         同一批笔记的人类可读视图，按应用分组
-  observations.jsonl 机器写的事实
-  pending.jsonl      还没被写下来的问题
-  manual.jsonl       可选，手写，插件永不改写
-```
-
-**如何到达模型。** 一个回合内对某应用的首次观察会额外带一条参考文本块：
-
-```text
-Experience notes for blender.exe - machine-local notes from earlier tasks here.
-ADVISORY ONLY: not rules and not a gate. An upgrade, a DPI or configuration change can
-invalidate them, and the current observation always wins over a stored note.
-- 2026-09-14 [partial] accessibility was null in 11 of 13 observations -> prefer the app scripting interface
-```
-
-它以独立文本块的形式送达，官方 payload 的键集保持不变（`window`、`screenshots`、`accessibility`、`cacheDiagnostics`）。
-
-**「仅供参考」是靠机制而不是靠措辞。** 任何条目都不能阻塞、替换或门禁一次调用；超过 `staleAfterDays` 的条目标记为可能过期；再次被验证有效的条目会刷新 `verified`；被更好解法取代的条目用 `supersededBy` 退役；并且明确告知模型：**当前观察永远优先**。
-
-**隐私。** 输入文本、控件名、控件值与截图字节永不落盘。错误文本会脱敏（`C:/Users/name/...` 变成 `%USERPROFILE%`）并截断。用 `experience.enabled: false` 或 `DSH_CU_EXPERIENCE=off` 可以整体关闭。
+设计笔记、与参考实现的差距分析、以及移植过程中自己发现并修正的三个问题，见
+[`docs/design-essence-dsh-computer-use.md`](docs/design-essence-dsh-computer-use.md)。
 
 ---
 
@@ -291,20 +275,12 @@ invalidate them, and the current observation always wins over a stored note.
 | `allowedApps` | `[]` | 非空时只有这些 app id 可被观察或驱动 |
 | `envAllowlist` | `[]` | 在随包允许列表之外额外转发给 helper 的环境变量名 |
 | `overlayCaptureExclusion` | `mask` | 状态药丸如何避开模型看到的截图：`mask`（默认）在单次捕获期间用合成器隐藏药丸，操作者始终能看到；`wda` 改用 `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`；`off` 不排除，药丸会出现在截图里 |
-
-### 经验层（同一行上的 `experience.*`）
-
-| 键 | 默认 | 含义 |
-|---|---|---|
-| `enabled` | `true` | 读写笔记的总开关 |
-| `store` | `""` | 空表示 `<pluginRoot>/.experience` |
-| `captureObservations` | `true` | 是否写机器观测事实 |
-| `injectDigest` | `true` | 是否把参考块附在匹配应用的首次观察上 |
-| `maxEntries` / `maxChars` | `3` / `900` | 注入预算 |
-| `staleAfterDays` | `90` | 超过这个天数的条目标记为可能过期 |
-| `includeStale` | `true` | 设为 `false` 时过期条目完全不注入 |
-| `retainEntries` / `retainObservationDays` | `200` / `30` | 保留策略 |
-| `redactPaths` | `true` | 对记录下来的错误文本做本地路径脱敏 |
+| `fallbackLatchAfterWedge` | `true` | 某应用第一次楔死后，本会话余下时间直接用 .NET UIA 兜底供文本，不再每次都等 helper 的 15s dump 超时 |
+| `safetyDefaultEnabled` | `true` | 从未被显式授权或收回的会话，能力默认是否开启。`false` 则默认关闭并摘掉它的工具 schema |
+| `safetyDenySubagents` | `true` | 是否一律拒绝子代理驱动桌面：子代理的权限范围在启动时就固定，不能从会话内部放宽 |
+| `safetyHideToolSchemasWhenOff` | `true` | 能力关闭时是否摘掉工具 schema（已注册工具的 schema 随该会话的每个请求一起发出去） |
+| `safetyControllerLease` | `true` | 是否在会话之间仲裁写操作：helper 是进程级的，所有会话共用同一只鼠标和键盘 |
+| `safetyControllerLeaseIdleMs` | `10000` | 写租约在没有写操作时存活多久。空闲时钟从写**结束**那一刻重新开始，而不是从被接受那一刻 |
 
 ### PRESET 平面（`dsh-computer-use/tool` 行）
 
@@ -332,7 +308,7 @@ invalidate them, and the current observation always wins over a stored note.
 
 ```sh
 # 在 DeepSeek Harness checkout 下运行，以便解析 peer 依赖
-node --import tsx/esm --test tests/contracts.test.mjs tests/experience.test.mjs
+node --import tsx/esm --test tests/contracts.test.mjs tests/interactive_summary.test.mjs
 
 # helper（Rust）
 cargo test --release --manifest-path helper-rs/Cargo.toml
@@ -344,7 +320,7 @@ python -m pytest -q
 node src/smoke.mjs
 ```
 
-当前状态（Windows 11 x64）：**插件门禁 38/38**（25 条契约 + 13 条经验层）、**Rust 202 通过**、**Python 289 通过 / 1 跳过**、fake 后端冒烟通过。
+当前状态（Windows 11 x64）：**插件契约门禁 25/25**、**Rust 231 通过**、**Python 326 通过 / 4 skipped**，fake-backend 冒烟绿。
 
 parity 套件会操作真实桌面，把本插件与官方实现逐项对比 —— 覆盖层像素、光标运动、截图新鲜度、window-state 用例、传输预算、AX 树字节、插件生命周期：
 
@@ -389,7 +365,6 @@ src/
   index.js              HOST 服务：sidecar 生命周期、回合生命周期、health
   tool.js               PRESET 行：工具注册、批准、文档门禁
   sidecar.js            helper 传输：启动、JSON-RPC、预算、路由
-  experience.js         经验层：存储、digest、观测、待补记
   prompt.js             常驻提示词段 + 按需参考文档清单
   paths.js              helper / python 发现逻辑
 skills/
@@ -427,7 +402,6 @@ docs/                   插件说明与图片资源
 
 - **Agent 控制的是真实的鼠标、键盘与屏幕。** 请只在你能接受这一点的会话里使用 Computer Use，并保持拒绝清单完整。
 - **批准是显式的。** `launch_app` 与音频录制会暂停等待 harness 批准 UI；没有任何动作会被静默批准，被拒绝的请求也绝不重试。完全访问（或批准策略为「从不询问」）的会话除外：那是用户自己的选择，插件按 `allow` 放行并留下审计记录。
-- **经验层是本机且有界的。** 它位于插件目录内、已 gitignore、永不打包，也永不记录输入文本、控件名或截图字节。
 - **截图是视觉 part。** 它们以图片附件形式送达模型，JSON 工具结果里不含 base64。
 - **不可信内容始终不可信。** 网页、文档与邮件可以给模型提供信息，但无权授权任何动作。
 
@@ -438,6 +412,31 @@ docs/                   插件说明与图片资源
 本插件对标的基线是 Codex Computer Use 插件 `26.903.61454`：相同的 13 个方法、相同的参数名与默认值、相同的返回体、相同的错误串、相同的 AX 树语法、相同的预算、相同的覆盖层语义。
 
 DSH官方的Computer Use采用设计思路不大一致。如果希望使用Codex风格的功能，可以使用本插件。
+
+### 截图需要窗口"有变化"（静态窗口）
+
+`Windows.Graphics.Capture` 只在目标窗口**发生重绘**时给帧。静态页面——考试答题页、设置对话框、停住的文档——会直接 `window capture timed out`；没有帧就拿不到坐标输入。现在遇到这种情况会**按下面顺序降级**，而不是整单失败：
+
+1. **抖一下再重试**：`scripts/gdi-capture.ps1 -NudgeOnly` 做一次 1 像素尺寸回弹（外加 `InvalidateRect`/`UpdateWindow`）逼窗口重绘，然后**重取一次** helper 的捕获。这一帧落在 helper **自己的**捕获会话里，所以 `screenshotId`、坐标点击、观察租约全都照常可用。需要抖动的窗口会被记住，**下一次捕获前先抖**——15 秒超时每个窗口只付一次，而不是每次观察都付。
+2. **PrintWindow（GDI）**：`PrintWindow(PW_RENDERFULLCONTENT)` 完全不需要新的 DWM 帧。抓到的图按普通截图注入，带 `source: "gdi-printwindow"`：读页面、算 x/y 都够用，但 helper 手里没有这一帧，所以优先用元素名（`computer_use_uia_act`），坐标点击前会自动补一次观察。
+3. **陈旧帧**：GDI 也失败时，返回该窗口**上一次成功**的帧，标 `stale: true` 并附年龄。
+4. **纯文本**：只有到这一步才退回原来的 `captureFailed: true` + UIA 文本兜底。
+
+`value.capture` 会说明走了哪条路（`path`/`stale`/`recovered`/`oversizeWindow`/`guidance`），`computer_use_health.captureRecovery` 则给出计数（`wgc`、`wgc-after-nudge`、`gdi-printwindow`、`stale-frame`、`gdi-failed`）。Chromium 宿主上"只取文本"的观察依旧完全不走捕获通道（.NET UIA 兜底 + 有效租约）；`computer_use_uia_act` 也依旧按元素名操作，既不需要帧也不需要坐标。
+
+同一轮还有两个配套行为：
+
+- `batch_actions` 现在由插件**逐步执行**，而不是一整个丢给 helper：每一步的 `shot-N` 截图 id 都像顶层调用一样翻译；连续两个坐标动作之间会补一次"只带截图"的观察；遇到 `user input was detected in this window` 会先补观察再重试这一步，而不是整批中止。
+- **微信小程序（WMPF）页面既不吃鼠标也不吃触摸注入**。实测 40 题安全考试：`SendInput` 点击事件确实送达（返回 2、光标回读正确、窗口在前台、`WindowFromPoint` 命中页面），但页面完全无反应；`InjectTouchInput` 全部 `err=87`，因为本机 `IsTouchWindow=false`。**真正有效的是两件事**：`scripts/uia-post.ps1`（`PostMessage` 直接把 `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/`WM_LBUTTONUP` 投给渲染子窗口，`lParam = x|y<<16`）与 `scripts/uia-ticks.ps1`（**按像素判红**读勾选框 ON/OFF）——这些选项是裸 `Text`、没有任何 `SelectionItem`/`Toggle` pattern，像素是唯一可信的回读手段。
+- **不要用"算出来的坐标"去点 WMPF 多选题**。选项标签的 `y` 不是勾选框的 `y`（实测某 5 选项题差 **+48**，且 4 选项与 5 选项行距不同），而且**每勾一次页面就会重排**，所以"读一次坐标再连点一批"必然错位。可靠姿势是：**人工勾选 + `uia-ticks.ps1` 像素复核**（先扫 200–440 竖带找红区定位行，再 `-Points "119,<y>;..."`）。
+- 两步确认交互用 `computer_use_uia_act`：点第一个控件（如 `交卷`），`checkDialog` 会报告确认弹窗与真正提交的按钮；**最后一步提交刻意保持为独立的显式动作**。
+- 交卷可以稳定用 `computer_use_uia_act`：点 `交卷` → 确认弹窗点 `提交`。已端到端验证（40/40，100 分）。
+- `computer_use_uia_act` 的点击兜底（给没有任何 UIA pattern 的节点）在注入事件上打了 helper 的 `SYNTHETIC_TAG`（`dwExtraInfo`），所以它自己的点击不会再被当成"人工输入"。
+- `computer_use_scroll_to` 不再只信滚轮。阶梯是：滚轮 → `Page_Down` → `Right` → `Next` → **插值 swipe**（`scripts/uia-swipe.ps1`：14 个中间移动、350ms、带 `SYNTHETIC_TAG`、**不需要 helper 捕获会话**；helper 自带的 `drag` 只有 4 个事件、中间没有移动，网页阅读器不认）。**是否真的翻动**用三信号判定，最硬的先判：页码「当前/总页」→ UIA 树文本 diff（`documentSnapshot()`，还能识别 `最后一页了` → `lastPage`）→ GDI 帧哈希；**帧相同只会降级为 `unknown`**，因为 `PrintWindow` 对 Chromium 表面常返回陈旧帧。返回体给出 `page`、`pageProbe`、`swipe:{ok,from:'document-rect'|'window-rect'}`、`moved:'text'|'frame'|'unknown'`、`lastPage`、`guidance`。树里第一个 `Document` 常常是**别的后台课程**，所以文档矩形要过“能塞进当前窗口”的检查，不合格就退回窗口矩形，保证 swipe 落在可见文档里。已证伪的一条路：**UIA ScrollPattern**——第一个可滚动节点是隐藏文档（`VerticalScrollPercent` 始终 `-1`），按“可见 + VerticallyScrollable”过滤后，81 个元素的树里一个都没有。
+
+另外，**比桌面还大**的窗口永远合成不了。捕获脚本会同时报出屏幕与窗口矩形，所以提示会**直接说明**这件事，并把窗口缩到屏幕内即可。
+
+被**别的窗口遮住**的目标也是同一类失败（helper 不肯把"遮挡窗口的像素"当成交付内容）。走的是同一条阶梯：先 `activate_window` 再重取；仍然被遮就用 `PrintWindow` 抓目标**自己**的表面（实测遮挡状态下 782×735 窗口仍能出 71 KB PNG），所以结果会是 `path:"wgc-after-activate"` 或 `"gdi-printwindow"`，而不是直接失败。
 
 
 ---
@@ -454,3 +453,4 @@ MIT —— 见 [LICENSE](LICENSE)。
 - `parity/golden-ax/` 与 `parity/ax-rich/` 包含官方 helper 产出的无障碍树样本，作为 parity 门禁的对比基线。
 
 如果你要再分发本项目，请按你获取这些文件时所依据的条款复核它们。
+

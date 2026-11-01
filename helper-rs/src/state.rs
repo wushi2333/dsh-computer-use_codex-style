@@ -246,6 +246,10 @@ pub struct HelperState {
     pub ttl_ms: i64,
     pub last_nodes: Vec<UiNode>,
     pub observed_at: Option<Instant>,
+    /// How many times a NEW TURN dropped a live observation lease. Non-zero means
+    /// "you did observe; the turn boundary cleared it", which `require_window_use`
+    /// words differently from "you never observed" (tools-improved #12).
+    pub lease_dropped_at_turn: u32,
     pub notes: HashMap<String, String>,
     pub allowed_apps: Vec<String>,
     pub session_id: String,
@@ -291,6 +295,7 @@ impl HelperState {
             ttl_ms: 0,
             last_nodes: Vec::new(),
             observed_at: None,
+            lease_dropped_at_turn: 0,
             notes: HashMap::new(),
             allowed_apps: Vec::new(),
             session_id: "dsh".into(),
@@ -399,6 +404,9 @@ impl HelperState {
         let hwnd = self.current_target_hwnd();
         self.shots.insert(id.clone(), CachedShot { hwnd, viewport: vp });
         self.observed_at = Some(Instant::now());
+        // A fresh observation satisfies the lease: forget any "dropped by a new
+        // turn" marker so the next failure reads as a plain missing observation.
+        self.lease_dropped_at_turn = 0;
         self.last_shot_id = Some(id.clone());
         crate::interrupt::clear();
         id
@@ -427,6 +435,14 @@ impl HelperState {
     /// state (approved apps, allowlist, notes, reasoning, monotonic id counters)
     /// survives.
     pub fn reset_turn_state(&mut self) {
+        // Remember that a lease was dropped by a NEW TURN, not by the agent never
+        // observing: the two failures read identically otherwise ("call
+        // get_window_state before using this window"), which cost turns chasing
+        // the wrong thing (tools-improved #12). Only a truthy marker here, so a
+        // reset before any observation is not remembered as "you had one".
+        if self.last_window_identity.is_some() {
+            self.lease_dropped_at_turn += 1;
+        }
         self.last_window = None;
         self.last_window_identity = None;
         self.last_viewport = None;
@@ -495,6 +511,24 @@ impl HelperState {
             return Err(Error::desktop(identity_error(use_, IdentityFail::IdRequired)));
         }
         let Some(identity) = &self.last_window_identity else {
+            // Distinguish "you observed, then a NEW TURN cleared it" from "you never
+            // observed". The old single message made both look like the agent forgot
+            // to observe, and the agent then re-observed blindly (tools-improved #12).
+            if use_ == WindowUse::Captured && self.lease_dropped_at_turn > 0 {
+                return Err(Error::desktop(
+                    "the observation lease was cleared at the start of this turn; call get_window_state once before using this window",
+                ));
+            }
+            // A coordinate action with no cached capture session has a specific,
+            // fixable cause: the last observation returned no screenshot (a
+            // text-only observation, or a helper that had just restarted). Saying
+            // "target is unavailable" alone sent the model hunting for the wrong
+            // thing (tools-improved #28b).
+            if use_ == WindowUse::Coordinate && crate::capture::cached_session_count() == 0 {
+                return Err(Error::desktop(
+                    "coordinate input needs a screenshot from the last observation, and none is cached; call get_window_state with include_screenshot:true (or use element_index) before clicking by x/y",
+                ));
+            }
             return Err(Error::desktop(identity_error(use_, IdentityFail::Missing)));
         };
         if identity.root_hwnd != 0 && identity.root_hwnd != id {
@@ -638,6 +672,40 @@ mod tests {
         assert_eq!(require_usable_app_window(gone).unwrap_err().message, WINDOW_NOT_USABLE);
     }
 
+    // tools-improved #12: a lease dropped by a NEW TURN must read differently from
+    // one that was never taken, so the agent re-observes once instead of hunting.
+    #[test]
+    fn a_turn_dropped_lease_reads_differently_from_a_missing_one() {
+        let mut st = HelperState::new("computer".to_string());
+        // Never observed: the official message.
+        let err = st.require_window_use(1, WindowUse::Captured).unwrap_err();
+        assert_eq!(err.message, CALL_GET_WINDOW_STATE);
+
+        // Simulate an observation, then the turn boundary dropping it.
+        st.last_window_identity = Some(WindowIdentity {
+            app_id: "app".into(),
+            process_id: 0,
+            root_hwnd: 0,
+            input_hwnd: 0,
+            process_name: "app".into(),
+            title: "t".into(),
+            bounds: None,
+            snapshot_revision: 0,
+        });
+        st.reset_turn_state();
+        assert_eq!(st.lease_dropped_at_turn, 1);
+        let err = st.require_window_use(1, WindowUse::Captured).unwrap_err();
+        assert!(
+            err.message.contains("cleared at the start of this turn"),
+            "unexpected: {}",
+            err.message
+        );
+
+        // A fresh capture clears the marker again (a plain capture, no window).
+        st.remember_capture(0, 0, 100, 100, 96);
+        assert_eq!(st.lease_dropped_at_turn, 0);
+    }
+
     #[test]
     fn bounds_compare_is_exact() {
         let bounds = WindowBounds::from_rect(10, 20, 800, 600);
@@ -653,8 +721,16 @@ mod tests {
         let st = HelperState::new("window2".into());
         let err = st.require_window(1).unwrap_err();
         assert_eq!(err.message, CALL_GET_WINDOW_STATE);
+        // A coordinate action with no observation: with no cached capture session
+        // the message now names the real cause (need a screenshot first); otherwise
+        // it is the official "target is unavailable".
         let err = st.require_coordinate_target(1).unwrap_err();
-        assert_eq!(err.message, COORD_TARGET_UNAVAILABLE);
+        assert!(
+            err.message == COORD_TARGET_UNAVAILABLE
+                || err.message.contains("needs a screenshot from the last observation"),
+            "unexpected: {}",
+            err.message
+        );
         let err = st.require_window(0).unwrap_err();
         assert_eq!(err.message, WINDOW_ID_REQUIRED);
     }

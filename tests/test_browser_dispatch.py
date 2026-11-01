@@ -65,7 +65,9 @@ class BrowserDispatchTests(unittest.TestCase):
             "tab_ax_get_state", {"tab_id": self.tid, "content": "screenshot"}
         )
         self.assertEqual(shot["mode"], "screenshot")
-        self.assertTrue(shot.get("_png"))
+        # Screenshot bytes ride as a data-URL on the entry so detach_images
+        # can harvest them into the vision images[] channel (F9).
+        self.assertTrue(shot["screenshots"][0]["url"].startswith("data:image/png;base64,"))
         state = self.surface.dispatch("tab_ax_get_state", {"tab_id": self.tid})
         self.assertEqual(state["mode"], "state")
         # Official default returns a diff, not a forced full tree (BR-06).

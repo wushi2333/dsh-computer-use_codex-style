@@ -36,3 +36,19 @@
         # identity + bounds + the human-input monitor. There is deliberately no
         # expiry knob here (PSG-9): the official contract has no such field.
         allowedApps: []
+        # --- Safety contract (src/safety/) -------------------------------------
+        # Whether the capability is on for a session that was never explicitly
+        # granted or revoked. false closes it by default and hides its tool
+        # schemas, so that session does not pay for tools it may never call.
+        safetyDefaultEnabled: true
+        # Refuse computer control to delegated subagents: a subagent's scope is
+        # fixed when it starts and cannot be widened from inside the session.
+        safetyDenySubagents: true
+        # Hide the tool schemas of a session whose capability is off.
+        safetyHideToolSchemasWhenOff: true
+        # Arbitrate write operations between sessions: the helper is
+        # process-wide, so every session shares one mouse and one keyboard.
+        safetyControllerLease: true
+        # How long the write lease survives without a write. The idle clock
+        # restarts when a write finishes, not when it is accepted.
+        safetyControllerLeaseIdleMs: 10000

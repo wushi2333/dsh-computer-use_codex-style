@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{Interface, Ref, BSTR, Result as WinResult};
 use windows_core::implement;
@@ -54,10 +54,10 @@ use windows::Win32::UI::Accessibility::{
     UIA_ValuePatternId, UIA_WindowPatternId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetAncestor, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsChild, IsWindowVisible, PeekMessageW,
-    TranslateMessage, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, GA_ROOT, MSG, PM_REMOVE,
-    WINEVENT_OUTOFCONTEXT,
+    DispatchMessageW, GetAncestor, GetClientRect, GetForegroundWindow, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsChild, IsWindowVisible,
+    PeekMessageW, TranslateMessage, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, GA_ROOT, MSG,
+    PM_REMOVE, WINEVENT_OUTOFCONTEXT,
 };
 
 pub const ID_SPACE_EXHAUSTED: &str = "accessibility element ID space exhausted";
@@ -744,6 +744,259 @@ impl AccessibilityDump {
 
 pub type UiaResult<T> = Result<T, String>;
 
+// ---------------------------------------------------------------------------
+// AX-WEDGE: per-request deadlines and wedged-window cooldowns.
+//
+// Every client entry point used to block on `recv()` with no deadline, so one
+// provider that never answers (a Chromium UIA bridge on a busy renderer is the
+// measured case: QQNT's main window, 2026-10-25) wedged the single monitor
+// thread, and the only recovery was the Node transport killing the whole helper
+// process -- which also threw away the observation lease, the element cache and
+// Chromium's warmed accessibility tree. The walk's node/depth budgets bound how
+// MUCH is walked but nothing bounded HOW LONG one blocking COM call may take.
+// The transport budget now stays the outer backstop; the helper answers first.
+// ---------------------------------------------------------------------------
+
+/// Monotonic process clock for the absolute deadline slot (`Instant` itself does
+/// not fit an atomic), started on first use.
+static PROCESS_CLOCK: OnceLock<Instant> = OnceLock::new();
+
+/// Deadline of the request currently being dispatched, in ms since
+/// [`PROCESS_CLOCK`]. `0` = no request budget (tests, non-request paths), in
+/// which case only the per-entry-point caps apply.
+static REQUEST_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The job the monitor thread is currently running: `(job hwnd, started)`,
+/// `hwnd = 0` for jobs that carry no window (focused-element reads, cached
+/// lookups, diagnostics). Published before the job runs so a client that times
+/// out can tell "my window's provider is wedged" from "the monitor is busy with
+/// an earlier job".
+static MONITOR_CURRENT: Mutex<Option<(isize, Instant)>> = Mutex::new(None);
+
+/// Windows whose UIA provider has proven wedged: hwnd -> cooldown end. Dumps for
+/// these windows short-circuit to the placeholder tree instead of queueing behind
+/// the stuck call that proved the wedge.
+static WEDGED: OnceLock<Mutex<HashMap<isize, Instant>>> = OnceLock::new();
+
+/// How long a window stays on the wedge list after one timed-out dump.
+const WEDGE_COOLDOWN_MS: u64 = 60_000;
+/// A job running this long is treated as wedged, not merely slow.
+const WEDGE_STUCK_MS: u64 = 30_000;
+/// Per-entry-point wait caps, so a request without a budget still cannot hang.
+const DUMP_WAIT_CAP_MS: u64 = 15_000;
+const MUTATE_WAIT_CAP_MS: u64 = 8_000;
+const READ_WAIT_CAP_MS: u64 = 3_000;
+
+fn process_clock() -> Instant {
+    *PROCESS_CLOCK.get_or_init(Instant::now)
+}
+
+/// Publish the budget of the request being dispatched. Called by the request
+/// dispatcher (`gate_and_dispatch`), which owns the request start and the
+/// transport's `x-oai-cua-request-budget-ms` header. `remaining_ms <= 0` clears
+/// the slot (no budget: only the caps apply).
+pub fn begin_request_budget(remaining_ms: i64) {
+    let deadline = if remaining_ms <= 0 {
+        0
+    } else {
+        process_clock().elapsed().as_millis() as u64 + remaining_ms as u64
+    };
+    REQUEST_DEADLINE_MS.store(deadline, Ordering::SeqCst);
+}
+
+/// How long the caller may wait for one reply: the request's remaining budget
+/// capped by the entry-point class. `Err` when the budget is already spent, so
+/// the caller fails with the protocol's budget message instead of a generic
+/// timeout.
+fn reply_wait(cap_ms: u64) -> Result<Duration, String> {
+    let deadline = REQUEST_DEADLINE_MS.load(Ordering::SeqCst);
+    if deadline == 0 {
+        return Ok(Duration::from_millis(cap_ms));
+    }
+    let now = process_clock().elapsed().as_millis() as u64;
+    if now >= deadline {
+        return Err(crate::protocol::BUDGET_EXHAUSTED.to_string());
+    }
+    Ok(Duration::from_millis(cap_ms.min(deadline - now)))
+}
+
+fn wedged_map() -> &'static Mutex<HashMap<isize, Instant>> {
+    WEDGED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn wedged_until(hwnd: isize) -> Option<Instant> {
+    // Audit P3-1 (2026-10-25): expired entries are removed on sight, not just
+    // ignored — a long batch session otherwise accumulates one dead hwnd per
+    // wedged window and diagnostics reports cooldownRemainingMs: 0 forever.
+    let now = Instant::now();
+    let mut guard = wedged_map().lock().ok()?;
+    match guard.get(&hwnd).copied() {
+        Some(until) if until > now => Some(until),
+        Some(_) => {
+            guard.remove(&hwnd);
+            None
+        }
+        None => None,
+    }
+}
+
+fn mark_wedged(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    if let Ok(mut guard) = wedged_map().lock() {
+        guard.insert(hwnd, Instant::now() + Duration::from_millis(wedge_cooldown_ms()));
+    }
+}
+
+/// The monitor finished (or never started) a job for `hwnd`: drop its cooldown so
+/// the next dump for the window probes the provider again instead of serving the
+/// placeholder for the whole cooldown.
+fn clear_wedged(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    if let Ok(mut guard) = wedged_map().lock() {
+        guard.remove(&hwnd);
+    }
+}
+
+/// Operator-facing drop of a cooldown `hwnd` earned through failed probe jobs.
+/// The post-restore warm-up (`activate_hwnd` → `warm_up_uia_after_restore`)
+/// probes a possibly-dead provider, and every Err job result wedges its window;
+/// the warm-up clears what it earned when it ends, so a genuinely dead provider
+/// re-earns the cooldown through the caller's next dump instead of through the
+/// probe itself.
+pub fn clear_probe_cooldown(hwnd: isize) {
+    clear_wedged(hwnd);
+}
+
+fn env_ms(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn wedge_cooldown_ms() -> u64 {
+    env_ms("DSH_CU_AX_WEDGE_COOLDOWN_MS", WEDGE_COOLDOWN_MS)
+}
+
+fn wedge_stuck_ms() -> u64 {
+    env_ms("DSH_CU_AX_WEDGE_STUCK_MS", WEDGE_STUCK_MS)
+}
+
+/// Operator-visible wedge state for `diagnostic_state`: which windows are on the
+/// cooldown list and what the monitor is currently running.
+pub fn wedge_diagnostics() -> serde_json::Value {
+    let now = Instant::now();
+    let wedged = wedged_map()
+        .lock()
+        .map(|mut guard| {
+            // Audit P3-1: prune dead entries here too — diagnostics must not
+            // report cooldownRemainingMs: 0 for windows that recovered long ago.
+            guard.retain(|_, until| *until > now);
+            guard
+                .iter()
+                .map(|(hwnd, until)| {
+                    serde_json::json!({
+                        "hwnd": hwnd,
+                        "cooldownRemainingMs": until.saturating_duration_since(now).as_millis() as u64,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let current_job = MONITOR_CURRENT
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .map(|(hwnd, started)| {
+            serde_json::json!({
+                "hwnd": hwnd,
+                "runningMs": started.elapsed().as_millis() as u64,
+            })
+        });
+    serde_json::json!({
+        "wedged": wedged,
+        "currentJob": current_job,
+    })
+}
+
+/// The error a caller gets when the monitor has been on one job for at least the
+/// caller's whole wait. `busy_hwnd == hwnd` means the caller's own job is the one
+/// in flight (its window may be wedged); anything else means the caller never got
+/// serviced and must not be blamed.
+fn monitor_busy_error(busy_hwnd: isize, elapsed_ms: u64, hwnd: isize, wait: Duration, what: &str) -> String {
+    if busy_hwnd != 0 && busy_hwnd == hwnd {
+        format!(
+            "{what} got no answer within {}ms (hwnd {hwnd}); its UIA provider looks wedged -- \
+             the window is on a {}ms cooldown and dumps for it fall back to a placeholder tree; \
+             use the screenshot and coordinate actions meanwhile",
+            wait.as_millis(),
+            wedge_cooldown_ms()
+        )
+    } else if busy_hwnd == 0 {
+        format!(
+            "accessibility monitor busy: a global accessibility job has been running for \
+             {elapsed_ms}ms; {what} was dropped without queueing"
+        )
+    } else {
+        format!(
+            "accessibility monitor busy: window {busy_hwnd}'s accessibility job has been running \
+             for {elapsed_ms}ms; {what} was dropped without queueing"
+        )
+    }
+}
+
+/// Fail fast when the monitor is already stuck (or slow beyond this caller's whole
+/// budget): queueing would only burn the wait and then time out anyway.
+fn precheck_monitor_busy(hwnd: isize, wait: Duration, what: &str) -> Result<(), String> {
+    let Some((busy_hwnd, started)) = MONITOR_CURRENT.lock().ok().and_then(|slot| *slot) else {
+        return Ok(());
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if elapsed_ms < wait.as_millis() as u64 {
+        // The in-flight job may still finish inside this caller's budget.
+        return Ok(());
+    }
+    if elapsed_ms >= wedge_stuck_ms() {
+        mark_wedged(busy_hwnd);
+    }
+    Err(monitor_busy_error(busy_hwnd, elapsed_ms, hwnd, wait, what))
+}
+
+/// The verdict after a full wait: same attribution as [`precheck_monitor_busy`],
+/// but the in-flight job had the whole wait to finish and did not.
+fn timeout_verdict(hwnd: isize, wait: Duration, what: &str) -> String {
+    let Some((busy_hwnd, started)) = MONITOR_CURRENT.lock().ok().and_then(|slot| *slot) else {
+        return format!("{what} did not answer within {}ms", wait.as_millis());
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if elapsed_ms >= wait.as_millis() as u64 {
+        if elapsed_ms >= wedge_stuck_ms() {
+            mark_wedged(busy_hwnd);
+        }
+        return monitor_busy_error(busy_hwnd, elapsed_ms, hwnd, wait, what);
+    }
+    format!("{what} did not answer within {}ms", wait.as_millis())
+}
+
+/// One bounded wait for a monitor reply, shared by every client entry point.
+///
+/// `hwnd` is the window the job targets (0 for global jobs). `what` names the
+/// operation in the model-visible error.
+fn wait_reply<T>(rx: Receiver<UiaResult<T>>, hwnd: isize, cap_ms: u64, what: &str) -> UiaResult<T> {
+    let wait = reply_wait(cap_ms)?;
+    precheck_monitor_busy(hwnd, wait, what)?;
+    match rx.recv_timeout(wait) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Disconnected) => Err(MONITOR_DID_NOT_START.to_string()),
+        Err(RecvTimeoutError::Timeout) => Err(timeout_verdict(hwnd, wait, what)),
+    }
+}
+
 enum Job {
     Dump {
         hwnd: isize,
@@ -764,6 +1017,12 @@ enum Job {
         action: String,
         resp: Sender<UiaResult<()>>,
     },
+    SelectText {
+        hwnd: isize,
+        index: i32,
+        text: String,
+        resp: Sender<UiaResult<()>>,
+    },
     Scroll {
         hwnd: isize,
         index: i32,
@@ -779,8 +1038,61 @@ enum Job {
         index: i32,
         resp: Sender<UiaResult<Vec<String>>>,
     },
+    /// An observed element's current readable text (TextPattern), else its
+    /// ValuePattern value; `None` when it publishes neither. The read-back side
+    /// of a write (`value_at`).
+    ValueAt {
+        hwnd: isize,
+        index: i32,
+        resp: Sender<UiaResult<Option<String>>>,
+    },
+    /// Resolve a previously observed element index to its UIA runtime id.
+    ///
+    /// Needed by callers that re-observe between steps (`fill_form`): the walk
+    /// renumbers every node, so an index handed in against the *previous*
+    /// snapshot no longer names the same control. The runtime id is stable
+    /// across renumbering, which makes it the only safe handle to carry over.
+    RuntimeId {
+        index: i32,
+        resp: Sender<UiaResult<Vec<i32>>>,
+    },
+    /// Find the current index of the element carrying `runtime_id`.
+    IndexOf {
+        runtime_id: Vec<i32>,
+        resp: Sender<UiaResult<Option<i32>>>,
+    },
     Diagnostics {
         resp: Sender<serde_json::Value>,
+    },
+    FocusedValue {
+        resp: Sender<UiaResult<Option<String>>>,
+    },
+    /// The focused element's own text, if it exposes any.
+    FocusedText {
+        resp: Sender<UiaResult<Option<String>>>,
+    },
+    /// The focused element's text range (TextPattern) for `window_hwnd`.
+    FocusedTextRange {
+        window_hwnd: isize,
+        resp: Sender<UiaResult<Option<String>>>,
+    },
+    /// Whether the focused element covers (nearly) all of `window_hwnd`.
+    FocusedContainer {
+        window_hwnd: isize,
+        resp: Sender<UiaResult<bool>>,
+    },
+    /// Whether the foreground focused control accepts typed text.
+    FocusedEditability {
+        resp: Sender<UiaResult<Option<bool>>>,
+    },
+    /// The HWND that owns keyboard focus.
+    FocusedWindowId {
+        resp: Sender<UiaResult<Option<isize>>>,
+    },
+    WindowContains {
+        hwnd: isize,
+        needle: String,
+        resp: Sender<UiaResult<bool>>,
     },
 }
 
@@ -790,6 +1102,57 @@ pub struct UiaClient {
 
 static CLIENT: OnceLock<UiaClient> = OnceLock::new();
 
+// Audit P1-2 root fix (2026-10-25): a wedged COM call cannot be cancelled and
+// the thread it runs on cannot be safely destroyed, so the only way past a
+// permanently stuck provider is to ABANDON that thread and start a fresh
+// monitor on the shared receiver. `MONITOR_RX` is the shared queue (the lock
+// is held only while receiving, never while a job executes), `MONITOR_GEN` is
+// the current monitor generation, and `MONITOR_SERVED_BY` records which
+// generation owns the job in MONITOR_CURRENT — a superseded thread checks the
+// generation and exits instead of competing for jobs or clearing the new
+// monitor's bookkeeping.
+static MONITOR_RX: OnceLock<Mutex<Receiver<Job>>> = OnceLock::new();
+static MONITOR_GEN: AtomicU64 = AtomicU64::new(1);
+static MONITOR_SERVED_BY: AtomicU64 = AtomicU64::new(0);
+
+fn spawn_monitor() -> u64 {
+    let gen = MONITOR_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let _ = thread::Builder::new()
+        .name(format!("computer-use-uia-monitor-{gen}"))
+        .spawn(move || monitor_loop(gen));
+    gen
+}
+
+/// Watchdog for the monitor thread: a job stuck past `wedge_stuck_ms` is never
+/// coming back on its own, so start a replacement monitor. The replacement
+/// only spawns once per stuck job (`MONITOR_SERVED_BY` still names the latest
+/// generation); the abandoned thread exits after its late COM call returns.
+/// Cost of a rebuild: a fresh `Engine` means the element cache is lost, so
+/// indexed actions fail with the usual runtime-id mismatch until the caller
+/// re-observes — the documented, survivable degradation.
+fn monitor_watchdog() {
+    thread::Builder::new()
+        .name("computer-use-uia-watchdog".into())
+        .spawn(|| loop {
+            thread::sleep(Duration::from_millis(1_000));
+            if MONITOR_RX.get().is_none() {
+                continue; // unit tests drive the wedge helpers without a client
+            }
+            let Some((busy_hwnd, started)) = MONITOR_CURRENT.lock().ok().and_then(|slot| *slot) else {
+                continue;
+            };
+            if busy_hwnd == 0 || started.elapsed() < Duration::from_millis(wedge_stuck_ms()) {
+                continue;
+            }
+            if MONITOR_SERVED_BY.load(Ordering::SeqCst) != MONITOR_GEN.load(Ordering::SeqCst) {
+                continue; // a replacement monitor is already running
+            }
+            mark_wedged(busy_hwnd);
+            spawn_monitor();
+        })
+        .ok();
+}
+
 pub fn global() -> &'static UiaClient {
     CLIENT.get_or_init(UiaClient::new)
 }
@@ -797,40 +1160,36 @@ pub fn global() -> &'static UiaClient {
 impl UiaClient {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        thread::Builder::new()
-            .name("computer-use-uia-monitor".into())
-            .spawn(move || monitor_loop(rx))
-            .expect("spawn UIA monitor");
+        let _ = MONITOR_RX.set(Mutex::new(rx));
+        spawn_monitor();
+        monitor_watchdog();
         Self { tx }
     }
 
     pub fn dump(&self, hwnd: isize, title: &str, origin: (f64, f64), scale: f64) -> UiaResult<AccessibilityDump> {
         if let Some(msg) = integrity_blocked(hwnd) {
-            let bounds = window_logical_bounds(hwnd, origin, scale);
-            let node = UiNode {
-                index: 0,
-                role: "window".into(),
-                name: msg,
-                bounds,
-                value: String::new(),
-                depth: 0,
-                actions: Vec::new(),
-                automation_id: String::new(),
-                description: String::new(),
-                states: Vec::new(),
-                focused: true,
-                runtime_id: Vec::new(),
-                truncated: None,
-            };
-            let focused = focused_line(&node);
-            return Ok(AccessibilityDump {
-                focused,
-                nodes: vec![node],
-                ..AccessibilityDump::default()
-            });
+            return Ok(single_node_dump(hwnd, title, origin, scale, msg));
         }
         if hwnd == 0 {
             return Ok(fallback_dump(hwnd, title, origin, scale));
+        }
+        // AX-WEDGE: a window whose UIA provider wedged recently serves the
+        // placeholder tree immediately instead of queueing behind the stuck call
+        // that proved the wedge. The cooldown ends early when the stuck call
+        // finally completes (the monitor clears the entry), or expires so the
+        // provider is probed again.
+        if wedged_until(hwnd).is_some_and(|until| until > Instant::now()) {
+            return Ok(single_node_dump(
+                hwnd,
+                title,
+                origin,
+                scale,
+                format!(
+                    "accessibility is temporarily unavailable for this window ({}ms cooldown after a \
+                     wedged UIA dump); use the screenshot and coordinate actions",
+                    wedge_cooldown_ms()
+                ),
+            ));
         }
         wait_window_opened_ready()?;
         let (resp_tx, resp_rx) = mpsc::channel();
@@ -843,7 +1202,7 @@ impl UiaClient {
                 resp: resp_tx,
             })
             .map_err(|_| MONITOR_DID_NOT_START.to_string())?;
-        resp_rx.recv().map_err(|_| "wait for accessibility dump timeout".to_string())?
+        wait_reply(resp_rx, hwnd, DUMP_WAIT_CAP_MS, "accessibility dump")
     }
 
     pub fn set_value(&self, hwnd: isize, index: i32, value: &str) -> UiaResult<()> {
@@ -857,7 +1216,162 @@ impl UiaClient {
                 resp: resp_tx,
             })
             .map_err(|_| "send set value request to accessibility monitor".to_string())?;
-        resp_rx.recv().map_err(|_| "wait for accessibility set value".to_string())?
+        wait_reply(resp_rx, hwnd, MUTATE_WAIT_CAP_MS, "accessibility set value")
+    }
+
+    pub fn focused_value(&self) -> UiaResult<Option<String>> {
+        wait_window_opened_ready()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::FocusedValue { resp: resp_tx })
+            .map_err(|_| "send focused value request to accessibility monitor".to_string())?;
+        wait_reply(resp_rx, 0, READ_WAIT_CAP_MS, "accessibility focused value")
+    }
+
+    /// Best-effort focused-control value: `None` when there is no focused element or
+    /// it exposes no readable value (so callers can distinguish "unchanged" from
+    /// "cannot verify").
+    pub fn focused_value_opt(&self) -> Option<String> {
+        self.focused_value().ok().flatten()
+    }
+
+    /// The focused element's own text, without walking the whole tree.
+    ///
+    /// The landing check runs on every `type_text`, and a full window dump of an
+    /// Electron/browser window is expensive (hundreds of nodes, a cache rebuild
+    /// each time). The focused element is the one that received the paste, so its
+    /// own `value`/`name` is the cheapest possible witness.
+    /// `None` means the focused element exposes no text at all — the contenteditable
+    /// case, where only the renderer's DOM knows the answer.
+    pub fn focused_text(&self) -> Option<String> {
+        wait_window_opened_ready().ok()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx.send(Job::FocusedText { resp: resp_tx }).ok()?;
+        wait_reply(resp_rx, 0, READ_WAIT_CAP_MS, "accessibility focused text").ok()?
+    }
+
+    /// The focused element's text range (TextPattern), if it is a usable witness.
+    ///
+    /// Returns `None` when the focused element covers (nearly) the whole window —
+    /// a browser's `RootWebArea` / a window-level document container. Its range is
+    /// the *entire page*, which would "confirm" any string that merely appears
+    /// somewhere in the UI. That is not a hypothetical: a chat app renders the
+    /// tool call itself (`type_text · <the text>`) into the transcript, so a
+    /// page-wide search for the typed text always succeeds — the 2026-10-22 false
+    /// positive that made a paste into nowhere report success.
+    pub fn focused_text_range_text(&self, window_hwnd: isize) -> Option<String> {
+        wait_window_opened_ready().ok()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::FocusedTextRange {
+                window_hwnd,
+                resp: resp_tx,
+            })
+            .ok()?;
+        wait_reply(
+            resp_rx,
+            window_hwnd,
+            READ_WAIT_CAP_MS,
+            "accessibility focused text range",
+        )
+        .ok()?
+    }
+
+    /// Whether the focused element is a whole-window container (a page/document
+    /// root). Such an element cannot witness a paste: its text range is the whole
+    /// surface, and it is a container rather than a text target.
+    pub fn focused_is_window_container(&self, window_hwnd: isize) -> Option<bool> {
+        wait_window_opened_ready().ok()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::FocusedContainer {
+                window_hwnd,
+                resp: resp_tx,
+            })
+            .ok()?;
+        wait_reply(
+            resp_rx,
+            window_hwnd,
+            READ_WAIT_CAP_MS,
+            "accessibility focused container check",
+        )
+        .ok()
+    }
+
+    /// Whether the focused control accepts typed text.
+    ///
+    /// `Some(true)`  -- the focused element is a text surface (an Edit/Document
+    ///                 control type, or it exposes a writable ValuePattern). A paste
+    ///                 sent there had somewhere to land.
+    /// `Some(false)` -- there is a focused element and it provably cannot take
+    ///                 text (a button, a list).
+    /// `None`        -- no focused element, or the monitor could not answer.
+    ///
+    /// This exists because some text surfaces never publish their content to UIA
+    /// (Chromium `contenteditable`, ProseMirror, canvas editors), so "the text is
+    /// not readable" is *not* evidence that a paste failed. Callers use this to
+    /// tell "absent" from "unverifiable" instead of reporting a false failure.
+    pub fn focused_is_editable(&self) -> Option<bool> {
+        wait_window_opened_ready().ok()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx.send(Job::FocusedEditability { resp: resp_tx }).ok()?;
+        wait_reply(
+            resp_rx,
+            0,
+            READ_WAIT_CAP_MS,
+            "accessibility focused editability",
+        )
+        .ok()?
+    }
+
+    /// The window id (HWND) that currently owns keyboard focus, if it can be read.
+    pub fn focused_window_id(&self) -> Option<isize> {
+        wait_window_opened_ready().ok()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx.send(Job::FocusedWindowId { resp: resp_tx }).ok()?;
+        wait_reply(resp_rx, 0, READ_WAIT_CAP_MS, "accessibility focused window id").ok()?
+    }
+
+    /// One dump answering both landing questions: does any node contain `needle`,
+    /// and does the window publish any readable text at all.
+    ///
+    /// This is the *fallback* path: it walks the whole tree, which is expensive for
+    /// a browser window. The landing check only reaches it when the focused element
+    /// could not answer on its own.
+    /// `None` means the dump could not be taken.
+    pub fn window_landing_probe(&self, hwnd: isize, needle: &str) -> Option<(bool, bool)> {
+        let dump = self.dump(hwnd, "", (0.0, 0.0), 1.0).ok()?;
+        let mut contains = false;
+        let mut publishes = false;
+        for node in &dump.nodes {
+            if !contains && (node.value.contains(needle) || node.name.contains(needle)) {
+                contains = true;
+            }
+            if !publishes && (!node.value.trim().is_empty() || !node.name.trim().is_empty()) {
+                publishes = true;
+            }
+            if contains && publishes {
+                break;
+            }
+        }
+        Some((contains, publishes))
+    }
+
+    /// Target-scoped landing check: dump the target window and report whether
+    /// `needle` appears in any node's value or name. Works even when the window is
+    /// not foreground, so it can confirm a paste landed (or detect it did not)
+    /// regardless of where keyboard focus is.
+    pub fn window_contains(&self, hwnd: isize, needle: &str) -> UiaResult<bool> {
+        wait_window_opened_ready()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::WindowContains {
+                hwnd,
+                needle: needle.to_string(),
+                resp: resp_tx,
+            })
+            .map_err(|_| "send window contains request to accessibility monitor".to_string())?;
+        wait_reply(resp_rx, hwnd, MUTATE_WAIT_CAP_MS, "accessibility window contains")
     }
 
     pub fn secondary(&self, hwnd: isize, index: i32, action: &str) -> UiaResult<()> {
@@ -871,7 +1385,21 @@ impl UiaClient {
                 resp: resp_tx,
             })
             .map_err(|_| "send secondary action request to accessibility monitor".to_string())?;
-        resp_rx.recv().map_err(|_| "wait for accessibility secondary action".to_string())?
+        wait_reply(resp_rx, hwnd, MUTATE_WAIT_CAP_MS, "accessibility secondary action")
+    }
+
+    pub fn select_text(&self, hwnd: isize, index: i32, text: &str) -> UiaResult<()> {
+        wait_window_opened_ready()?;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::SelectText {
+                hwnd,
+                index,
+                text: text.to_string(),
+                resp: resp_tx,
+            })
+            .map_err(|_| "send select text request to accessibility monitor".to_string())?;
+        wait_reply(resp_rx, hwnd, MUTATE_WAIT_CAP_MS, "accessibility select text")
     }
 
     pub fn scroll(&self, hwnd: isize, index: i32, direction: &str, pages: i32) -> UiaResult<()> {
@@ -886,7 +1414,7 @@ impl UiaClient {
                 resp: resp_tx,
             })
             .map_err(|_| "send element target request to accessibility monitor".to_string())?;
-        resp_rx.recv().map_err(|_| "wait for accessibility element target".to_string())?
+        wait_reply(resp_rx, hwnd, MUTATE_WAIT_CAP_MS, "accessibility scroll")
     }
 
     pub fn cached_bounds(&self, index: i32) -> UiaResult<Bounds> {
@@ -894,7 +1422,12 @@ impl UiaClient {
         self.tx
             .send(Job::CachedBounds { index, resp: resp_tx })
             .map_err(|_| format!("element {index} {NO_CACHED_BOUNDS}"))?;
-        resp_rx.recv().map_err(|_| format!("element {index} {NO_CACHED_BOUNDS}"))?
+        wait_reply(
+            resp_rx,
+            0,
+            READ_WAIT_CAP_MS,
+            "accessibility cached bounds lookup",
+        )
     }
 
     pub fn cached_actions(&self, index: i32) -> UiaResult<Vec<String>> {
@@ -902,7 +1435,60 @@ impl UiaClient {
         self.tx
             .send(Job::CachedActions { index, resp: resp_tx })
             .map_err(|_| format!("element {index} {NO_CACHED_SECONDARY}"))?;
-        resp_rx.recv().map_err(|_| format!("element {index} {NO_CACHED_SECONDARY}"))?
+        wait_reply(
+            resp_rx,
+            0,
+            READ_WAIT_CAP_MS,
+            "accessibility cached actions lookup",
+        )
+    }
+
+    /// What an observed element currently shows, for a read-back after a write:
+    /// its rendered text when it has a TextPattern, else its ValuePattern value.
+    /// `None` when it publishes neither (an unverifiable control), so callers can
+    /// tell "cannot verify" from "did not take".
+    ///
+    /// Used by `fill_form`'s `set` step: a `set` that reports success while the
+    /// field kept its old text is the 2026-10-22 React false success (the TapTap
+    /// login form got the verification code written into the phone box, both
+    /// steps `ok`). Verifying each write turns that into a named failed step.
+    pub fn value_at(&self, hwnd: isize, index: i32) -> Option<String> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx.send(Job::ValueAt { hwnd, index, resp: resp_tx }).ok()?;
+        wait_reply(resp_rx, hwnd, READ_WAIT_CAP_MS, "accessibility value read-back").ok()?
+    }
+
+    /// The UIA runtime id of a node observed by the latest walk.
+    ///
+    /// Callers that re-observe mid-operation (`fill_form` re-establishes its
+    /// element cache before running the steps) must carry runtime ids, not
+    /// indices: every walk renumbers the tree from zero, so an index that named
+    /// the verification-code box before a refresh can name the phone-number box
+    /// after it — which is exactly how a login form gets mangled.
+    pub fn runtime_id(&self, index: i32) -> UiaResult<Vec<i32>> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::RuntimeId { index, resp: resp_tx })
+            .map_err(|_| format!("element {index} {RUNTIME_ID_MISMATCH}"))?;
+        wait_reply(
+            resp_rx,
+            0,
+            READ_WAIT_CAP_MS,
+            "accessibility runtime id lookup",
+        )
+    }
+
+    /// The index that currently names `runtime_id`, or `None` when the control
+    /// left the tree (the page re-rendered it away).
+    pub fn index_of(&self, runtime_id: &[i32]) -> UiaResult<Option<i32>> {
+        let (resp_tx, resp_rx) = mpsc::channel();
+        self.tx
+            .send(Job::IndexOf {
+                runtime_id: runtime_id.to_vec(),
+                resp: resp_tx,
+            })
+            .map_err(|_| "uia engine is not running".to_string())?;
+        wait_reply(resp_rx, 0, READ_WAIT_CAP_MS, "accessibility index lookup")
     }
 
     pub fn diagnostics(&self) -> serde_json::Value {
@@ -910,7 +1496,13 @@ impl UiaClient {
         if wait_window_opened_ready().is_err() || self.tx.send(Job::Diagnostics { resp: resp_tx }).is_err() {
             return diagnostics_payload(None);
         }
-        resp_rx.recv().unwrap_or_else(|_| diagnostics_payload(None))
+        // Health must answer even when the monitor is wedged, so this entry
+        // degrades to the empty payload instead of propagating the timeout.
+        let wait = reply_wait(READ_WAIT_CAP_MS).unwrap_or(Duration::from_millis(1));
+        match resp_rx.recv_timeout(wait) {
+            Ok(payload) => payload,
+            Err(_) => diagnostics_payload(None),
+        }
     }
 }
 
@@ -1019,12 +1611,42 @@ impl Engine {
     }
 }
 
-fn monitor_loop(rx: Receiver<Job>) {
+/// The window a job targets, for the AX-WEDGE current-job slot. `0` for jobs that
+/// carry no window (focused-element reads, cached lookups, diagnostics) -- a
+/// timeout on those can be attributed to the monitor being busy, never to a
+/// specific window's provider.
+fn job_hwnd(job: &Job) -> isize {
+    match job {
+        Job::Dump { hwnd, .. }
+        | Job::SetValue { hwnd, .. }
+        | Job::Secondary { hwnd, .. }
+        | Job::SelectText { hwnd, .. }
+        | Job::Scroll { hwnd, .. }
+        | Job::ValueAt { hwnd, .. }
+        | Job::WindowContains { hwnd, .. } => *hwnd,
+        Job::FocusedTextRange { window_hwnd, .. }
+        | Job::FocusedContainer { window_hwnd, .. } => *window_hwnd,
+        Job::CachedBounds { .. }
+        | Job::CachedActions { .. }
+        | Job::RuntimeId { .. }
+        | Job::IndexOf { .. }
+        | Job::Diagnostics { .. }
+        | Job::FocusedValue { .. }
+        | Job::FocusedText { .. }
+        | Job::FocusedEditability { .. }
+        | Job::FocusedWindowId { .. } => 0,
+    }
+}
+
+fn monitor_loop(gen: u64) {
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if hr.is_err() && hr != RPC_E_CHANGED_MODE {
         mark_monitor_setup(Err(INIT_COM_UIA.to_string()));
-        for job in rx {
-            fail_job(job, INIT_COM_UIA);
+        while MONITOR_GEN.load(Ordering::SeqCst) == gen {
+            match MONITOR_RX.get().and_then(|rx| rx.lock().ok()).map(|rx| rx.recv()) {
+                Some(Ok(job)) => fail_job(job, INIT_COM_UIA),
+                _ => break,
+            }
         }
         return;
     }
@@ -1045,8 +1667,34 @@ fn monitor_loop(rx: Receiver<Job>) {
         }
     };
     loop {
-        match rx.recv_timeout(Duration::from_millis(40)) {
-            Ok(job) => match job {
+        // A superseded monitor (the watchdog rebuilt around a stuck COM call on
+        // this thread) must not pick up more jobs or touch the new monitor's
+        // bookkeeping; it exits after its late call returns.
+        if MONITOR_GEN.load(Ordering::SeqCst) != gen {
+            break;
+        }
+        // The receiver lock is held ONLY while receiving. Holding it during a
+        // job would stop a replacement monitor from ever serving anything.
+        let msg = MONITOR_RX
+            .get()
+            .and_then(|rx| rx.lock().ok())
+            .map(|rx| rx.recv_timeout(Duration::from_millis(40)));
+        match msg {
+            Some(Ok(job)) => {
+                // AX-WEDGE: publish what the monitor is working on so a client that
+                // times out can attribute the stall, and clear the window's wedge
+                // entry when the job finishes (a stuck provider that eventually
+                // answers recovers immediately instead of serving the placeholder
+                // for the rest of its cooldown).
+                let job_hwnd = job_hwnd(&job);
+                if let Ok(mut slot) = MONITOR_CURRENT.lock() {
+                    *slot = Some((job_hwnd, Instant::now()));
+                }
+                MONITOR_SERVED_BY.store(gen, Ordering::SeqCst);
+                // Audit P1-2 (2026-10-25): a panicking COM call must not kill the
+                // monitor thread — its death would leave MONITOR_CURRENT set and
+                // every later UIA request busy forever. Catch the unwind per job.
+                let job_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job {
             Job::Dump {
                 hwnd,
                 title,
@@ -1096,9 +1744,26 @@ fn monitor_loop(rx: Receiver<Job>) {
             } => {
                 let result = match engine.as_mut() {
                     Some(eng) => {
-                        eng.apply_invalidate();
+                        // Do not invalidate before a UIA-pattern action: a focus event
+                        // emitted by window activation would clear the element cache
+                        // and turn a valid indexed action into "no cached app state".
+                        // cached_element still validates the runtime id and pid.
                         unsafe { eng.secondary(hwnd, index, &action) }
                     }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::SelectText {
+                hwnd,
+                index,
+                text,
+                resp,
+            } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => unsafe { eng.select_text(hwnd, index, &text) },
                     None => Err(setup_err
                         .clone()
                         .unwrap_or_else(|| CREATE_UIA.to_string())),
@@ -1137,14 +1802,146 @@ fn monitor_loop(rx: Receiver<Job>) {
                     .ok_or_else(|| format!("element {index} {NO_CACHED_SECONDARY}"));
                 let _ = resp.send(result);
             }
+            Job::ValueAt { hwnd, index, resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => unsafe { eng.value_at(hwnd, index) },
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::RuntimeId { index, resp } => {
+                let result = engine
+                    .as_ref()
+                    .and_then(|eng| eng.runtime_ids.get(&index).cloned())
+                    .ok_or_else(|| format!("element {index} {RUNTIME_ID_MISMATCH}"));
+                let _ = resp.send(result);
+            }
+            Job::IndexOf { runtime_id, resp } => {
+                let result = match engine.as_ref() {
+                    Some(eng) => Ok(eng
+                        .runtime_ids
+                        .iter()
+                        .find(|(_, id)| **id == runtime_id)
+                        .map(|(index, _)| *index)),
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
             Job::Diagnostics { resp } => {
                 if let Some(eng) = engine.as_mut() {
                     eng.apply_invalidate();
                 }
                 let _ = resp.send(diagnostics_payload(engine.as_ref()));
             }
-            },
-            Err(RecvTimeoutError::Timeout) => {
+            Job::FocusedValue { resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.focused_value() })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::FocusedText { resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.focused_text() })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::FocusedTextRange { window_hwnd, resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.focused_text_range_text(window_hwnd) })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::FocusedContainer { window_hwnd, resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.focused_is_window_container(window_hwnd) })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::FocusedEditability { resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.focused_is_editable() })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::FocusedWindowId { resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.focused_window_id() })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+            Job::WindowContains { hwnd, needle, resp } => {
+                let result = match engine.as_mut() {
+                    Some(eng) => {
+                        eng.apply_invalidate();
+                        Ok(unsafe { eng.window_contains(hwnd, &needle) })
+                    }
+                    None => Err(setup_err
+                        .clone()
+                        .unwrap_or_else(|| CREATE_UIA.to_string())),
+                };
+                let _ = resp.send(result);
+            }
+                }));
+                let superseded = MONITOR_GEN.load(Ordering::SeqCst) != gen;
+                if job_result.is_err() {
+                    // The in-flight caller times out on its own request budget;
+                    // put the panicking window on the wedge cooldown so dumps for
+                    // it degrade to the placeholder tree instead of queueing.
+                    if let Ok(mut slot) = MONITOR_CURRENT.lock() {
+                        *slot = None;
+                    }
+                    mark_wedged(job_hwnd);
+                } else if !superseded {
+                    // Only the owning generation may clear the current-job slot:
+                    // a superseded thread finishing a very late job must not
+                    // wipe the replacement monitor's in-flight bookkeeping.
+                    if let Ok(mut slot) = MONITOR_CURRENT.lock() {
+                        *slot = None;
+                    }
+                    clear_wedged(job_hwnd);
+                }
+            }
+            Some(Err(RecvTimeoutError::Timeout)) => {
                 let mut msg = MSG::default();
                 unsafe {
                     while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -1153,7 +1950,7 @@ fn monitor_loop(rx: Receiver<Job>) {
                     }
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => break,
+            Some(Err(RecvTimeoutError::Disconnected)) | None => break,
         }
     }
     unsafe { CoUninitialize() };
@@ -1168,7 +1965,10 @@ fn fail_job(job: Job, err: &str) {
                 let _ = resp.send(Ok(fallback_dump(hwnd, &title, origin, scale)));
             }
         }
-        Job::SetValue { resp, .. } | Job::Secondary { resp, .. } | Job::Scroll { resp, .. } => {
+        Job::SetValue { resp, .. }
+        | Job::Secondary { resp, .. }
+        | Job::SelectText { resp, .. }
+        | Job::Scroll { resp, .. } => {
             let _ = resp.send(Err(err.to_string()));
         }
         Job::CachedBounds { resp, index } => {
@@ -1177,10 +1977,40 @@ fn fail_job(job: Job, err: &str) {
         Job::CachedActions { resp, index } => {
             let _ = resp.send(Err(format!("element {index} {NO_CACHED_SECONDARY}")));
         }
+        Job::ValueAt { resp, .. } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
+        Job::RuntimeId { resp, index } => {
+            let _ = resp.send(Err(format!("element {index} {RUNTIME_ID_MISMATCH}")));
+        }
+        Job::IndexOf { resp, .. } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
         Job::Diagnostics { resp } => {
             let mut payload = diagnostics_payload(None);
             payload["error"] = serde_json::json!(err);
             let _ = resp.send(payload);
+        }
+        Job::FocusedValue { resp } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
+        Job::FocusedText { resp } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
+        Job::FocusedTextRange { resp, .. } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
+        Job::FocusedContainer { resp, .. } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
+        Job::FocusedEditability { resp } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
+        Job::FocusedWindowId { resp } => {
+            let _ = resp.send(Err(err.to_string()));
+        }
+        Job::WindowContains { resp, .. } => {
+            let _ = resp.send(Err(err.to_string()));
         }
     }
 }
@@ -1656,6 +2486,180 @@ impl Engine {
         Err(format!("{NO_CACHED_APP_STATE}{}", self.process_name))
     }
 
+    /// Dump the target window and report whether `needle` appears in any node's
+    /// value or name. Target-scoped: works even when the window is not foreground,
+    /// so it can confirm a paste landed (or detect it did not) regardless of where
+    /// keyboard focus is. Coordinate origin/scale are irrelevant to a text search,
+    /// so dummy values are used.
+    unsafe fn window_contains(&mut self, hwnd: isize, needle: &str) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        match self.dump(hwnd, "", (0.0, 0.0), 1.0) {
+            Ok(dump) => dump
+                .nodes
+                .iter()
+                .any(|n| n.value.contains(needle) || n.name.contains(needle)),
+            Err(_) => false,
+        }
+    }
+
+    /// Read the live value of the currently focused control, but only when it
+    /// exposes a readable ValuePattern. `None` means "no focused control" or
+    /// "focused control has no readable value" — callers must not treat that as
+    /// "unchanged".
+    unsafe fn focused_value(&mut self) -> Option<String> {
+        let el = self
+            .automation
+            .GetFocusedElementBuildCache(&self.dump_cache)
+            .ok()
+            .or_else(|| self.automation.GetFocusedElement().ok())?;
+        pattern::<IUIAutomationValuePattern>(&el, UIA_ValuePatternId)?;
+        Some(value_of(&el))
+    }
+
+    /// The focused element's own text, without walking the window tree.
+    ///
+    /// `None` when the element exposes no text at all (a Chromium `contenteditable`
+    /// publishes its content only in the renderer's DOM, not in UIA).
+    unsafe fn focused_text(&mut self) -> Option<String> {
+        let el = self
+            .automation
+            .GetFocusedElementBuildCache(&self.dump_cache)
+            .ok()
+            .or_else(|| self.automation.GetFocusedElement().ok())?;
+        // Value first (edit boxes), then Name (a button's label, a Document's title).
+        let value = value_of(&el);
+        if !value.is_empty() {
+            return Some(value);
+        }
+        let name = el
+            .CachedName()
+            .ok()
+            .or_else(|| el.CurrentName().ok())
+            .map(bstr_to_string)
+            .unwrap_or_default();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
+    /// The focused element's text range (TextPattern), if it is a usable witness.
+    ///
+    /// `None` when the element covers (nearly) the whole window: a browser's
+    /// `RootWebArea` or another window-level document container. Its range is the
+    /// entire page, so it would "confirm" any string that merely appears somewhere
+    /// in the UI — including the agent's own tool-call echo in a chat transcript.
+    unsafe fn focused_text_range_text(&mut self, window_hwnd: isize) -> Option<String> {
+        let el = self
+            .automation
+            .GetFocusedElementBuildCache(&self.dump_cache)
+            .ok()
+            .or_else(|| self.automation.GetFocusedElement().ok())?;
+        if is_window_container(&el, window_hwnd) {
+            return None;
+        }
+        let pat = pattern::<IUIAutomationTextPattern>(&el, UIA_TextPatternId)?;
+        let range = pat.DocumentRange().ok()?;
+        let text = range.GetText(-1).ok()?;
+        let value = bstr_to_string(text);
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    /// Whether the focused element covers (nearly) all of `window_hwnd`.
+    unsafe fn focused_is_window_container(&mut self, window_hwnd: isize) -> bool {
+        match self
+            .automation
+            .GetFocusedElementBuildCache(&self.dump_cache)
+            .ok()
+            .or_else(|| self.automation.GetFocusedElement().ok())
+        {
+            Some(el) => is_window_container(&el, window_hwnd),
+            None => false,
+        }
+    }
+
+    /// Whether the focused control accepts typed text. See
+    /// [`UiaClient::focused_is_editable`] for the three-state contract.    ///
+    /// The judgement is deliberately pattern/type based rather than
+    /// class-name based, so it covers native edits, WinUI boxes, and browser
+    /// text surfaces without a per-app allow list:
+    ///   * a writable ValuePattern  -> editable (a plain edit box);
+    ///   * an Edit control type      -> editable (password fields and providers
+    ///                                  that omit ValuePattern);
+    ///   * a Document control type   -> editable unless its TextPattern reports
+    ///                                  read-only (Chromium `contenteditable`,
+    ///                                  Word, ProseMirror all surface as Document);
+    ///   * anything else             -> not editable.
+    unsafe fn focused_is_editable(&mut self) -> Option<bool> {
+        let el = self
+            .automation
+            .GetFocusedElementBuildCache(&self.dump_cache)
+            .ok()
+            .or_else(|| self.automation.GetFocusedElement().ok())?;
+        // A writable value pattern is the strongest positive signal.
+        if let Some(pat) = pattern::<IUIAutomationValuePattern>(&el, UIA_ValuePatternId) {
+            let readonly = pat
+                .CachedIsReadOnly()
+                .ok()
+                .or_else(|| pat.CurrentIsReadOnly().ok())
+                .map(|b| b.as_bool())
+                .unwrap_or(false);
+            if !readonly {
+                return Some(true);
+            }
+        }
+        let ctype = control_type_id(&el);
+        // UIA_EditControlTypeId = 50004.
+        if ctype == 50004 {
+            return Some(true);
+        }
+        if ctype == UIA_DOCUMENT_CONTROL_TYPE {
+            // A Document is the text surface of a browser or an editor
+            // (Chromium `contenteditable`, ProseMirror, Word all surface this way).
+            // `IUIAutomationTextRange` exposes no IsReadOnly, and the read-only
+            // Document case is a viewer whose paste simply does not change the
+            // text — the landing check stays honest because the *dump* then still
+            // publishes text, so a genuine miss is still reported as Absent.
+            // Treating the surface as text-accepting here is what keeps a
+            // contenteditable paste from being reported as a failure.
+            return Some(true);
+        }
+        Some(false)
+    }
+
+    /// The HWND that owns keyboard focus. Read from the focused element's native
+    /// window handle, walking to its top-level ancestor so a focused child control
+    /// reports the window a paste was addressed to.
+    unsafe fn focused_window_id(&mut self) -> Option<isize> {
+        let el = self
+            .automation
+            .GetFocusedElementBuildCache(&self.dump_cache)
+            .ok()
+            .or_else(|| self.automation.GetFocusedElement().ok())?;
+        let hwnd = el
+            .CachedNativeWindowHandle()
+            .ok()
+            .or_else(|| el.CurrentNativeWindowHandle().ok())
+            .map(|h| h.0 as isize)?;
+        if hwnd == 0 {
+            return None;
+        }
+        let handle = HWND(hwnd as *mut core::ffi::c_void);
+        let root = GetAncestor(handle, GA_ROOT);
+        if root.is_invalid() {
+            Some(hwnd)
+        } else {
+            Some(root.0 as isize)
+        }
+    }
+
     unsafe fn set_value(&mut self, hwnd: isize, index: i32, value: &str) -> UiaResult<()> {
         let el = self.cached_element(hwnd, index)?;
         el.SetFocus().map_err(|_| FOCUS_BEFORE_SET_VALUE.to_string())?;
@@ -1671,6 +2675,47 @@ impl Engine {
             }
             let bstr = BSTR::from(value);
             pat.SetValue(&bstr).map_err(|_| "set UIA value".to_string())?;
+            // F2 (known limitation, NOT fully closeable via UIA): some controls —
+            // notably the Win11 Notepad WinUI RichEditBox — report SetValue success
+            // and write the new value into the UIA value model while the real control
+            // is unchanged. The echo is transient but outlasts any practical delay, so
+            // BOTH CurrentValue() and a fresh window dump read back the written value
+            // and cannot detect the no-op. Closing this needs a non-UIA check or
+            // accepting set_value as unreliable on such controls (prefer type_text,
+            // and let the model's own vision verify the result). The readback below
+            // still catches providers that fail WITHOUT echoing.
+            let echoed = pat.CurrentValue().ok().map(bstr_to_string).unwrap_or_default();
+            if echoed != value {
+                // The provider did not take the write. Audit P2-4 (2026-10-25):
+                // this runs on the UIA monitor thread, and the input fallback
+                // (clipboard + SendInput + sleeps) used to run here too, queueing
+                // every other UIA request behind synthetic typing. Return the
+                // error instead; the caller (main.rs set_value Err(_) branch)
+                // performs the same select-all + paste replace on its own thread.
+                return Err(
+                    "set_value reported success but the control's value did not change"
+                        .to_string(),
+                );
+            }
+            // Second, independent witness: a *rendered text* read. A controlled
+            // input (React/Vue) or an IME can accept the write into the UIA value
+            // echo and still show the old text or a stray fragment on screen — the
+            // 2026-10-23 case where `Value: v` was reported as success. When the
+            // element publishes its text through TextPattern and that text does not
+            // carry the requested value, one replace pass is tried, then the write
+            // is reported as failed rather than silently wrong.
+            if let Some(rendered) = text_pattern_of(&el) {
+                let rendered = rendered.replace('\r', "");
+                if !rendered.contains(value) {
+                    // Audit P2-4: as above, the input replace must happen on the
+                    // caller's thread; report the miss and let the coordinate
+                    // fallback in main.rs do it.
+                    return Err(format!(
+                        "set_value did not take: the field's text reads {:?}, not the value given",
+                        clip_text(&rendered, 40)
+                    ));
+                }
+            }
             return Ok(());
         }
         if let Some(rng) = pattern::<IUIAutomationRangeValuePattern>(&el, UIA_RangeValuePatternId) {
@@ -1682,6 +2727,41 @@ impl Engine {
             return Ok(());
         }
         Err(NOT_SETTABLE.to_string())
+    }
+
+    /// What an element shows now: its rendered text (TextPattern) when it has
+    /// one, else its ValuePattern value. `None` when it publishes neither.
+    ///
+    /// The read-back side of `fill_form`'s `set` step (see `value_at` on the
+    /// handle). Never dumps the tree: it is one pattern read on a cached element.
+    unsafe fn value_at(&mut self, hwnd: isize, index: i32) -> UiaResult<Option<String>> {
+        // Resolve through cached_element (the same path set_value uses): it
+        // rebuilds the element from the walk's cache and validates its runtime
+        // id, so the read-back sees the control the write targeted even after a
+        // focus event invalidated the bare map.
+        let el = self.cached_element(hwnd, index)?;
+        if let Some(text) = text_pattern_of(&el) {
+            return Ok(Some(text));
+        }
+        let v = pattern::<IUIAutomationValuePattern>(&el, UIA_ValuePatternId)
+            .and_then(|pat| pat.CurrentValue().ok())
+            .map(bstr_to_string);
+        Ok(v)
+    }
+
+    unsafe fn select_text(&mut self, hwnd: isize, index: i32, text: &str) -> UiaResult<()> {
+        let el = self.cached_element(hwnd, index)?;
+        let pat = text_pattern(&el).ok_or_else(|| "element has no text pattern".to_string())?;
+        let range = pat
+            .DocumentRange()
+            .map_err(|_| "get UIA document range".to_string())?;
+        let found = range
+            .FindText(&BSTR::from(text), false, true)
+            .map_err(|_| format!("text not found: {text}"))?;
+        found
+            .Select()
+            .map_err(|_| "select UIA text range".to_string())?;
+        Ok(())
     }
 
     unsafe fn secondary(&mut self, hwnd: isize, index: i32, action: &str) -> UiaResult<()> {
@@ -1960,6 +3040,42 @@ fn control_type_id(el: &IUIAutomationElement) -> i32 {
     }
 }
 
+/// How much of the window an element must cover to count as a window container.
+///
+/// A page/document root covers the whole client area; a real text field covers a
+/// small share of it. 70% separates them with a wide margin either way, and the
+/// rule needs no per-app or per-framework knowledge — which is what keeps it
+/// general across browser `RootWebArea`, Word's document pane, and native
+/// window-level rich edits.
+const WINDOW_CONTAINER_COVERAGE: f64 = 0.7;
+
+/// Whether `el` covers (nearly) all of `window_hwnd`'s client area.
+///
+/// Such an element is a container, not a text target: its TextPattern range spans
+/// the entire surface, so using it to look for typed text "confirms" anything that
+/// merely appears on screen (an agent's own tool-call echo in a chat transcript,
+/// for instance). Container focus therefore cannot witness a paste either way.
+fn is_window_container(el: &IUIAutomationElement, window_hwnd: isize) -> bool {
+    unsafe {
+        let handle = HWND(window_hwnd as *mut core::ffi::c_void);
+        if handle.is_invalid() {
+            return false;
+        }
+        let mut client = RECT::default();
+        if GetClientRect(handle, &mut client).is_err() {
+            return false;
+        }
+        let window_area =
+            (client.right - client.left) as f64 * (client.bottom - client.top) as f64;
+        if window_area <= 0.0 {
+            return false;
+        }
+        let rect = element_rect(el);
+        let element_area = (rect.right - rect.left) as f64 * (rect.bottom - rect.top) as f64;
+        element_area / window_area >= WINDOW_CONTAINER_COVERAGE
+    }
+}
+
 fn element_rect(el: &IUIAutomationElement) -> RECT {
     unsafe {
         el.CachedBoundingRectangle()
@@ -1984,6 +3100,31 @@ fn value_of(el: &IUIAutomationElement) -> String {
         .map(bstr_to_string)
         .unwrap_or_default()
 }
+
+/// A value cut to `max` characters for an error message, with an ellipsis, so a
+/// page's whole text never lands in a tool error.
+fn clip_text(s: &str, max: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= max {
+        return t.to_string();
+    }
+    format!("{}…", t.chars().take(max).collect::<String>())
+}
+
+/// The element's own text as TextPattern reports it, when it has one.
+///
+/// A second, independent witness beside `ValuePattern`: a controlled input can
+/// echo a `SetValue` into its UIA value model while its rendered text keeps the
+/// old content (the React false-success of 2026-10-22). TextPattern reads the
+/// rendered text, so disagreeing with it is the one in-process signal that the
+/// write did not take. `None` when the element exposes no text pattern or its
+/// range is unbounded (a whole-window container, whose range is the page).
+fn text_pattern_of(el: &IUIAutomationElement) -> Option<String> {
+    let pat = text_pattern(el)?;
+    let range = unsafe { pat.DocumentRange().ok()? };
+    unsafe { range.GetText(-1).ok() }.map(bstr_to_string)
+}
+
 
 fn expand_state(el: &IUIAutomationElement) -> Option<ExpandCollapseState> {
     pattern::<IUIAutomationExpandCollapsePattern>(el, UIA_ExpandCollapsePatternId).and_then(|pat| unsafe {
@@ -2346,6 +3487,38 @@ fn window_logical_bounds(hwnd: isize, origin: (f64, f64), scale: f64) -> Bounds 
     logical_bounds(rect, origin, scale)
 }
 
+/// The one-node placeholder tree: the official integrity gate and the AX-WEDGE
+/// cooldown path both serve this shape, with the reason as the root node's name.
+fn single_node_dump(
+    hwnd: isize,
+    _title: &str,
+    origin: (f64, f64),
+    scale: f64,
+    message: String,
+) -> AccessibilityDump {
+    let node = UiNode {
+        index: 0,
+        role: "window".into(),
+        name: message,
+        bounds: window_logical_bounds(hwnd, origin, scale),
+        value: String::new(),
+        depth: 0,
+        actions: Vec::new(),
+        automation_id: String::new(),
+        description: String::new(),
+        states: Vec::new(),
+        focused: true,
+        runtime_id: Vec::new(),
+        truncated: None,
+    };
+    let focused = focused_line(&node);
+    AccessibilityDump {
+        focused,
+        nodes: vec![node],
+        ..AccessibilityDump::default()
+    }
+}
+
 fn fallback_dump(hwnd: isize, title: &str, origin: (f64, f64), scale: f64) -> AccessibilityDump {
     let node = UiNode {
         index: 0,
@@ -2374,7 +3547,7 @@ fn fallback_dump(hwnd: isize, title: &str, origin: (f64, f64), scale: f64) -> Ac
     }
 }
 
-fn integrity_rid(pid: u32) -> Option<u32> {
+pub fn integrity_rid(pid: u32) -> Option<u32> {
     unsafe {
         let proc = if pid == GetCurrentProcessId() {
             GetCurrentProcess()
@@ -2414,6 +3587,20 @@ fn integrity_rid(pid: u32) -> Option<u32> {
         } else {
             Some(*rid_ptr)
         }
+    }
+}
+
+/// Human-readable name for the mandatory-integrity RID, used by health and
+/// diagnostic_state so an operator can see why UIA/input is gated.
+pub fn integrity_label(rid: Option<u32>) -> &'static str {
+    match rid {
+        Some(0) => "untrusted",
+        Some(4096) => "low",
+        Some(8192) => "medium",
+        Some(12288) => "high",
+        Some(16384) => "system",
+        Some(_) => "custom",
+        None => "unknown",
     }
 }
 
@@ -2844,7 +4031,10 @@ mod ax_tests {
     /// shape is pinned by `official_golden_tree_matches_byte_for_byte`.
     #[test]
     fn on_disk_golden_fixture_keeps_the_official_grammar() {
-        let golden = include_str!("../../parity/golden-ax/official.tree.txt");
+        // A Windows checkout writes the fixture with CRLF; the grammar is defined in
+        // terms of LF. Normalising here keeps the test meaningful on both platforms
+        // instead of failing with "AX-06 blank line" on every CRLF clone.
+        let golden = include_str!("../../parity/golden-ax/official.tree.txt").replace("\r\n", "\n");
         assert!(golden.starts_with("Window: \"Parity Target\", App: "), "{golden}");
         let (body, focused) = golden.split_once("\n\n").expect("AX-06 blank line");
         assert!(focused.starts_with("The focused UI element is "), "{focused}");
@@ -2961,6 +4151,136 @@ mod ax_tests {
             WalkLimits { child_limit: 7, document_child_limit: 9, ..rich }.child_cap_for("list"),
             7
         );
+    }
+
+    /// AX-WEDGE: the reply wait is bounded by the request budget and the
+    /// entry-point cap. One test, not three: the deadline slot is process-global
+    /// and parallel tests would clobber each other's budget mid-assertion.
+    #[test]
+    fn reply_wait_honors_the_request_budget_and_the_caps() {
+        // No budget: the cap is the whole wait.
+        begin_request_budget(0);
+        assert_eq!(
+            reply_wait(READ_WAIT_CAP_MS),
+            Ok(Duration::from_millis(READ_WAIT_CAP_MS))
+        );
+        assert_eq!(
+            reply_wait(DUMP_WAIT_CAP_MS),
+            Ok(Duration::from_millis(DUMP_WAIT_CAP_MS))
+        );
+        // A live budget clamps the wait to the remaining time.
+        begin_request_budget(1_500);
+        let wait = reply_wait(DUMP_WAIT_CAP_MS).expect("budget is live");
+        assert!(wait <= Duration::from_millis(1_500), "wait {wait:?} exceeds the budget");
+        assert!(wait >= Duration::from_millis(1_400), "wait {wait:?} lost the budget");
+        // A spent budget fails with the protocol's budget message, never with a
+        // generic "did not answer" that would blame the monitor.
+        begin_request_budget(30);
+        std::thread::sleep(Duration::from_millis(60));
+        let err = reply_wait(READ_WAIT_CAP_MS).unwrap_err();
+        assert_eq!(err, crate::protocol::BUDGET_EXHAUSTED);
+        begin_request_budget(0);
+    }
+
+    /// AX-WEDGE: a monitor job that has outlived the caller's whole wait reports the
+    /// in-flight job as busy (and wedges its window once it is stuck for real),
+    /// instead of letting every caller queue behind it and time out in turn.
+    #[test]
+    fn a_stuck_monitor_job_reports_busy_and_wedges_its_window() {
+        let stuck_hwnd: isize = 0x51DE_0001;
+        let caller_hwnd: isize = 0x51DE_0002;
+        *MONITOR_CURRENT.lock().unwrap() = Some((stuck_hwnd, Instant::now() - Duration::from_millis(40_000)));
+        let err = precheck_monitor_busy(caller_hwnd, Duration::from_millis(100), "accessibility dump")
+            .unwrap_err();
+        assert!(err.contains("monitor busy"), "{err}");
+        assert!(err.contains(&stuck_hwnd.to_string()), "{err}");
+        assert!(
+            wedged_until(stuck_hwnd).is_some(),
+            "a 40s job is past the stuck threshold and must wedge its window"
+        );
+        assert!(wedged_until(caller_hwnd).is_none(), "the caller's window is not to blame");
+        *MONITOR_CURRENT.lock().unwrap() = None;
+        clear_wedged(stuck_hwnd);
+        assert!(wedged_until(stuck_hwnd).is_none());
+    }
+
+    /// AX-WEDGE: when the caller's OWN dump is the job the monitor is stuck on, the
+    /// error names the wedge and the cooldown instead of a generic timeout.
+    #[test]
+    fn a_timeout_on_our_own_wedged_dump_names_the_cooldown() {
+        let hwnd: isize = 0x51DE_0003;
+        *MONITOR_CURRENT.lock().unwrap() = Some((hwnd, Instant::now() - Duration::from_millis(40_000)));
+        let err = timeout_verdict(hwnd, Duration::from_millis(100), "accessibility dump");
+        assert!(err.contains("wedged"), "{err}");
+        assert!(err.contains("cooldown"), "{err}");
+        assert!(wedged_until(hwnd).is_some(), "the wedged window must be on the cooldown list");
+        *MONITOR_CURRENT.lock().unwrap() = None;
+        clear_wedged(hwnd);
+    }
+
+    /// AX-WEDGE: a young in-flight job does not trip the busy path, and a job that
+    /// finishes clears its window's cooldown entry (recovery before the cooldown
+    /// expires).
+    #[test]
+    fn a_young_or_finished_job_never_wedges() {
+        let hwnd: isize = 0x51DE_0004;
+        mark_wedged(hwnd);
+        assert!(wedged_until(hwnd).is_some());
+        *MONITOR_CURRENT.lock().unwrap() = Some((hwnd, Instant::now()));
+        precheck_monitor_busy(hwnd, Duration::from_millis(5_000), "accessibility dump")
+            .expect("a just-started job must not fail the caller");
+        // The monitor finishing the job clears the wedge even mid-cooldown.
+        clear_wedged(hwnd);
+        assert!(wedged_until(hwnd).is_none());
+        *MONITOR_CURRENT.lock().unwrap() = None;
+    }
+
+    /// P1-2 root fix: each watchdog replacement advances the generation; a
+    /// monitor whose generation is superseded must stop serving.
+    #[test]
+    fn watchdog_replacement_advances_the_generation() {
+        let before = MONITOR_GEN.load(Ordering::SeqCst);
+        spawn_monitor();
+        let after = MONITOR_GEN.load(Ordering::SeqCst);
+        assert!(after > before, "generation must advance: {before} -> {after}");
+        // Without a shared receiver (unit-test process) the new monitor exits
+        // immediately instead of blocking; the generation still advanced.
+    }
+
+    /// AX-WEDGE: `job_hwnd` decides which window a timeout may blame, so every
+    /// hwnd-carrying variant must map to its window and every global job to 0.
+    #[test]
+    fn job_hwnd_maps_every_variant() {
+        let (t_unit, _r_unit) = mpsc::channel::<UiaResult<()>>();
+        let (t_dump, _r_dump) = mpsc::channel::<UiaResult<AccessibilityDump>>();
+        let (t_bool, _r_bool) = mpsc::channel::<UiaResult<bool>>();
+        let (t_bounds, _r_bounds) = mpsc::channel::<UiaResult<Bounds>>();
+        let (t_actions, _r_actions) = mpsc::channel::<UiaResult<Vec<String>>>();
+        let (t_rid, _r_rid) = mpsc::channel::<UiaResult<Vec<i32>>>();
+        let (t_index, _r_index) = mpsc::channel::<UiaResult<Option<i32>>>();
+        let (t_opt_string, _r_opt_string) = mpsc::channel::<UiaResult<Option<String>>>();
+        let (t_opt_bool, _r_opt_bool) = mpsc::channel::<UiaResult<Option<bool>>>();
+        let (t_opt_hwnd, _r_opt_hwnd) = mpsc::channel::<UiaResult<Option<isize>>>();
+        let (t_diag, _r_diag) = mpsc::channel::<serde_json::Value>();
+        assert_eq!(job_hwnd(&Job::Dump { hwnd: 5, title: String::new(), origin: (0.0, 0.0), scale: 1.0, resp: t_dump.clone() }), 5);
+        assert_eq!(job_hwnd(&Job::SetValue { hwnd: 6, index: 0, value: String::new(), resp: t_unit.clone() }), 6);
+        assert_eq!(job_hwnd(&Job::Secondary { hwnd: 7, index: 0, action: String::new(), resp: t_unit.clone() }), 7);
+        assert_eq!(job_hwnd(&Job::SelectText { hwnd: 8, index: 0, text: String::new(), resp: t_unit.clone() }), 8);
+        assert_eq!(job_hwnd(&Job::Scroll { hwnd: 9, index: 0, direction: String::new(), pages: 0, resp: t_unit.clone() }), 9);
+        assert_eq!(job_hwnd(&Job::ValueAt { hwnd: 10, index: 0, resp: t_opt_string.clone() }), 10);
+        assert_eq!(job_hwnd(&Job::WindowContains { hwnd: 11, needle: String::new(), resp: t_bool.clone() }), 11);
+        assert_eq!(job_hwnd(&Job::FocusedTextRange { window_hwnd: 12, resp: t_opt_string.clone() }), 12);
+        assert_eq!(job_hwnd(&Job::FocusedContainer { window_hwnd: 13, resp: t_bool }), 13);
+        assert_eq!(job_hwnd(&Job::CachedBounds { index: 0, resp: t_bounds.clone() }), 0);
+        assert_eq!(job_hwnd(&Job::CachedActions { index: 0, resp: t_actions.clone() }), 0);
+        assert_eq!(job_hwnd(&Job::RuntimeId { index: 0, resp: t_rid.clone() }), 0);
+        assert_eq!(job_hwnd(&Job::IndexOf { runtime_id: vec![], resp: t_index.clone() }), 0);
+        assert_eq!(job_hwnd(&Job::Diagnostics { resp: t_diag }), 0);
+        assert_eq!(job_hwnd(&Job::FocusedValue { resp: t_opt_string.clone() }), 0);
+        assert_eq!(job_hwnd(&Job::FocusedText { resp: t_opt_string }), 0);
+        assert_eq!(job_hwnd(&Job::FocusedEditability { resp: t_opt_bool }), 0);
+        assert_eq!(job_hwnd(&Job::FocusedWindowId { resp: t_opt_hwnd }), 0);
+        drop(t_unit);
     }
 
     /// AX-16: the diagnostic payload carries every field name the official ships

@@ -20,6 +20,7 @@ INPUT_ACTIONS = frozenset(
         "set_value",
         "perform_secondary_action",
         "scroll_element",
+        "fill_form",
         "paste",
         "select_text",
     }

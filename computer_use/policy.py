@@ -59,6 +59,8 @@ WIN_KEY_TOKENS = {
     "command",
     "super",
     "os",
+    "lwin",
+    "rwin",
 }
 
 

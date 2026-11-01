@@ -161,8 +161,9 @@ class PromptParityTests(unittest.TestCase):
         import sys
 
         script = ROOT / "parity" / "check_guidance_coverage.py"
-        if not script.is_file():
-            self.skipTest("coverage script not present")
+        needle = ROOT / "analysis" / "official-guidance.md"
+        if not script.is_file() or not needle.is_file():
+            self.skipTest("coverage script or official guidance needle not present")
         proc = subprocess.run(
             [sys.executable, str(script)],
             capture_output=True,

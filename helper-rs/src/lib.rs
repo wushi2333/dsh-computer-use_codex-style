@@ -8,6 +8,7 @@ pub mod desktop;
 pub mod dpi;
 pub mod enum_windows;
 pub mod images;
+pub mod ime;
 pub mod input;
 pub mod interrupt;
 pub mod notify;

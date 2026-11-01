@@ -62,7 +62,8 @@
       "drag",
       "perform_secondary_action",
       "activate_window",
-      "batch_actions"
+      "batch_actions",
+      "fill_form"
     ],
     "diagnostic": [
       "session_note",

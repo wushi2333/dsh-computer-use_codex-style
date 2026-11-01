@@ -127,27 +127,16 @@ a `Selected:` list, `Selected text:` / `Document text:` fenced blocks, and the s
 
 ## Recommendations
 
-- Prefer `element_index` over guessed coordinates whenever an accessibility element is available.
+- Prefer `element_index` or `text` over guessed coordinates whenever an accessibility element is available.
+- `click({window, text: "按钮名称"})` will automatically match the target element from the latest accessibility tree.
 - Coordinates are window-relative **logical** pixels; a screenshot's `originX`/`originY` are **screen** coordinates. Do not mix them.
 - Do not run `pwsh`, OCR, or PrintWindow to \"see\" the UI: the screenshot is an image part you can already read.
 
-## Experience notes (advisory)
+## Experience & Machine-Local Knowledge
 
-Earlier tasks on this machine leave short notes behind, readable with `computer_use_experience`.
-When the first observation of an app matches a stored note, that tool result carries an
-`Experience notes` text block: read it before choosing an approach.
-
-- Notes are **reference only**. Software updates, DPI or configuration changes can invalidate them;
-  a note never blocks, replaces or overrides a call, and the current observation always wins.
-- `computer_use_experience({action: "list", app: "blender.exe"})` before driving an app you have not
-  driven on this machine.
-- Record one short note when a task ends with an app-specific problem you diagnosed or worked around:
-  `computer_use_experience({action: "record", app, symptom, context, cause, workaround, outcome, tags})`.
-  Record what is reproducible and actionable; a one-off typo or a generic error is not worth a note.
-  Never put credentials, typed text or document contents in a note.
-- If a stored note no longer applies, say so and retire it:
-  `computer_use_experience({action: "update", id, stale: true})`, or point it at the note that
-  replaces it with `supersededBy`.
+Machine-specific quirks, pitfalls, and workaround guidance belong in dedicated Skills
+(e.g. `computer-use-local` or app-specific skills) tracked in version control, rather than
+ephemeral runtime experience stores.
 
 ## Approvals
 

@@ -279,7 +279,35 @@ pub fn scroll_element_tool() -> Value {
 
 /// DSH harness extensions that exist nowhere in the official catalogue.
 pub fn harness_only_tools() -> Vec<Value> {
-    vec![scroll_element_tool()]
+    vec![scroll_element_tool(), fill_form_tool()]
+}
+
+fn fill_form_tool() -> Value {
+    tool(
+        "fill_form",
+        "Atomically fill several form fields in one call, then return the per-step results for a single final observation. Use this instead of separate set_value/click round-trips whenever a form has 2+ fields: it *replaces* values (select-all then write) so a stale value can never become \"old + new\", and it stops at the first failing step unless continue_on_error is set. Field actions: \"set\" (write value), \"check\" (tick a checkbox), \"click\" (press a button), \"press\" (a key, default Return).",
+        obj(
+            json!({
+                "window": window("containing the form"),
+                "continue_on_error": b("Keep going after a failing step instead of stopping (default false)."),
+                "fields": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "element_index": i("Element index from the latest get_window_state() accessibility tree."),
+                            "action": s("One of: set, check, click, press (defaults to set when value is present, otherwise click)."),
+                            "value": s("Value to write for action \"set\"."),
+                            "key": s("Key to press for action \"press\" (default Return)."),
+                        },
+                        "required": ["element_index"],
+                    },
+                    "description": "Ordered form steps, executed in one shot.",
+                },
+            }),
+            &["window", "fields"],
+        ),
+    )
 }
 
 /// The DSH `harness` surface: every catalogue entry that is not one of the

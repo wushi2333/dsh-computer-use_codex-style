@@ -28,7 +28,6 @@ English | [中文](README.zh-CN.md)
 - [Tool surface](#tool-surface)
 - [The act-and-refresh loop](#the-act-and-refresh-loop)
 - [Safety model](#safety-model)
-- [Experience layer](#experience-layer)
 - [Configuration](#configuration)
 - [Browser automation](#browser-automation)
 - [Verification](#verification)
@@ -51,7 +50,6 @@ English | [中文](README.zh-CN.md)
 | **Verified against the real thing** | Behaviour is gated against the official plugin and its helper: AX tree grammar, overlay pixels, cursor motion, capture freshness, transport budgets, approval strings, turn lifecycle. |
 | **Harness-native, not MCP-shaped** | DSH tools with a bundled skill, not a JavaScript REPL. The plugin is a DSH **bundle**: `package.json` + `cordis.patch.yml` + entry modules at the package root. |
 | **Two planes, one sidecar** | The desktop is process-wide, so the pointer, overlay, capture and approvals live on the HOST plane; the model-facing tools live in an agent preset, so an ordinary coding session never gets the mouse. |
-| **An experience layer** | Local, machine-specific notes written after a task and replayed as advisory context before the next one — see [Experience layer](#experience-layer). |
 
 ---
 
@@ -187,8 +185,12 @@ flowchart TB
 | Tool | Default | Purpose |
 |---|---|---|
 | `batch_actions` | enabled | Deterministic actions in one call, then one `get_window_state` |
-| `computer_use_health` | always | Backend, allow list, documentation gate, environment audit, experience store |
-| `computer_use_experience` | always | Read, record and update the local experience notes |
+| `computer_use_health` | always | Backend, allow list, documentation gate, environment audit |
+| `computer_use_uia_act` | enabled | Act on a control **by element name** through UIA patterns (`SelectionItem`/`Invoke`/`LegacyIAccessible`); no screenshot and no coordinates, so it also works on static windows WGC cannot capture. Chain steps with `"A、选项|下一题"`; returns the resulting text tree. **Two-step safety is built in:** `verify` (default on) diffs the page before and after each step and reports `applied`/`unchanged`, so a click the page ignored no longer reads as success; `checkDialog` (default on) probes the confirmation sheet after a 交卷/提交 step and returns `{dialog, body, buttons, confirm, nextStep}`. **Caveat:** a bare `Text` node (mini-program options) has no pattern at all, so the fallback click only means "issued" — verify the effect |
+| `computer_use_wait` | enabled | Fixed delay (optionally re-observing) without a helper round trip |
+| `computer_use_wait_until` | enabled | Poll until text appears in the accessibility tree, or until the screenshot changes, or until a timeout |
+| `computer_use_scroll_to` | enabled | Scroll to bottom/top/an approximate percent by issuing several sequential wheel pulses (70 ms apart, because apps coalesce rapid pulses). To reach the end of a long document pass steps:40 delta:40000 |
+| `computer_use_documents` | enabled | Export live document URLs (`Document` role ValuePattern) so PDF/viewer courseware can be read without scrolling page by page |
 | `click_element`, `scroll_element` | opt-in | Legacy window-v1 aliases |
 | `session_note`, `session_state`, `diagnostic_state`, `end_turn` | diagnostic | Session scratchpad, state dump and turn control |
 
@@ -234,43 +236,28 @@ The plugin ships the official confirmation policy and a hard deny list, and the 
 
 Read the shipped policy before extending the tool surface: `skills/computer-use/references/confirmations.md` and `skills/computer-use-browser/references/confirmations.md`.
 
+### The safety contract (`src/safety/`)
+
+Four rules decide whether a call may touch the desktop. They live in `src/safety/`, which has
+**no host dependency** on purpose: a policy layer that can only be exercised inside a full host
+is a policy layer nobody re-tests.
+
+| Rule | What it does |
+|---|---|
+| **Per-session grant** | The capability is off for a session that was never granted it. A grant cannot be widened from inside the session, and a delegated subagent is refused outright (`SUBAGENT_COMPUTER_USE_UNAVAILABLE`) — hand that step back to the parent. The host may flip a session's grant from **outside** the session via `service.safetyGrant(sessionId, true\|false)` (the contract's `authorize()`), which also converges that session's schema visibility in the same call |
+| **Schema visibility** | While a session's capability is off, its tool schemas are removed from that agent's view, so the session does not pay for tools it may never call. The restriction is released through the disposer **function** the host returns — `restricted.dispose?.()` would be a silent no-op and the tool would stay invisible forever |
+| **Cross-session write lease** | The helper is process-wide, so every session shares one mouse. A write operation holds the lease while it runs; the idle clock restarts when the write *finishes*. Read operations are never arbitrated, and the refusal says whether the other session is *executing* or merely *quiet* |
+| **Structured failures** | Every refusal carries a stable `code`, a `retry` verdict (`never` / `retry` / `reobserve`) and the next step to take. "It failed" and "it failed, observe again first" call for opposite reactions |
+
+Two layers below the plugin already cover the rest of the contract and are **not** re-implemented here:
+the Rust helper refuses input on a locked desktop (`helper-rs/src/desktop.rs`) and reports an
+integrity-limited target (`helper-rs/src/uia.rs`), while the plugin itself never writes screenshot
+files to disk — the bytes go to the host's attachment store, so their lifetime is the host's business.
+
+The design notes, the gap analysis against the reference implementation and the port's own
+findings live in [`docs/design-essence-dsh-computer-use.md`](docs/design-essence-dsh-computer-use.md).
+
 ---
-
-## Experience layer
-
-Every Computer Use run leaves two kinds of records behind, and the next run reads them before acting:
-
-| | Lessons (model-written) | Observations (machine-written) |
-|---|---|---|
-| Content | symptom, context, suspected cause, workaround, outcome, tags, date | method, ok/error, app, accessibility presence, window geometry, timing |
-| Who writes | the model, at the end of a task | the plugin, on every call |
-| Trust | prose with inference - **advisory only** | facts, no interpretation |
-
-Where it lives (inside the plugin folder, gitignored, never published):
-
-```text
-.experience/
-  lessons.jsonl      one JSON record per note (the canonical store)
-  lessons.md         the same notes rendered for humans, grouped by app
-  observations.jsonl machine-written facts
-  pending.jsonl      problems nobody wrote up yet
-  manual.jsonl       optional, hand-written, never rewritten by the plugin
-```
-
-**How it reaches the model.** The first observation of an app in a turn carries one extra advisory text block:
-
-```text
-Experience notes for blender.exe - machine-local notes from earlier tasks here.
-ADVISORY ONLY: not rules and not a gate. An upgrade, a DPI or configuration change can
-invalidate them, and the current observation always wins over a stored note.
-- 2026-09-14 [partial] accessibility was null in 11 of 13 observations -> prefer the app scripting interface
-```
-
-The note travels as its own block, so the official payload keeps its exact key set (`window`, `screenshots`, `accessibility`, `cacheDiagnostics`).
-
-**Advisory by construction, not by wording.** A note can never block, replace or gate a call; notes older than `staleAfterDays` are marked; a note that proves correct again is refreshed with `verified`; a note replaced by a better one is retired with `supersededBy`; and the model is told that **the current observation always wins**.
-
-**Privacy.** Typed text, element names, element values and screenshot bytes never reach these files. Error strings are path-redacted (`C:/Users/name/...` becomes `%USERPROFILE%`) and truncated. Turn the whole layer off with `experience.enabled: false` or `DSH_CU_EXPERIENCE=off`.
 
 ---
 
@@ -291,20 +278,12 @@ The note travels as its own block, so the official payload keeps its exact key s
 | `allowedApps` | `[]` | Non-empty means only these app ids may be observed or driven |
 | `envAllowlist` | `[]` | Extra environment names forwarded to the helper on top of the shipped allow list |
 | `overlayCaptureExclusion` | `mask` | How the status pill is kept out of the model's screenshots: `mask` hides it in the compositor for the duration of one capture (you keep seeing it), `wda` applies `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` instead, `off` leaves the pill in the frame |
-
-### Experience layer (`experience.*` on the same row)
-
-| Key | Default | Meaning |
-|---|---|---|
-| `enabled` | `true` | Master switch for reading and writing notes |
-| `store` | `""` | Empty means `<pluginRoot>/.experience` |
-| `captureObservations` | `true` | Write the machine-observed facts |
-| `injectDigest` | `true` | Attach the advisory block to the first observation of a matching app |
-| `maxEntries` / `maxChars` | `3` / `900` | Injection budget |
-| `staleAfterDays` | `90` | Notes older than this are marked as possibly outdated |
-| `includeStale` | `true` | `false` drops stale notes from the digest entirely |
-| `retainEntries` / `retainObservationDays` | `200` / `30` | Retention |
-| `redactPaths` | `true` | Redact local profile paths in recorded error text |
+| `fallbackLatchAfterWedge` | `true` | After the first accessibility wedge for an app, serve text from the .NET UIA fallback for the rest of the session instead of waiting out the helper's 15 s dump timeout each time |
+| `safetyDefaultEnabled` | `true` | Whether the capability is on for a session that was never explicitly granted or revoked. `false` closes it by default and hides its tool schemas |
+| `safetyDenySubagents` | `true` | Refuse computer control to delegated subagents: a subagent's scope is fixed when it starts and cannot be widened from inside the session |
+| `safetyHideToolSchemasWhenOff` | `true` | Hide the tool schemas of a session whose capability is off (a registered tool's schema rides along with every request) |
+| `safetyControllerLease` | `true` | Arbitrate write operations between sessions: the helper is process-wide, so every session shares one mouse and one keyboard |
+| `safetyControllerLeaseIdleMs` | `10000` | How long the write lease survives without a write. The idle clock restarts when a write *finishes*, not when it is accepted |
 
 ### PRESET plane (the `dsh-computer-use/tool` row)
 
@@ -332,7 +311,7 @@ Everything is reproducible from this repository. Plugin-plane gates need no desk
 
 ```sh
 # from a DeepSeek Harness checkout, so the peer dependencies resolve
-node --import tsx/esm --test tests/contracts.test.mjs tests/experience.test.mjs
+node --import tsx/esm --test tests/contracts.test.mjs tests/interactive_summary.test.mjs
 
 # helper (Rust)
 cargo test --release --manifest-path helper-rs/Cargo.toml
@@ -344,7 +323,7 @@ python -m pytest -q
 node src/smoke.mjs
 ```
 
-Current state on Windows 11 x64: **plugin gates 38/38** (25 contract + 13 experience), **Rust 202 passed**, **Python 289 passed / 1 skipped**, fake-backend smoke green.
+Current state on Windows 11 x64: **plugin gates 25/25 contract**, **Rust 231 passed**, **Python 326 passed / 4 skipped**, fake-backend smoke green.
 
 The parity suite drives the real desktop and compares this plugin against the official one — overlay pixels, cursor motion, capture freshness, window-state cases, transport budgets, AX tree bytes, plugin lifecycle:
 
@@ -389,9 +368,13 @@ src/
   index.js              HOST service: sidecar lifetime, turn lifecycle, health
   tool.js               PRESET row: tool registration, approvals, documentation gate
   sidecar.js            helper transport: spawn, JSON-RPC, budgets, routing
-  experience.js         the experience layer: store, digest, observations, pending
   prompt.js             always-on prompt section + on-demand reference inventory
   paths.js              helper/python discovery
+  safety/               the safety contract (no host dependency, unit-tested standalone)
+    grant.js            per-session capability grant + subagent refusal
+    schema-visibility.js  hiding a switched-off session's tool schemas
+    controller-lease.js   cross-session write arbitration
+    failures.js         code + retry + next step for every refusal
 skills/
   computer-use/         the desktop skill + its reference documents
   computer-use-browser/ the browser skill + its reference documents
@@ -420,7 +403,7 @@ docs/                   plugin readmes and assets
 | The status pill never appears | Read `computer_use_health` → `overlay.captureExclusion`. The default `mask` always keeps the pill on screen. The official-style `wda` affinity stops the DWM from presenting the pill's composition content *on screen* on some Windows/DWM/GPU combinations (the operator then sees the synthetic cursor and no pill, while every overlay API still reports `visible=true`); that is why it is opt-in. A stuck mask would show up as `overlay.captureMasked = true`, and the helper lifts one itself after five seconds. |
 | `list_apps` times out | The installed-app catalog is the one method that does real work before answering. `computer_use_health` → `overlay`/`appCatalog` timing and the helper's own `%LOCALAPPDATA%\computer-use-app-catalog\slow-requests.log` (every request over `DSH_CU_SLOW_REQUEST_MS`, default 1 s, with catalog and rebuild-stage timing) are the two records that survive: a transport timeout kills the helper, so its in-process diagnostics are gone by the time you can ask. Raise `listAppsTimeoutMs` if the catalog is genuinely slow on the machine |
 | `Computer Use was stopped by the user with the physical Escape key` without pressing Esc | A tool call was aborted by the harness (its own budget) and the helper latched the turn as stopped. Aborts now send `cancel`, which only drops the overlay; if you still see this, the helper is from an older build (a fresh helper starts on the next turn) |
-| An app has an unusable accessibility tree | Common for self-drawn UIs. Use the screenshot path, or prefer the app own scripting interface, then record what you learned with `computer_use_experience`. |
+| An app has an unusable accessibility tree | Common for self-drawn UIs. Use the screenshot path, or prefer the app own scripting interface, then document what you learned in a dedicated Skill. |
 
 ---
 
@@ -428,7 +411,6 @@ docs/                   plugin readmes and assets
 
 - **The agent controls the real mouse, keyboard and screen.** Run Computer Use in a session where that is acceptable, and keep the deny list intact.
 - **Approvals are explicit.** `launch_app` and audio recording can pause for the harness approval UI; nothing is approved silently, and a refusal is never retried.
-- **The experience store is local and bounded.** It lives inside the plugin folder, is gitignored, is never packed, and never records typed text, element names or screenshot bytes.
 - **Screenshots are vision parts.** They travel to the model as image attachments; the JSON tool result carries no base64.
 - **Untrusted content stays untrusted.** Pages, documents and mail can inform the model but cannot authorise an action.
 
@@ -439,6 +421,29 @@ docs/                   plugin readmes and assets
 The plugin targets the Codex Computer Use plugin baseline `26.903.61454`: same 13 methods, same parameter names and defaults, same return shapes, same error strings, same AX tree grammar, same budgets, same overlay semantics.
 
 The official DSH Computer Use follows a noticeably different design. Use this plugin when you want the Codex-style behaviour.
+
+### Capture needs a repaint (static windows)
+
+`Windows.Graphics.Capture` delivers a frame only when the target window **changes**. A static page — an exam form, a settings dialog, a paused document — can therefore time out with `window capture timed out`, and coordinate input is impossible without a frame. The plugin degrades instead of failing, in this order:
+
+1. **Nudge → retry.** A 1 px size round-trip (`scripts/gdi-capture.ps1 -NudgeOnly`, plus `InvalidateRect`/`UpdateWindow`) forces a repaint and the capture is retried once. The frame then lands in the helper's **own** capture session, so `screenshotId`, coordinate clicks and the observation lease all keep working. A window that needed a nudge is nudged *before* the next capture, so the 15 s timeout is paid once per window rather than once per observation.
+2. **PrintWindow (GDI).** `PrintWindow(PW_RENDERFULLCONTENT)` needs no fresh DWM frame at all. The picture is injected as a normal screenshot with `source: "gdi-printwindow"` — good for reading the page and for x/y geometry, but the helper holds no frame for it, so prefer element names (`computer_use_uia_act`) and expect one automatic re-observe before a coordinate click lands.
+3. **Stale frame.** If GDI fails too, the last good frame for that window is returned with `stale: true` and its age.
+4. **Text only.** Only then does it fall back to the pre-existing `captureFailed: true` plus the UIA text fallback.
+
+`value.capture` reports which path was taken (`path`, `stale`, `recovered`, `oversizeWindow`, `guidance`) and `computer_use_health.captureRecovery` counts them (`wgc`, `wgc-after-nudge`, `gdi-printwindow`, `stale-frame`, `gdi-failed`). Text-only observation of a Chromium host still bypasses the capture path entirely (`.NET` UIA fallback, valid lease), and `computer_use_uia_act` still drives controls by name, needing neither frame nor coordinates.
+
+Two related behaviours from the same pass:
+
+- `batch_actions` is executed **step by step** by the plugin rather than as one opaque helper call: each step's `shot-N` screenshot id is translated like a top-level call, two coordinate steps in a row get a screenshot-only re-observation in between, and a `user input was detected in this window` refusal is retried once after that re-observe instead of aborting the whole batch.
+- **WeChat mini-program (WMPF) pages bind neither the mouse nor touch injection.** Measured on a 40-question safety exam: a `SendInput` click is delivered (returns 2, cursor read back on the pixel, window is foreground, `WindowFromPoint` hits the page) yet the page ignores it; `InjectTouchInput` fails with `err=87` because the machine reports `IsTouchWindow=false`. The two things that *do* work are `scripts/uia-post.ps1` (PostMessage `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/`WM_LBUTTONUP` straight to the render child window, `lParam = x|y<<16`) and `scripts/uia-ticks.ps1`, which reads a checkbox's ON/OFF state from **pixels** (a tick is a solid red square; count red pixels) — the only trustworthy read-back, since these option rows are bare `Text` nodes with no `SelectionItem`/`Toggle` pattern at all.
+- **Do not try to drive WMPF multi-select rows by computed coordinates.** The option label's `y` is not the checkbox's `y` (measured +48 on one 5-option question, and the row pitch differs between 4- and 5-option questions), and the page **reflows after each tick**, so "read the coordinates once, then click a batch" mis-targets every time. The reliable pattern is: a human ticks the boxes, and the tool verifies with `uia-ticks.ps1` (`-Points "119,<y>;..."`, after scanning a 200–440 vertical strip to locate the red bands).
+- A two-step confirm interaction is handled by `computer_use_uia_act`: click the first control (e.g. `交卷`), then `checkDialog` reports the confirmation sheet and which button commits it. The final commit is deliberately a separate, explicit act.
+- `computer_use_scroll_to` does not trust the wheel alone. The ladder is wheel → `Page_Down` → `Right` → `Next` → an **interpolated swipe** (`scripts/uia-swipe.ps1`: 14 pointer moves over 350 ms, `SYNTHETIC_TAG`-stamped, and **no helper capture session needed** — the helper's own `drag` is only four events with no motion in between, which web readers ignore). Whether the page actually moved is decided by **three signals, strongest first**: the `current/total` page counter → a UIA tree text diff (`documentSnapshot()`, which also recognises `最后一页了` as `lastPage`) → a GDI frame hash, and *equal frames are downgraded to `unknown`* because `PrintWindow` returns stale frames for Chromium surfaces. The result reports `page`, `pageProbe`, `swipe:{ok,from:'document-rect'|'window-rect'}`, `moved:'text'|'frame'|'unknown'`, `lastPage` and `guidance`. A hidden Document rect (the first `Document` line often belongs to another, background course) is rejected by a window-fit check, so the swipe always lands inside the visible document. Verified dead end: **UIA ScrollPattern** — the first scrollable node is a hidden document (`VerticalScrollPercent` stays `-1`) and, filtered to visible + `VerticallyScrollable`, the 81-element tree contains none.
+
+A window **larger than the desktop** can never be composited. The capture helper reports both the screen and the window rectangles, so the guidance states that outright instead of leaving you to guess; resize the window to fit the screen.
+
+A window that is **covered by another window** fails the same way — the helper refuses to hand over pixels that belong to the covering window. The same ladder runs: the target is activated first, then re-captured; if it is still covered, `PrintWindow` renders the target's *own* surface (verified on a covered 782x735 window), so the observation succeeds as `path: "wgc-after-activate"` or `path: "gdi-printwindow"` instead of failing.
 
 ---
 
@@ -454,3 +459,4 @@ Verbatim third-party material ships in this repository and keeps its own terms:
 - `parity/golden-ax/` and `parity/ax-rich/` carry accessibility-tree samples produced by the official helper, kept as the comparison baseline for the parity gates.
 
 If you redistribute this project, review those files against the terms you obtained them under.
+

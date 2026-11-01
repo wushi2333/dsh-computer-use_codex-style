@@ -77,7 +77,7 @@ def required_documentation(names: list[str]) -> str:
     """Official `assertRequiredDocumentationRead` error (browser-service.mjs:37344)."""
     quoted = ", ".join(json.dumps(name) for name in names)
     hints = "; ".join(
-        "await agent.documentation.get(" + json.dumps(name) + ")" for name in names
+        "get_documentation(name=" + json.dumps(name) + ")" for name in names
     )
     return f"Required documentation has not been read: {quoted}. Read the instructions with {hints}."
 

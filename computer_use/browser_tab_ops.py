@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import tempfile
 import time
-from pathlib import Path
 from typing import Any
 
+from computer_use.temp_janitor import janitor
 from computer_use.tools import _bool, _int, _num, _obj, _str, _tool
 
 TAB_OPS = (
@@ -198,7 +197,7 @@ def handle_tab_ops(surface: Any, name: str, spec: dict[str, object]) -> Any:
         bundler = getattr(browser, "page_assets_bundle", None)
         if callable(bundler):
             return bundler(tab_id, str(spec.get("inventoryId") or ""))
-        directory = Path(tempfile.mkdtemp())
+        directory = janitor.new_dir("assets", owner=str(tab_id))
         manifest = directory / "manifest.json"
         manifest.write_text("{}", encoding="utf-8")
         return {"directoryPath": str(directory), "manifestPath": str(manifest), "assets": [], "failures": [], "summary": {"downloadedCount": 0, "failedCount": 0, "requestedCount": 0, "elapsedMs": 0}}
@@ -233,7 +232,7 @@ def _content(browser: Any, name: str, spec: dict[str, object], tab_id: str) -> d
     if name.endswith("youtube"):
         suffix = "txt"
         text = f"YouTube transcript for {tab.url}\n{text}"
-    path = Path(tempfile.gettempdir()) / f"export-{tab.id}.{suffix}"
+    path = janitor.new_path(f"export-{tab.id}.{suffix}", owner=str(tab.id))
     path.write_text(text, encoding="utf-8")
     return {"path": str(path), "bytes": path.stat().st_size}
 

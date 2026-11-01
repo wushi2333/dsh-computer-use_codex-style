@@ -262,6 +262,16 @@ class ComputerUseServer:
                 shutdown_manager()
             except Exception:
                 pass
+            # SEC-05: the sidecar is the real lifetime boundary for the
+            # temporary files this process produced (exports, media captures,
+            # the audio recording). Take them away instead of leaving them in
+            # the system temp dir.
+            try:
+                from computer_use.temp_janitor import shutdown_janitor
+
+                shutdown_janitor()
+            except Exception:
+                pass
             closer = getattr(self.executor.driver.backend, "close", None)
             if callable(closer):
                 closer()

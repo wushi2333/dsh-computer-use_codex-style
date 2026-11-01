@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from computer_use.models import Bounds, UINode
 from computer_use.png import solid_png
+from computer_use.temp_janitor import janitor
 from computer_use.tree_format import format_tree
 
 
@@ -161,11 +162,8 @@ class FakeBrowser:
         return {"claimed": False, "unavailable": True, "reason": "tab mention no longer matches"}
 
     def download_media(self, tab_id: str, node_id: int | None = None, x: float | None = None, y: float | None = None) -> dict[str, object]:
-        from pathlib import Path
-        import tempfile
-
         tab = self.tab(tab_id)
-        path = Path(tempfile.gettempdir()) / f"media-{tab.id}.bin"
+        path = janitor.new_path(f"media-{tab.id}.bin", owner=str(tab.id))
         path.write_bytes(b"media-bytes")
         item = {
             "filename": path.name,
@@ -263,9 +261,16 @@ class FakeBrowser:
                 payload["screenshot_unavailable"] = tab.screenshot_unavailable
             else:
                 png = solid_png()
-                payload["screenshots"] = [{"id": f"{tab.id}-shot", "emitted": False, "bytes": len(png)}]
+                b64 = base64.b64encode(png).decode("ascii")
+                payload["screenshots"] = [
+                    {
+                        "id": f"{tab.id}-shot",
+                        "emitted": False,
+                        "bytes": len(png),
+                        "url": f"data:image/png;base64,{b64}",
+                    }
+                ]
                 payload["screenshot_bytes"] = len(png)
-                payload["_png"] = base64.b64encode(png).decode("ascii")
         return payload
 
     def ax_click(self, tab_id: str, index: int) -> dict[str, object]:
@@ -369,6 +374,10 @@ class FakeBrowser:
 
     def close_tab(self, tab_id: str) -> dict[str, object]:
         self.tabs.pop(tab_id, None)
+        # The tab's plugin-generated exports and media captures go with it
+        # (SEC-05). A *download* is the user's artifact and is not ours to
+        # delete, so it was never registered with the janitor.
+        janitor.release_owner(str(tab_id))
         return {"ok": True, "closed": tab_id}
 
     def get_js_dialog(self, tab_id: str) -> dict[str, object] | None:
@@ -509,18 +518,15 @@ class FakeBrowser:
         return " ".join(node.name for node in self.tab(tab_id).nodes)
 
     def export_authenticated(self, kind: str, tab_id: str, spec: dict[str, object]) -> dict[str, object]:
-        from pathlib import Path
-        import tempfile
-
         from computer_use.browser_export import gsuite_export_url
 
         tab = self.tab(tab_id)
         if kind == "youtube":
-            path = Path(tempfile.gettempdir()) / f"yt-{tab.id}.txt"
+            path = janitor.new_path(f"yt-{tab.id}.txt", owner=str(tab.id))
             path.write_text(f"YouTube transcript for {tab.url}\n{self.inner_text(tab_id)}", encoding="utf-8")
             return {"path": str(path), "bytes": path.stat().st_size, "backend": "page-js"}
         fmt = str(spec.get("type") or "pdf")
         export = gsuite_export_url(tab.url, fmt)
-        path = Path(tempfile.gettempdir()) / f"gsuite-{tab.id}.{fmt}"
+        path = janitor.new_path(f"gsuite-{tab.id}.{fmt}", owner=str(tab.id))
         path.write_text(f"GSuite export of {export or tab.url}\n{self.inner_text(tab_id)}", encoding="utf-8")
         return {"path": str(path), "bytes": path.stat().st_size, "exportUrl": export, "backend": "page-fetch"}

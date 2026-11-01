@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "LLM-agnostic Computer Use driver reconstructed from Codex window2 + helper protocol"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+# cdp_ws.py imports `websocket` (websocket-client) at module load; the browser
+# engine and every Python-routed method (get_app_state/paste/select_text) crash
+# at startup without it. Declared so a fresh checkout provisions it (F1).
+dependencies = ["websocket-client"]
 
 [project.scripts]
 computer-use = "computer_use.cli:main"

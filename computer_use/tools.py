@@ -204,6 +204,43 @@ def tool_names() -> list[str]:
     return [item["function"]["name"] for item in tool_definitions()]
 
 
+def harness_tool_definitions() -> list[dict[str, Any]]:
+    """DSH harness extensions that exist nowhere in the official catalogue.
+
+    Kept out of `tool_definitions()` so the official contract tests keep passing:
+    `tool_names()` must stay exactly `WINDOW2_TOOLS`. `scroll_element` is the
+    precedent — an extension that the *native helper* surface publishes
+    separately (see `harness_only_tools()` in helper-rs/src/tools.rs).
+    """
+    window = _window()
+    return [
+        _tool(
+            "fill_form",
+            "Atomically fill several form fields in one call, then return the per-step results for a single final observation. Use this instead of separate set_value/click round-trips whenever a form has 2+ fields: it *replaces* values (select-all then write) so a stale value can never become \"old + new\", and it stops at the first failing step unless continue_on_error is set. Field actions: \"set\" (write value), \"check\" (tick a checkbox), \"click\" (press a button), \"press\" (a key, default Return).",
+            _obj(
+                {
+                    "window": window,
+                    "continue_on_error": {"type": "boolean", "description": "Keep going after a failing step instead of stopping (default false)."},
+                    "fields": {
+                        "type": "array",
+                        "items": _obj(
+                            {
+                                "element_index": _int("Element index from the latest get_window_state() accessibility tree."),
+                                "action": _str("One of: set, check, click, press (defaults to set when value is present, otherwise click)."),
+                                "value": _str("Value to write for action \"set\"."),
+                                "key": _str("Key to press for action \"press\" (default Return)."),
+                            },
+                            ["element_index"],
+                        ),
+                        "description": "Ordered form steps, executed in one shot.",
+                    },
+                },
+                ["window", "fields"],
+            ),
+        ),
+    ]
+
+
 def openai_tools() -> list[dict[str, Any]]:
     return tool_definitions()
 

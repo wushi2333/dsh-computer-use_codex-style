@@ -159,6 +159,33 @@ pub fn capture_path_is_known(path: &str) -> bool {
     path.is_empty() || CAPTURE_PATHS.contains(&path)
 }
 
+/// Last occlusion verdict, so a "captured the wrong window" report can be
+/// attributed to the check instead of guessed at.
+static LAST_COVERED: Mutex<Option<bool>> = Mutex::new(None);
+
+fn note_covered(covered: bool) {
+    if let Ok(mut slot) = LAST_COVERED.lock() {
+        *slot = Some(covered);
+    }
+}
+
+/// Whether the target is covered, recording the verdict for diagnostics.
+fn target_covered(hwnd: isize) -> bool {
+    let covered = crate::enum_windows::is_covered(as_hwnd(hwnd));
+    note_covered(covered);
+    covered
+}
+
+/// External diagnostic: the full per-sample occlusion picture for a window.
+pub fn coverage_probe(hwnd: isize) -> serde_json::Value {
+    let mut detail = crate::enum_windows::is_covered_detail(as_hwnd(hwnd));
+    detail["lastPath"] = serde_json::json!(capture_path());
+    if let Ok(slot) = LAST_COVERED.lock() {
+        detail["lastCovered"] = serde_json::json!(*slot);
+    }
+    detail
+}
+
 /// CW-7: official has exactly one capture path (`wgc`) and fails loudly when it is
 /// unavailable. DSH keeps GDI fallbacks, so the chosen path and whether it is the
 /// official one must be visible; a `gdi-*` frame may show a covering window instead
@@ -166,6 +193,7 @@ pub fn capture_path_is_known(path: &str) -> bool {
 pub fn capture_diagnostics() -> serde_json::Value {
     let path = capture_path();
     let display = crate::overlay::display_hwnds().len();
+    let covered = LAST_COVERED.lock().ok().and_then(|slot| *slot);
     serde_json::json!({
         "path": path,
         "officialPath": OFFICIAL_CAPTURE_PATH,
@@ -173,6 +201,7 @@ pub fn capture_diagnostics() -> serde_json::Value {
         "fallback": !path.is_empty() && path != OFFICIAL_CAPTURE_PATH,
         "gdiFallbackIsDshExtension": true,
         "displayOverlays": display,
+        "lastCovered": covered,
     })
 }
 
@@ -887,6 +916,22 @@ fn capture_wgc(hwnd_raw: isize, timeout_ms: u32, fresh: bool) -> Result<CaptureF
     if hwnd_raw == 0 || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         bail!("window id is required");
     }
+    // WGC captures a MONITOR (`CreateForMonitor` in `create_item`), not the window:
+    // it records the composited desktop for the display that hosts the target and
+    // then crops to the window rect. That means the frame shows whatever is on top
+    // at those coordinates — a covered target yields the *covering* window's pixels
+    // while the tool still reports `ok`. Observed live 2026-10-20 (TapTap behind the
+    // Harness window): two observations returned the Harness chat.
+    //
+    // Refusing here sends the caller down the GDI path, which has a window-DC
+    // fallback that cannot pick up a covering window. Failing loudly beats
+    // answering with someone else's screen.
+    if target_covered(hwnd_raw) {
+        bail!(
+            "target window is covered by another window; monitor capture would return the \
+             covering window's pixels"
+        );
+    }
     let (left, top, win_w, win_h) = window_rect(hwnd)?;
     let (_hmon, mon) = monitor_frame_for_hwnd(hwnd)?;
     let (crop_x, crop_y, crop_w, crop_h) =
@@ -1133,11 +1178,34 @@ fn skip_printwindow(hwnd_raw: isize) -> bool {
     crate::enum_windows::uses_redirected_composition(as_hwnd(hwnd_raw))
 }
 
+/// Screen-DC BitBlt, used as the first GDI fallback when WGC cannot produce a
+/// frame.
+///
+/// A screen BitBlt samples the composited desktop, so it only shows the target
+/// while the target is actually on top. When another window covers it, the frame
+/// contains the *covering* window's pixels — and the caller still reports `ok`.
+/// Observed live (2026-10-20, TapTap login behind the Harness window): this path
+/// returned the Harness chat twice.
+///
+/// When the target is covered, prefer the window DC (which cannot pick up a
+/// covering window) and otherwise fail loudly; a wrong frame that looks like a
+/// successful observation is the worse outcome.
 fn capture_gdi_bitblt_only(hwnd_raw: isize) -> Result<CaptureFrame> {
     let hwnd = as_hwnd(hwnd_raw);
     let (left, top, width, height) = window_rect(hwnd)?;
     let dpi = window_dpi(hwnd);
     let (logical_w, logical_h) = scaled_size(width, height, dpi);
+    // A covered target has no trustworthy GDI frame either: the screen DC returns
+    // the covering window, and the window DC of a DirectComposition/Electron window
+    // returns an empty (black) bitmap. Both would be reported as a successful
+    // observation, which is the failure mode this guard exists to prevent — so the
+    // honest answer is the error.
+    if target_covered(hwnd_raw) {
+        bail!(
+            "target window is covered by another window; no trustworthy frame is available — \
+             call activate_window first"
+        );
+    }
     let bgra = bitblt_screen_bgra(left, top, width, height)?;
     let jpeg = encode_jpeg_bgra(width, height, &bgra, logical_w, logical_h)?;
     Ok(CaptureFrame {
@@ -1160,12 +1228,31 @@ fn capture_gdi(hwnd_raw: isize) -> Result<CaptureFrame> {
     unsafe { ShowCursor(false) };
     let result = (|| {
         let bgra = if skip_printwindow(hwnd_raw) {
-            note_capture_path("gdi-screen-bitblt");
-            bitblt_screen_bgra(left, top, width, height)
-                .or_else(|_| {
-                    note_capture_path("gdi-window-bitblt");
-                    bitblt_window_bgra(hwnd, width, height)
-                })
+            // Electron / DirectComposition windows (TapTap, Slack, VS Code…)
+            // cannot use PrintWindow without freezing their swapchain, so this
+            // branch used to go straight to a screen-DC BitBlt. A screen BitBlt
+            // samples the composited desktop: if the target is covered, it
+            // captures the *covering* window and still reports success.
+            //
+            // Observed live (2026-10-20, TapTap login): the Harness window sat on
+            // top and two observations returned the Harness chat instead of the
+            // TapTap form. A covered Electron window has no trustworthy GDI frame
+            // either — the window DC comes back black — so a covered target is
+            // reported as an error instead of being answered with a wrong picture.
+            let covered = target_covered(hwnd_raw);
+            if covered {
+                bail!(
+                    "target window is covered by another window; no trustworthy frame is \
+                     available — call activate_window first"
+                );
+            } else {
+                note_capture_path("gdi-screen-bitblt");
+                bitblt_screen_bgra(left, top, width, height)
+                    .or_else(|_| {
+                        note_capture_path("gdi-window-bitblt");
+                        bitblt_window_bgra(hwnd, width, height)
+                    })?
+            }
         } else {
             print_window_bgra(hwnd, width, height)
                 .map(|px| {
@@ -1177,10 +1264,15 @@ fn capture_gdi(hwnd_raw: isize) -> Result<CaptureFrame> {
                     bitblt_window_bgra(hwnd, width, height)
                 })
                 .or_else(|_| {
+                    // Last resort is the screen, but only when nothing covers
+                    // the target — see the note above.
+                    if target_covered(hwnd_raw) {
+                        bail!("target window is covered; screen capture refused");
+                    }
                     note_capture_path("gdi-screen-bitblt");
                     bitblt_screen_bgra(left, top, width, height)
-                })
-        }?;
+                })?
+        };
         let jpeg = encode_jpeg_bgra(width, height, &bgra, logical_w, logical_h)?;
         Ok(CaptureFrame {
             jpeg_bytes: jpeg,

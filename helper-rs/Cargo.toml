@@ -11,7 +11,7 @@ wgc = []
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 windows-core = "0.61"

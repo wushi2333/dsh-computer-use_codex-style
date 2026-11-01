@@ -55,8 +55,25 @@ static RUNNING: AtomicBool = AtomicBool::new(true);
 static LAST_RPC: Mutex<Option<Instant>> = Mutex::new(None);
 static IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
 
+/// Source revision this binary was built from ("unknown" for ad-hoc
+/// `cargo build` runs; scripts/ship-helper.ps1 injects the git hash).
+pub const BUILD_REVISION: &str = match option_env!("DSH_CU_BUILD_GIT") {
+    Some(rev) => rev,
+    None => "unknown",
+};
+
 fn main() {
     dpi::enable();
+    // Audit P3-2 (2026-10-25): the shipped binary embeds the source revision it
+    // was built from (set by scripts/ship-helper.ps1 via DSH_CU_BUILD_GIT). A
+    // stale committed exe — source changed, binary not rebuilt — is the single
+    // most common way these fixes silently regress, so CI compares this against
+    // git HEAD. Queried through the environment, not argv: the helper must keep
+    // the official CLI surface (unknown flags abort).
+    if std::env::var_os("DSH_CU_PRINT_BUILD").is_some() {
+        println!("{BUILD_REVISION}");
+        std::process::exit(0);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut parent_pid: u32 = 0;
     // FIX-4: the official helper has no clap, no --help and no subcommands. Exactly
@@ -110,6 +127,44 @@ fn main() {
     }
     if cursor_manager {
         std::process::exit(run_system_cursor_manager(parent_pid));
+    }
+    // P1 migration: one-shot image crop, replacing scripts/crop-image.ps1 (System.Drawing)
+    // with the Rust `image` crate — no powershell.exe process. Triggered via the ENVIRONMENT
+    // (like DSH_CU_PRINT_BUILD), so the argv surface stays the exact official one.
+    //   DSH_CU_CROP_IN / DSH_CU_CROP_OUT    input / output png paths (required)
+    //   DSH_CU_CROP_X / _Y / _W / _H        region (W/H <= 0 => to the edge; defaults 0)
+    if let Ok(in_path) = std::env::var("DSH_CU_CROP_IN") {
+        let out_path = std::env::var("DSH_CU_CROP_OUT").unwrap_or_default();
+        let env_i = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+        let (x, y, w, h) = (
+            env_i("DSH_CU_CROP_X"),
+            env_i("DSH_CU_CROP_Y"),
+            env_i("DSH_CU_CROP_W"),
+            env_i("DSH_CU_CROP_H"),
+        );
+        std::process::exit(run_crop_image_oneshot(&in_path, &out_path, x, y, w, h));
+    }
+    // P1 migration: one-shot GDI capture, replacing scripts/gdi-capture.ps1. It reuses the
+    // helper's OWN capture_hwnd (WGC -> GDI ladder, nudge, overlay masking), so the Rust
+    // path is a superset of the ps1's GDI-only PrintWindow. Env-triggered like the crop mode.
+    //   DSH_CU_GDI_CAPTURE_HWND=<hwnd>   DSH_CU_GDI_CAPTURE_OUT=<png path>
+    if let Ok(hwnd_raw) = std::env::var("DSH_CU_GDI_CAPTURE_HWND") {
+        let out_path = std::env::var("DSH_CU_GDI_CAPTURE_OUT").unwrap_or_default();
+        let hwnd: isize = hwnd_raw.trim().parse().unwrap_or(0);
+        std::process::exit(run_gdi_capture_oneshot(hwnd, &out_path));
+    }
+    // P1 migration: one-shot interpolated swipe, replacing scripts/uia-swipe.ps1.
+    //   DSH_CU_SWIPE_HWND / _FROMX / _FROMY / _TOX / _TOY [ / _DURATION / _STEPS ]
+    if let Ok(hwnd_raw) = std::env::var("DSH_CU_SWIPE_HWND") {
+        let hwnd: isize = hwnd_raw.trim().parse().unwrap_or(0);
+        let env_i = |k: &str, d: i64| std::env::var(k).ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(d);
+        let fx = env_i("DSH_CU_SWIPE_FROMX", 0) as i32;
+        let fy = env_i("DSH_CU_SWIPE_FROMY", 0) as i32;
+        let tx = env_i("DSH_CU_SWIPE_TOX", 0) as i32;
+        let ty = env_i("DSH_CU_SWIPE_TOY", 0) as i32;
+        let dur = env_i("DSH_CU_SWIPE_DURATION", 350) as i32;
+        let steps = env_i("DSH_CU_SWIPE_STEPS", 12) as i32;
+        std::process::exit(run_swipe_oneshot(hwnd, (fx, fy), (tx, ty), dur, steps));
     }
     if let Some(payload) = prev_notify.as_deref() {
         // Official: the notify hook calls back with the previous payload so the
@@ -196,6 +251,128 @@ fn main() {
             break;
         }
         let _ = stdout.flush();
+    }
+}
+
+/// P1 migration: one-shot crop for `scripts/crop-image.ps1` parity. Decodes InPath (jpg/png),
+/// crops [x,y,w,h] (w/h <= 0 => to the edge, clamped into bounds), writes OutPath as PNG.
+/// Prints {"ok":true,"out":...} / {"ok":false,"error":...} and returns the exit code
+/// (0 write / 1 fail), matching the ps1 contract's exit semantics exactly.
+fn run_crop_image_oneshot(in_path: &str, out_path: &str, x: i64, y: i64, w: i64, h: i64) -> i32 {
+    if out_path.is_empty() {
+        eprintln!("crop-image: empty out path");
+        println!("{{\"ok\":false,\"error\":\"empty out path\"}}");
+        return 1;
+    }
+    let result = (|| -> Result<(), String> {
+        let img = image::open(in_path).map_err(|e| format!("open {in_path}: {e}"))?;
+        let (iw, ih) = (img.width() as i64, img.height() as i64);
+        let x0 = x.max(0).min((iw - 1).max(0));
+        let y0 = y.max(0).min((ih - 1).max(0));
+        let cw = if w <= 0 { iw - x0 } else { w.min(iw - x0) };
+        let ch = if h <= 0 { ih - y0 } else { h.min(ih - y0) };
+        if cw <= 0 || ch <= 0 {
+            return Err("empty crop region".to_string());
+        }
+        let sub = img.crop_imm(x0 as u32, y0 as u32, cw as u32, ch as u32);
+        sub.save(out_path).map_err(|e| format!("save {out_path}: {e}"))?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            let esc = out_path.replace('\\', "\\\\").replace('"', "\\\"");
+            println!("{{\"ok\":true,\"out\":\"{esc}\"}}");
+            0
+        }
+        Err(msg) => {
+            eprintln!("crop-image: {msg}");
+            let esc = msg.replace('\\', "\\\\").replace('"', "\\\"");
+            println!("{{\"ok\":false,\"error\":\"{esc}\"}}");
+            1
+        }
+    }
+}
+
+/// P1 migration: one-shot GDI/WGC capture for `scripts/gdi-capture.ps1` parity. Reuses the
+/// helper's `capture::capture_hwnd` (WGC -> GDI ladder, nudge, overlay masking — a superset of
+/// the ps1's GDI-only PrintWindow), converts the returned JPEG frame to PNG, writes OutPath,
+/// and prints one JSON verdict with the same geometry fields gdi-capture.ps1 emitted.
+fn run_gdi_capture_oneshot(hwnd: isize, out_path: &str) -> i32 {
+    if out_path.is_empty() {
+        eprintln!("gdi-capture: empty out path");
+        println!("{{\"ok\":false,\"error\":\"empty out path\"}}");
+        return 1;
+    }
+    let frame = match capture::capture_hwnd(hwnd) {
+        Ok(f) => f,
+        Err(e) => {
+            let msg = e.to_string();
+            eprintln!("gdi-capture: {msg}");
+            let esc = msg.replace('\\', "\\\\").replace('"', "\\\"");
+            println!("{{\"ok\":false,\"error\":\"{esc}\"}}");
+            return 1;
+        }
+    };
+    // CaptureFrame carries JPEG bytes; decode then re-encode as PNG so the caller's
+    // image/png assumption (frameObservation) holds unchanged.
+    let img = match image::load_from_memory(&frame.jpeg_bytes) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("gdi-capture: decode frame: {e}");
+            println!("{{\"ok\":false,\"error\":\"decode frame failed\"}}");
+            return 1;
+        }
+    };
+    if let Err(e) = img.save(out_path) {
+        eprintln!("gdi-capture: save {out_path}: {e}");
+        let esc = format!("save {out_path}: {e}").replace('\\', "\\\\").replace('"', "\\\"");
+        println!("{{\"ok\":false,\"error\":\"{esc}\"}}");
+        return 1;
+    }
+    let bytes = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+    let (w, h) = (frame.logical_w, frame.logical_h);
+    // Screen metrics for the oversize check (matches gdi-capture.ps1's GetSystemMetrics(0/1)).
+    let (sw, sh) = unsafe {
+        (
+            windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
+            ),
+            windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN,
+            ),
+        )
+    };
+    let oversize = sw > 0 && sh > 0 && (frame.phys_w > sw || frame.phys_h > sh);
+    println!(
+        "{{\"ok\":true,\"nudged\":true,\"width\":{w},\"height\":{h},\"bytes\":{bytes},\
+\"window\":{{\"left\":{ol},\"top\":{ot},\"width\":{w},\"height\":{h}}},\
+\"screen\":{{\"width\":{sw},\"height\":{sh}}},\"oversize\":{os}}}",
+        ol = frame.origin_x,
+        ot = frame.origin_y,
+        os = if oversize { "true" } else { "false" },
+    );
+    0
+}
+
+/// P1 migration: one-shot interpolated swipe for `scripts/uia-swipe.ps1` parity. Maps
+/// window-relative client points to screen and drives input::swipe_client. Prints one JSON
+/// verdict {ok,from,to} / {ok:false,error} and exits 0/1.
+fn run_swipe_oneshot(hwnd: isize, from: (i32, i32), to: (i32, i32), duration_ms: i32, steps: i32) -> i32 {
+    match input::swipe_client(hwnd, from, to, duration_ms, steps) {
+        Ok(()) => {
+            println!(
+                "{{\"ok\":true,\"from\":\"{}, {}\",\"to\":\"{}, {}\"}}",
+                from.0, from.1, to.0, to.1
+            );
+            0
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            eprintln!("uia-swipe: {msg}");
+            let esc = msg.replace('\\', "\\\\").replace('"', "\\\"");
+            println!("{{\"ok\":false,\"error\":\"{esc}\"}}");
+            1
+        }
     }
 }
 
@@ -434,6 +611,14 @@ fn gate_and_dispatch(
     budget_ms: i64,
 ) -> Result<Value, Error> {
     budget_check(started, budget_ms)?;
+    // AX-WEDGE: publish this request's remaining budget so the accessibility client
+    // bounds every blocking call by it and answers BEFORE the transport kills the
+    // helper. The transport budget stays the outer backstop, not the primary bound.
+    uia::begin_request_budget(if budget_ms > 0 {
+        budget_ms - started.elapsed().as_millis() as i64
+    } else {
+        0
+    });
     // The turn-lifecycle method must stay reachable while the turn is stopped: `end_turn` is
     // the only path that clears the STOPPED latch and deletes the interrupt marker, so routing
     // it through those very checks made the cleanup unreachable exactly when it was needed
@@ -506,6 +691,8 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
                 "ok": true,
                 "overlay": "dsh",
                 "helper": "dsh-computer-use",
+                "revision": BUILD_REVISION,
+                "ime": {"restoreFailures": dsh_computer_use::ime::restore_failure_count()},
                 "native": true,
                 "surface": st.surface,
                 "backend": st.backend,
@@ -515,7 +702,11 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
                 "observation": st.lease_snapshot(),
                 "pipe": pipe::current_name(),
                 "computerUseEnabled": policy::computer_use_enabled(),
-                "capture": {"wgcFramePool": capture::wgc_available(), "jpeg": true, "cachedSessionCount": capture::cached_session_count()},
+                "integrity": {
+                    "helperRid": uia::integrity_rid(std::process::id()),
+                    "helperLabel": uia::integrity_label(uia::integrity_rid(std::process::id())),
+                },
+                "capture": {"wgcFramePool": capture::wgc_available(), "jpeg": true, "cachedSessionCount": capture::cached_session_count(), "coverage": capture::capture_diagnostics()},
                 "dpi": {"aware": true, "scale": dpi::dpi_scale(dpi::window_dpi(hwnd_from_id(0)))},
             }))
         }
@@ -529,6 +720,16 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
                     .unwrap_or_else(|| "computer".into())
             });
             Ok(tools::tools_for_surface(&surface))
+        }
+        // Diagnostic probe: report exactly what the occlusion check sees for a
+        // window, so a "captured the wrong window" report can be rooted instead of
+        // reasoned about from the outside.
+        "probe_coverage" => {
+            let hwnd = json_i64(params, "hwnd")?
+                .map(|v| v as isize)
+                .or_else(|| state.lock().ok().and_then(|st| st.last_window.as_ref().map(|w| w.id as isize)))
+                .ok_or_else(|| Error::type_err("hwnd is required"))?;
+            Ok(capture::coverage_probe(hwnd))
         }
         "prompt" => Ok(json!({"prompt": prompt::native_prompt()})),
         // BR-14: the official host hook `assertBrowserUrlAllowed`. Pure decision, no
@@ -657,6 +858,17 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
             }))
         }
         "get_window_state" => get_window_state(state, params),
+        "fill_form" => {
+            state.lock().map_err(|_| Error::other("state lock"))?.require_fresh()?;
+            fill_form(state, params)
+        }
+        // DSH extension: satisfy the "call get_window_state before continuing" contract
+        // without paying for a capture. The plugin uses it to un-wedge the human-input
+        // monitor on windows Windows Graphics Capture can never frame.
+        "clear_user_input" => {
+            crate::interrupt::clear();
+            Ok(json!({ "cleared": true }))
+        }
         "start_audio_recording" => {
             let duration = StartAudioRecordingParams::from_map(params)?.duration_ms()?;
             audio::start(duration)?;
@@ -671,6 +883,10 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
             state.lock().map_err(|_| Error::other("state lock"))?.require_fresh()?;
             secondary(state, params)
         }
+        "select_text" => {
+            state.lock().map_err(|_| Error::other("state lock"))?.require_fresh()?;
+            select_text(state, params)
+        }
         "click" | "click_element" => {
             state.lock().map_err(|_| Error::other("state lock"))?.require_fresh()?;
             click(state, params, method)
@@ -683,10 +899,84 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
             let window = resolve_window(state, params)?;
             prepare_input(state, &window, WindowUse::Captured)?;
             overlay::show();
-            interrupt::mark_synthetic(0.3);
             // Official `type_text` accepts an empty string: the schema requires the
             // key to be present, not to be non-empty (TC-11).
-            input::paste_text(&require_text_allow_empty(params, "text")?)?;
+            let text = require_text_allow_empty(params, "text")?;
+            if text.is_empty() {
+                return Ok(json!({}));
+            }
+            // F2: `type_text` is a clipboard paste (Ctrl+V). Verify target-scoped, on
+            // the focused control only -- never a window-wide search, which a chat
+            // app that echoes the tool call into its transcript would trivially
+            // "confirm" (the 2026-10-22 false positive), and which costs a full tree
+            // walk on a browser window. Every check goes through
+            // `text_landed_settling` (one immediate pass, one after 300ms) and
+            // returns a four-state verdict.
+            //
+            // Only a *proven* absence fails. A surface that publishes no text at all
+            // (Chromium contenteditable, canvas editors) can never witness the paste,
+            // so its silence counts as success when the focused control inside the
+            // target accepts text. Retrying on that case used to paste the text a
+            // second time and then report a failure the model had to work around.
+            let hwnd = hwnd_from_id(window.id);
+            let wid = window.id as isize;
+            let before_fv = uia::global().focused_value_opt();
+            let _ = activate_hwnd(hwnd);
+            interrupt::mark_synthetic(0.3);
+            input::paste_text_for(Some(wid), &text)?;
+            let mut last = text_landed_settling(wid, &text, &before_fv);
+            if last.failed(wid) {
+                let _ = activate_hwnd(hwnd);
+                // AX-WEDGE anti-doubling: the retry must REPLACE, not append. A
+                // stale/uncommitted read-back (a slow Chromium field that still shows
+                // the pre-paste value, 2026-10-25 QQNT search box) reads as "did not
+                // land", and a second plain Ctrl+V pasted the text a second time at
+                // the cursor. When the focus is a text target inside this window,
+                // select-all first so the retry overwrites whatever did or did not
+                // land; with no editable focus, Ctrl+A could select an arbitrary
+                // surface and the paste would overwrite it, so the retry stays a
+                // plain insert there.
+                if focused_accepts_text(wid) {
+                    let _ = input::press_key_for(Some(wid), "Control_L+a");
+                    thread::sleep(Duration::from_millis(50));
+                }
+                interrupt::mark_synthetic(0.3);
+                input::paste_text_for(Some(wid), &text)?;
+                last = text_landed_settling(wid, &text, &before_fv);
+                if last.failed(wid) {
+                    // Last resort: post WM_PASTE straight to the focused control of
+                    // the target's GUI thread. This bypasses SendInput and helps the
+                    // classic Win32 EDIT case; it does not apply to WinUI/XAML and
+                    // cannot cross a UIPI integrity boundary. Same select-all guard
+                    // as above: the retry must replace, never append.
+                    if focused_accepts_text(wid) {
+                        let _ = input::press_key_for(Some(wid), "Control_L+a");
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    let _ = input::paste_text_via_postmessage(wid, &text);
+                    last = text_landed_settling(wid, &text, &before_fv);
+                    if last.failed(wid) {
+                        // A mangled paste gets its own message: something did land,
+                        // and saying "click into the field" would send the model
+                        // chasing the wrong thing (the classic IME `v`).
+                        if last == Landing::Wrong {
+                            let got = uia::global()
+                                .focused_value_opt()
+                                .or_else(|| uia::global().focused_text())
+                                .unwrap_or_default();
+                            let got = clip(&got, 40);
+                            return Err(Error::desktop(format!(
+                                "type_text landed the wrong text: the field reads {got:?}; \
+                                 an IME or a controlled input likely swallowed the paste \
+                                 (use set_value, or clear the field and type again)"
+                            )));
+                        }
+                        return Err(Error::desktop(
+                            "type_text did not land in the target window; click into the target field first, then retry",
+                        ));
+                    }
+                }
+            }
             Ok(json!({}))
         }
         "press_key" => {
@@ -696,7 +986,9 @@ fn dispatch(state: &Mutex<HelperState>, method: &str, params: &Map<String, Value
             prepare_input(state, &window, WindowUse::Captured)?;
             overlay::show();
             interrupt::mark_synthetic(0.3);
-            input::press_key(&key)?;
+            // Target the window that will receive the chord: the IME guard needs
+            // the owning thread's layout, not the helper's.
+            input::press_key_for(Some(window.id as isize), &key)?;
             Ok(json!({}))
         }
         "drag" => {
@@ -720,6 +1012,284 @@ fn prepare_input(state: &Mutex<HelperState>, window: &WindowRef, use_: WindowUse
         activate_hwnd(hwnd)?;
     }
     Ok(())
+}
+
+/// UIA-pattern actions (perform_secondary_action / native select_text) don't need
+/// foreground focus. Activating the target here would emit a focus event and
+/// invalidate the very element cache the action is about to use, producing
+/// "no cached app state is available for <app>". Keep the freshness/policy
+/// checks but skip activation.
+fn prepare_uia_target(state: &Mutex<HelperState>, window: &WindowRef) -> Result<(), Error> {
+    let hwnd = hwnd_from_id(window.id);
+    let st = state.lock().map_err(|_| Error::other("state lock"))?;
+    st.require_fresh()?;
+    st.require_window_use(window.id, WindowUse::Captured)?;
+    policy::deny_target(&window.app, hwnd, &st.allowed_apps).map_err(Error::desktop)?;
+    Ok(())
+}
+
+/// A value cut to `max` characters for a tool error, with an ellipsis, so a
+/// page's whole text or a huge field value never lands in an error string.
+fn clip(s: &str, max: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= max {
+        return t.to_string();
+    }
+    format!("{}…", t.chars().take(max).collect::<String>())
+}
+
+/// Whether a write's read-back proves the write did NOT take: the control was
+/// readable (`seen`), the value we asked for is non-empty, and the control does
+/// not carry it. `None` = cannot tell (unreadable control, or nothing to write),
+/// which must never be reported as a failure.
+///
+/// Shared by `set_value` and `fill_form`'s `set` step so both agree with
+/// `type_text`: writing something the field then does not show is a failure, not
+/// a success (2026-10-22/23 false successes on React controlled inputs).
+fn write_missed(want: &str, seen: Option<&str>) -> Option<String> {
+    let seen = seen?;
+    if want.is_empty() {
+        return None;
+    }
+    let seen = seen.replace('\r', "");
+    if seen.contains(want) {
+        None
+    } else {
+        Some(seen)
+    }
+}
+
+/// How a paste's landing was determined. Four states, not two.
+///
+/// The old boolean collapsed "we could not read the target's text" into "the text
+/// did not land", which is only correct for controls that publish their content to
+/// UIA. Text surfaces that never do (Chromium `contenteditable`, ProseMirror,
+/// canvas editors, many game/terminal surfaces) therefore answered every
+/// `type_text` with a false failure — observed live 2026-10-22 typing into the
+/// DSH composer. Reporting a failure requires *proof*; an unreadable target is
+/// not proof.
+///
+/// The reverse trap is just as bad: a control that publishes its text and *changed*
+/// is not proof that our text landed. A clipboard paste eaten by an IME leaves a
+/// stray character (`v` is the classic one), the value did change, and the old
+/// check called that a success — observed live 2026-10-23 typing `E2E-FWD-…`
+/// into a React input and reading back `Value: v`. So a change is only proof when
+/// the new value carries the typed text; otherwise it is proof of the opposite
+/// (`Wrong`), which must fail loudly rather than masquerade as `ok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Landing {
+    /// Positive evidence the text is there.
+    Landed,
+    /// Positive evidence it is NOT there: the target publishes text, and neither
+    /// the window dump nor the focused value contains it.
+    Absent,
+    /// Positive evidence something *else* landed: the target publishes text and it
+    /// changed, but does not carry what we typed (a mangled paste).
+    Wrong,
+    /// The target publishes no readable text, so neither conclusion is provable.
+    Unverifiable,
+}
+
+/// The signals a landing check collects, in the order they are consulted.
+///
+/// Kept as a plain struct so the verdict is a pure function over synthetic
+/// inputs — testable without a live window, and free of the brittle source-text
+/// assertions that used to pin its shape.
+#[derive(Debug, Clone, Default)]
+struct LandingSignals {
+    /// The focused control's node text (its `Value`, else its `Name`).
+    node_text: Option<String>,
+    /// The focused control's TextPattern range text. `None` for a whole-window
+    /// container, whose range would span the entire page.
+    range_text: Option<String>,
+    /// The focused control's value before the paste.
+    before_value: Option<String>,
+    /// The focused control's value after the paste.
+    after_value: Option<String>,
+    /// The focused element covers (nearly) the whole window, so it is a container
+    /// rather than a text target.
+    container_focus: bool,
+}
+
+/// The landing verdict, decided from the *focused control only*.
+///
+/// Deliberately never searches the window. A window-wide text search cannot
+/// witness a paste in any app that renders the agent's own tool call back into
+/// its UI (a chat transcript, a log pane): the typed string ends up on screen
+/// through the echo, so "the window contains the text" is trivially true even
+/// when the paste went nowhere. That was the 2026-10-22 false positive. Scoping
+/// the check to the focused control is both correct and far cheaper than a tree
+/// walk.
+///
+/// `None` means the signals could not decide.
+fn landing_from(signals: &LandingSignals, text: &str) -> Option<Landing> {
+    // 1. The focused control's own node text.
+    if let Some(current) = &signals.node_text {
+        if current.contains(text) {
+            return Some(Landing::Landed);
+        }
+    }
+    // 2. The focused value changed to a non-empty value, *and carries the text we
+    // typed*. A change alone is not proof: an IME that swallows the paste leaves a
+    // stray character behind, the value did change, and calling that a success is
+    // the 2026-10-23 false positive (typed `E2E-FWD-…`, read back `v`). Only
+    // meaningful when we had a concrete readable value before; never treat
+    // "unreadable before, readable after" as landed — that is just focus moving to
+    // an empty control.
+    match (&signals.before_value, &signals.after_value) {
+        (Some(b), Some(a)) if a != b && !a.is_empty() => {
+            return Some(if a.contains(text) {
+                Landing::Landed
+            } else {
+                Landing::Wrong
+            })
+        }
+        _ => {}
+    }
+    // 3. The focused control's text range. This is the signal that works for
+    // surfaces whose content is *not* a node `Value`/`Name` — a Chromium
+    // `contenteditable`, ProseMirror, a Word document. Those publish their text
+    // only through TextPattern, so neither a node check nor a tree walk sees it.
+    if let Some(current) = &signals.range_text {
+        if current.contains(text) {
+            return Some(Landing::Landed);
+        }
+    }
+    // 3.5. The focused value is byte-identical to the pre-paste value. On a slow
+    // Chromium field the paste commits asynchronously and the read-back still
+    // shows the pre-paste state, so "unchanged" is what a STALE read looks like
+    // -- it is not proof the paste failed (2026-10-25, QQNT search box: the
+    // paste landed, the first read returned the pre-paste empty value, the old
+    // code called it Absent, the retry appended a second copy, and the doubled
+    // text is something the caller cannot undo). An unchanged read-back that no
+    // positive signal witnessed is honestly "cannot tell"; the caller reports
+    // success when the focus is editable and re-observes otherwise.
+    if let (Some(before), Some(after)) = (&signals.before_value, &signals.after_value) {
+        if before == after {
+            return Some(Landing::Unverifiable);
+        }
+    }
+    // 4. The focused control publishes no text whatsoever -> the surface keeps
+    // its content private, so no UIA read can witness the paste.
+    if signals.node_text.is_none() && signals.range_text.is_none() {
+        return Some(Landing::Unverifiable);
+    }
+    // 5. The focus is a whole-window container. It is not a text target, so its
+    // content says nothing about where the paste went: a browser page root
+    // reports the whole page, which includes any echo. Cannot conclude.
+    if signals.container_focus {
+        return Some(Landing::Unverifiable);
+    }
+    // 6. A real control that publishes text, and not ours: proven absence.
+    Some(Landing::Absent)
+}
+
+/// Collect the cheap (element-query only) signals for the focused control.
+///
+/// No window dump: every signal here is a property read on one element, which is
+/// what keeps `type_text` fast on a browser/Electron window.
+fn collect_focused_signals(wid: isize, before_fv: &Option<String>) -> LandingSignals {
+    LandingSignals {
+        node_text: uia::global().focused_text(),
+        range_text: uia::global().focused_text_range_text(wid),
+        before_value: before_fv.clone(),
+        after_value: uia::global().focused_value_opt(),
+        container_focus: uia::global()
+            .focused_is_window_container(wid)
+            .unwrap_or(false),
+    }
+}
+
+/// The landing verdict for a paste into `wid`.
+fn text_landed(wid: isize, text: &str, before_fv: &Option<String>) -> Landing {
+    let signals = collect_focused_signals(wid, before_fv);
+    landing_from(&signals, text).unwrap_or(Landing::Absent)
+}
+
+/// How long a *failed* landing check waits before re-reading the surface.
+///
+/// Web documents (Electron / WebView / CEF) commit the pasted text asynchronously:
+/// the first read still shows the old DOM, so a correct paste reads as "did not
+/// land". 300ms is long enough for the renderer to commit on this machine and
+/// short enough to stay inside the tool budget.
+const LANDING_SETTLE_MS: u64 = 300;
+
+/// [`text_landed`], re-read once after [`LANDING_SETTLE_MS`] when the first pass
+/// said `Absent`.
+///
+/// `Absent` means "readable control, text missing", and a slow commit is
+/// exactly that case. An `Unverifiable` whose *before* value was readable gets
+/// the same second look (audit P1-3, 2026-10-25): a stale asynchronous commit
+/// reads exactly like a swallowed paste — the focused value is unchanged — and
+/// one settle read can upgrade it to a proven `Landed`/`Wrong` instead of a
+/// silent success. An `Unverifiable` from an unreadable target (`before` is
+/// `None`) can never change no matter how long we wait, so it returns
+/// immediately — which is what keeps a `type_text` into a web document fast.
+fn text_landed_settling(wid: isize, text: &str, before_fv: &Option<String>) -> Landing {
+    let first = text_landed(wid, text, before_fv);
+    // A wrong landing is settled too, and not by waiting: what is there is not
+    // what we typed. Re-reading would only paste it again, so return at once and
+    // let the caller report it.
+    let retry_unverifiable = first == Landing::Unverifiable && before_fv.is_some();
+    if first != Landing::Absent && !retry_unverifiable {
+        return first;
+    }
+    std::thread::sleep(Duration::from_millis(LANDING_SETTLE_MS));
+    match text_landed(wid, text, before_fv) {
+        Landing::Landed => Landing::Landed,
+        // A proven wrong landing must surface, not hide behind Unverifiable's
+        // "counts as success when the focus accepts text".
+        proven @ Landing::Wrong if retry_unverifiable => proven,
+        _ => first,
+    }
+}
+
+impl Landing {
+    /// Keep the more informative verdict when two passes disagree.
+    fn max_by_confidence(self, other: Landing) -> Landing {
+        match (self, other) {
+            (Landing::Landed, _) | (_, Landing::Landed) => Landing::Landed,
+            (Landing::Unverifiable, _) | (_, Landing::Unverifiable) => Landing::Unverifiable,
+            // A mangled paste outranks a plain absence: "wrong text is there" is
+            // strictly more informative than "nothing is there".
+            (Landing::Wrong, _) | (_, Landing::Wrong) => Landing::Wrong,
+            _ => Landing::Absent,
+        }
+    }
+
+    /// Whether the paste should be reported as failed, given whether the focused
+    /// control inside the target accepts text.
+    ///
+    /// Only a *proven* absence fails — or a proven wrong landing (`Wrong`), which
+    /// fails whatever the focus looks like: something did land and it is not what
+    /// was typed, so reporting success would be a lie. An unverifiable target
+    /// whose focus accepts text counts as success: the paste ran, and the only
+    /// surface that could receive it was editable.
+    fn failed_with(self, focus_accepts_text: bool) -> bool {
+        match self {
+            Landing::Landed => false,
+            Landing::Absent => true,
+            Landing::Wrong => true,
+            Landing::Unverifiable => !focus_accepts_text,
+        }
+    }
+
+    /// [`failed_with`], resolving the "does the focus accept text" question.
+    ///
+    /// The window scoping matters: a paste is only meaningful if the focus it
+    /// landed on belongs to the target, otherwise "editable somewhere on the
+    /// desktop" would excuse a genuine miss.
+    fn failed(self, wid: isize) -> bool {
+        self.failed_with(focused_accepts_text(wid))
+    }
+}
+
+/// Whether the foreground focus is a text-accepting control *inside* `wid`.
+fn focused_accepts_text(wid: isize) -> bool {
+    if uia::global().focused_window_id() != Some(wid) {
+        return false;
+    }
+    uia::global().focused_is_editable().unwrap_or(false)
 }
 
 fn flag(params: &Map<String, Value>, key: &str, default: bool) -> bool {
@@ -760,6 +1330,15 @@ fn get_window_state(state: &Mutex<HelperState>, params: &Map<String, Value>) -> 
     let window = resolve_window(state, params)?;
     let hwnd = hwnd_from_id(window.id);
     require_observable_window(hwnd)?;
+    // An observation request satisfies the "call get_window_state before continuing"
+    // contract, so it must clear the human-input flag HERE — before the capture can
+    // fail. It used to be cleared only in `remember_capture`, i.e. after a successful
+    // frame, which meant a window Windows Graphics Capture can never frame (static
+    // page, window larger than the desktop, covered window) kept the flag forever and
+    // every later click/scroll answered "user input was detected in this window" with
+    // no way out. Measured on the moxueyuan PDF chapter page: dirty stayed true through
+    // a text-only and a screenshot observation, and scroll_to could not run at all.
+    crate::interrupt::clear();
     overlay::exclude_overlay_from_capture();
     for h in overlay::hwnds() {
         capture::register_overlay_hwnd(h);
@@ -811,21 +1390,34 @@ fn get_window_state(state: &Mutex<HelperState>, params: &Map<String, Value>) -> 
     let mut nodes = Vec::new();
     let mut full_tree = String::new();
     if include_text {
-        let dumped = uia::global()
-            .dump(window.id as isize, &window.title, origin, scale)
-            .map_err(Error::desktop)?;
-        full_tree = uia::format_accessibility(&dumped, &window.title, &window.app);
-        nodes = dumped.nodes.clone();
-        // TC-03/AX-04: the official `accessibility.tree` always carries the FULL
-        // formatted tree, and `WindowState.d.ts` has no `diff` field. DSH used to
-        // substitute an accessibility diff for the tree and emit a non-official `diff`
-        // boolean, which made the field mean something other than the official schema.
-        //
-        // AX-05/AX-07: `uia::AccessibilityDump::to_json` applies the official
-        // serialisation rules (absent optional fields are omitted, and the official
-        // `meta` keys appear only when the tree was actually truncated).
-        let _ = disable_diffing;
-        accessibility = dumped.to_json(&full_tree);
+        // AX-WEDGE degraded observation: the screenshot is already captured, so a
+        // dump that cannot answer (a wedged UIA provider, a spent budget) must not
+        // fail the request -- that used to cost the whole helper process at the
+        // transport budget, and with it the coordinate path this observation feeds.
+        // The error travels in `accessibility` instead; the model keeps the screenshot
+        // and coordinate actions while the element list is empty.
+        match uia::global().dump(window.id as isize, &window.title, origin, scale) {
+            Ok(dumped) => {
+                full_tree = uia::format_accessibility(&dumped, &window.title, &window.app);
+                nodes = dumped.nodes.clone();
+                // TC-03/AX-04: the official `accessibility.tree` always carries the FULL
+                // formatted tree, and `WindowState.d.ts` has no `diff` field. DSH used to
+                // substitute an accessibility diff for the tree and emit a non-official `diff`
+                // boolean, which made the field mean something other than the official schema.
+                //
+                // AX-05/AX-07: `uia::AccessibilityDump::to_json` applies the official
+                // serialisation rules (absent optional fields are omitted, and the official
+                // `meta` keys appear only when the tree was actually truncated).
+                let _ = disable_diffing;
+                accessibility = dumped.to_json(&full_tree);
+            }
+            Err(err) => {
+                accessibility = serde_json::json!({
+                    "tree": String::new(),
+                    "error": err,
+                });
+            }
+        }
     }
     let mut screenshots = Vec::new();
     let mut st = state.lock().map_err(|_| Error::other("state lock"))?;
@@ -1022,6 +1614,15 @@ fn diagnostic_state(state: &Mutex<HelperState>) -> Result<Value, Error> {
             body["processId"] = json!(pid);
         }
         body["aumid"] = json!(policy::process_aumid(pid));
+        let helper_rid = uia::integrity_rid(std::process::id());
+        let target_rid = if pid != 0 { uia::integrity_rid(pid) } else { None };
+        body["integrity"] = json!({
+            "helperRid": helper_rid,
+            "helperLabel": uia::integrity_label(helper_rid),
+            "targetRid": target_rid,
+            "targetLabel": uia::integrity_label(target_rid),
+            "targetHigher": matches!((target_rid, helper_rid), (Some(t), Some(h)) if t > h),
+        });
         if hwnd != 0 {
             if let Ok((x, y, width, height)) = window_rect(hwnd_from_id(hwnd)) {
                 body["bounds"] = json!({ "x": x, "y": y, "width": width, "height": height });
@@ -1035,6 +1636,7 @@ fn diagnostic_state(state: &Mutex<HelperState>) -> Result<Value, Error> {
         // Catalog timing: the one Computer Use method that can run for seconds on a cold
         // machine, and the one the transport's 10 s budget turns into a helper restart.
         body["appCatalog"] = app_catalog::catalog_diagnostics();
+        body["uiaWedge"] = uia::wedge_diagnostics();
         body["computerUseEnabled"] = json!(policy::computer_use_enabled());
         body["overlayState"] = overlay::diagnostics();
         body["captureState"] = capture::capture_diagnostics();
@@ -1049,23 +1651,267 @@ fn diagnostic_state(state: &Mutex<HelperState>) -> Result<Value, Error> {
     Ok(body)
 }
 
+/// Diagnostic for a batch entry that names no method.
+///
+/// A missing or empty `name` used to fall through to `dispatch`, whose official
+/// diagnostic is `dsh_computer_use::protocol::UNSUPPORTED_METHOD_PREFIX` *with
+/// nothing after it* (`unsupported method: `) -- which reads like a helper bug
+/// rather than "this entry has no name". A *non-empty* unknown name keeps the
+/// official string (TC-14 parity); only the nameless case gets this message.
+const BATCH_ACTION_NAME_REQUIRED: &str = "each action needs a non-empty string \"name\" and an \"arguments\" object, e.g. {\"name\":\"press_key\",\"arguments\":{\"window\":{...},\"key\":\"Return\"}}; an item written as {\"action\":...} names no method to run";
+
+/// The method a batch entry names, or why it cannot be dispatched.
+///
+/// Extracted from [`batch_actions`] so the guard is testable without a live
+/// `HelperState` (the rest of that function needs a `Mutex<HelperState>`).
+fn batch_action_name(action: &Value) -> Result<&str, &'static str> {
+    match action.get("name").and_then(Value::as_str) {
+        Some(name) if !name.trim().is_empty() => Ok(name),
+        _ => Err(BATCH_ACTION_NAME_REQUIRED),
+    }
+}
+
 fn batch_actions(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<Value, Error> {
     let Some(Value::Array(actions)) = params.get("actions") else {
         return Err(Error::type_err("actions array required"));
     };
     let mut results = Vec::new();
-    for action in actions {
-        let name = action.get("name").and_then(Value::as_str).unwrap_or("");
+    for (index, action) in actions.iter().enumerate() {
+        // Name the offending index instead of dispatching "": see
+        // `batch_action_name` for why the official prefix alone is a dead end.
+        let name = match batch_action_name(action) {
+            Ok(name) => name,
+            Err(message) => {
+                results.push(json!({"ok": false, "index": index, "error": message}));
+                continue;
+            }
+        };
         let arguments = match action.get("arguments") {
             Some(Value::Object(map)) => map.clone(),
             _ => Map::new(),
         };
+        // `index` rides along on both arms: two actions of the same method are
+        // otherwise indistinguishable in the results list.
         match dispatch(state, name, &arguments) {
-            Ok(v) => results.push(json!({"ok": true, "name": name, "value": v})),
-            Err(e) => results.push(json!({"ok": false, "name": name, "error": e.message})),
+            Ok(v) => results.push(json!({"ok": true, "index": index, "name": name, "value": v})),
+            Err(e) => results.push(json!({"ok": false, "index": index, "name": name, "error": e.message})),
         }
     }
     Ok(json!({"results": results}))
+}
+
+/// `json!` yields `serde_json::Value`; the internal dispatch helpers take
+/// `&Map<String, Value>`. This narrows without cloning when it can.
+fn as_map(value: Value) -> Map<String, Value> {
+    match value {
+        Value::Object(map) => map,
+        other => {
+            let mut map = Map::new();
+            map.insert("_".to_string(), other);
+            map
+        }
+    }
+}
+
+/// Atomic form fill: one call, several field operations, one observation.
+///
+/// Motivation (2026-10-19, WorkBuddy login): filling a three-field login form
+/// through the plain act-and-refresh loop cost 6-8 model round-trips, each one
+/// re-uploading a full screenshot. A `fill_form` collapses that into a single
+/// tool call whose result already contains the post-fill accessibility state.
+///
+/// Semantics are deliberately *replace*, not insert: every `set` runs through
+/// the same `set_value` path (select-all + write + readback verify), so a field
+/// that already holds a stale value can never end up as "old + new".
+///
+/// Steps are ordered and stop at the first failure, unless `continue_on_error`
+/// is set — a half-filled form is easier to report than a silently wrong one.
+fn fill_form(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<Value, Error> {
+    let window = resolve_window(state, params)?;
+    prepare_input(state, &window, WindowUse::Captured)?;
+    let Some(Value::Array(steps)) = params.get("fields") else {
+        return Err(Error::type_err("fields array required"));
+    };
+    if steps.is_empty() {
+        return Err(Error::type_err("fields array must not be empty"));
+    }
+    let continue_on_error = params
+        .get("continue_on_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // Establish (or re-establish) this window's element cache before the first
+    // step. A composite fill often runs right after an observation of a
+    // *different* window (a `batch_actions` refresh, the overlay, a popup); the
+    // per-step `set_value` then fails with "element N has no cached bounds" or
+    // "last get_window_state was window id X" even though the caller did observe
+    // the form. Running the real observation here is what makes `fill_form`
+    // self-sufficient — and it is the same node table the steps then index into.
+    //
+    // BUT: every walk renumbers the nodes from zero, and this refresh happens
+    // *after* the caller read its indices off its own snapshot. Writing a value
+    // makes a live page insert or remove siblings (a resend countdown, a clear
+    // button, an error line), so the numbering shifts and the index that named
+    // the verification-code box in the caller's snapshot can name the
+    // phone-number box in ours. Observed live on the TapTap desktop login form
+    // (2026-10-20): a two-step `fill_form` wrote the verification code into the
+    // phone field, and both steps still reported `ok`.
+    //
+    // So carry the caller's indices across the refresh as runtime ids: read each
+    // step's runtime id from the cache as it stands (the caller's snapshot, when
+    // it is still the live one), walk, then map the id back to the fresh index.
+    // A control that left the tree is reported as a failed step rather than
+    // silently retargeted — acting on the wrong control is worse than acting on
+    // none.
+    let mut carried: Vec<Option<Vec<i32>>> = Vec::with_capacity(steps.len());
+    for step in steps.iter() {
+        let runtime_id = step
+            .as_object()
+            .and_then(|s| s.get("element_index"))
+            .and_then(Value::as_i64)
+            .and_then(|i| uia::global().runtime_id(i as i32).ok())
+            .filter(|id| !id.is_empty());
+        carried.push(runtime_id);
+    }
+
+    let refresh = json!({
+        "window": window.to_json(),
+        "include_screenshot": false,
+        "include_text": true,
+    });
+    get_window_state(state, &as_map(refresh))?;
+
+    let mut results: Vec<Value> = Vec::new();
+    let mut failed = false;
+
+    for (i, step) in steps.iter().enumerate() {
+        if failed && !continue_on_error {
+            break;
+        }
+        let Some(step) = step.as_object() else {
+            results.push(json!({"ok": false, "index": i, "error": "field entry must be an object"}));
+            failed = true;
+            continue;
+        };
+        // `element_index` is the canonical handle (from get_window_state). `text`
+        // is a convenience that resolves against the last observation.
+        let Some(index) = step.get("element_index").and_then(Value::as_i64) else {
+            results.push(json!({"ok": false, "index": i, "error": "element_index is required"}));
+            failed = true;
+            continue;
+        };
+        // Re-resolve the caller's index against the post-refresh numbering.
+        let index = match carried.get(i).and_then(Option::as_ref) {
+            Some(runtime_id) => match uia::global().index_of(runtime_id) {
+                Ok(Some(fresh)) => fresh as i64,
+                Ok(None) => {
+                    results.push(json!({
+                        "ok": false, "index": i, "element_index": index,
+                        "error": format!(
+                            "element {index} left the tree while filling (the page re-rendered it); re-observe and retry"
+                        ),
+                    }));
+                    failed = true;
+                    continue;
+                }
+                Err(e) => {
+                    results.push(json!({
+                        "ok": false, "index": i, "element_index": index, "error": e,
+                    }));
+                    failed = true;
+                    continue;
+                }
+            },
+            // No runtime id to carry (the caller's snapshot was already gone):
+            // fall back to the raw index, which at least matches a fresh
+            // observation taken immediately before the call.
+            None => index,
+        };
+        let value = step.get("value").and_then(Value::as_str);
+        let kind = step
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or(if value.is_some() { "set" } else { "click" });
+
+        let outcome = match kind {
+            "set" | "value" => {
+                let Some(value) = value else {
+                    return Err(Error::type_err("action \"set\" needs a value"));
+                };
+                set_value(
+                    state,
+                    &as_map(json!({"window": window.to_json(), "element_index": index, "value": value})),
+                )
+            }
+            "check" => dispatch(
+                state,
+                "perform_secondary_action",
+                &as_map(json!({"window": window.to_json(), "element_index": index, "action": "Check"})),
+            ),
+            "click" => dispatch(
+                state,
+                "click",
+                &as_map(json!({"window": window.to_json(), "element_index": index})),
+            ),
+            "press" => {
+                let key = step.get("key").and_then(Value::as_str).unwrap_or("Return");
+                dispatch(
+                    state,
+                    "press_key",
+                    &as_map(json!({"window": window.to_json(), "key": key})),
+                )
+            }
+            other => Err(Error::type_err(format!("unsupported field action: {other}"))),
+        };
+
+        match outcome {
+            Ok(v) => {
+                // Read-back verification for writes. A `set` that reports success
+                // while the field kept its old (or empty) value is the 2026-10-22
+                // React false success: UIA ValuePattern accepted the write, the
+                // controlled input discarded it, and the tool answered `filled: 2`
+                // with both fields blank (a login form got the code in the phone
+                // box). `value_at` reads the element's *rendered* text when it has
+                // one, so a discarded write is caught here and named, not counted
+                // as filled. A control that publishes nothing stays unverifiable
+                // and is reported as before — we only fail on proof.
+                let mut wrong: Option<String> = None;
+                if let (true, Some(want)) = (matches!(kind, "set" | "value"), value) {
+                    let seen = uia::global().value_at(window.id as isize, index as i32);
+                    wrong = write_missed(want, seen.as_deref());
+                }
+                match wrong {
+                    Some(seen) => {
+                        results.push(json!({
+                            "ok": false, "index": i, "action": kind, "element_index": index,
+                            "error": format!(
+                                "the field did not keep the value: it reads {:?}; a controlled input or an IME likely discarded it (use type_text, or clear the field and retry)",
+                                crate::clip(&seen, 40)
+                            ),
+                        }));
+                        failed = true;
+                    }
+                    None => results.push(json!({"ok": true, "index": i, "action": kind, "element_index": index, "value": v})),
+                }
+            }
+            Err(e) => {
+                results.push(json!({
+                    "ok": false, "index": i, "action": kind, "element_index": index,
+                    "error": e.message,
+                }));
+                failed = true;
+            }
+        }
+    }
+
+    let filled = results.iter().filter(|r| r["ok"] == Value::Bool(true)).count();
+    Ok(json!({
+        "ok": !failed,
+        "fields": results.len(),
+        "filled": filled,
+        "stoppedEarly": failed && !continue_on_error,
+        "results": results,
+    }))
 }
 
 fn set_value(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<Value, Error> {
@@ -1076,7 +1922,21 @@ fn set_value(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<
     // non-empty requirement.
     let value = require_text_allow_empty(params, "value")?;
     match uia::global().set_value(window.id as isize, index, &value) {
-        Ok(()) => Ok(json!({})),
+        Ok(()) => {
+            // Even a UIA SetValue that reported success is verified: a controlled
+            // input may accept the write into the UIA value model and then render
+            // something else (2026-10-23: `Value: v` was reported as ok). Only a
+            // readable-and-wrong field fails; an unreadable one still passes.
+            if let Some(seen) = uia::global().value_at(window.id as isize, index) {
+                if let Some(seen) = write_missed(&value, Some(&seen)) {
+                    return Err(Error::desktop(format!(
+                        "set_value did not take: the field reads {:?}; a controlled input or an IME likely discarded it (clear the field and retry, or use type_text)",
+                        clip(&seen, 40)
+                    )));
+                }
+            }
+            Ok(json!({}))
+        }
         Err(e) if e.contains("not settable") => Err(Error::type_err(e)),
         Err(e) if e.contains("no longer matches") || e.contains("no longer belongs") => Err(Error::desktop(e)),
         Err(_) => {
@@ -1096,7 +1956,21 @@ fn set_value(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<
             let _ = overlay::position_for("set_value", px as f32, py as f32, true);
             interrupt::mark_synthetic(0.3);
             input::move_click(px, py, "left", 1)?;
-            input::paste_text(&value)?;
+            // Replace, never insert: a bare paste lands at the caret and produces
+            // "old value + new text" instead of the value the caller asked for.
+            input::replace_text_for(Some(window.id as isize), &value)?;
+            // Verify the fallback path too: a paste into a controlled input can be
+            // swallowed by an IME and leave a stray character (`v`), and the old
+            // code returned ok unconditionally here (2026-10-23 false success).
+            // Only fail on proof; an unreadable control stays ok.
+            if let Some(seen) = uia::global().value_at(window.id as isize, index) {
+                if let Some(seen) = write_missed(&value, Some(&seen)) {
+                    return Err(Error::desktop(format!(
+                        "set_value wrote the wrong text: the field reads {:?}; an IME or a controlled input likely swallowed the write (clear the field and retry, or use type_text)",
+                        clip(&seen, 40)
+                    )));
+                }
+            }
             Ok(json!({}))
         }
     }
@@ -1104,18 +1978,70 @@ fn set_value(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<
 
 fn secondary(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<Value, Error> {
     let window = resolve_window(state, params)?;
-    prepare_input(state, &window, WindowUse::Captured)?;
+    prepare_uia_target(state, &window)?;
     let index = json_i64(params, "element_index")?.ok_or_else(|| Error::type_err("element_index is required"))? as i32;
     let action = require_text(params, "action")?;
-    uia::global()
-        .secondary(window.id as isize, index, &action)
-        .map_err(|e| {
-            if e.contains("has no cached") || e.contains("unsupported secondary") {
-                Error::key(e)
-            } else {
-                Error::desktop(e)
+    // Rebuild the UIA element cache immediately before the pattern call. Focus
+    // and foreground events (including the observation overlay) bump the
+    // invalidation generation, which clears the cached IUIAutomationElement map;
+    // a UIA pattern action does not need a new observation, but it does need the
+    // cached element, so refresh without activating the window.
+    let hwnd = hwnd_from_id(window.id);
+    if let Ok((ox, oy, _w, _h)) = window_rect(hwnd) {
+        let dpi = dpi::window_dpi(hwnd);
+        let scale = dpi::dpi_scale(dpi);
+        let _ = uia::global().dump(window.id as isize, &window.title, (ox as f64, oy as f64), scale);
+    }
+    match uia::global().secondary(window.id as isize, index, &action) {
+        Ok(()) => Ok(json!({})),
+        Err(e) => {
+            // Some providers (notably Win11 Notepad's RichEditBox) advertise
+            // Scroll Up/Down but return an error from IUIAutomationScrollPattern.
+            // Fall back to a real wheel scroll at the element center, matching
+            // the coordinate scroll path.
+            let key = action.trim().to_ascii_lowercase();
+            let scroll_key = matches!(key.as_str(), "scroll up" | "scroll down" | "scroll left" | "scroll right");
+            if scroll_key && e.contains("perform UIA secondary action") {
+                if let Ok(bounds) = uia::global().cached_bounds(index) {
+                    let (px, py) = bounds.center();
+                    let delta = 600.0;
+                    let (sx, sy) = match key.as_str() {
+                        "scroll up" => (0.0, -delta),
+                        "scroll down" => (0.0, delta),
+                        "scroll left" => (-delta, 0.0),
+                        _ => (delta, 0.0),
+                    };
+                    overlay::show();
+                    let _ = overlay::position_for(&action, px as f32, py as f32, false);
+                    input::scroll_at(px, py, sx, sy)?;
+                    return Ok(json!({}));
+                }
             }
-        })?;
+            let msg = format!("[rust-secondary] {e}");
+            if e.contains("has no cached") || e.contains("unsupported secondary") {
+                Err(Error::key(msg))
+            } else {
+                Err(Error::desktop(msg))
+            }
+        }
+    }
+}
+
+fn select_text(state: &Mutex<HelperState>, params: &Map<String, Value>) -> Result<Value, Error> {
+    let window = resolve_window(state, params)?;
+    prepare_uia_target(state, &window)?;
+    let index = json_i64(params, "element_index")?
+        .ok_or_else(|| Error::type_err("element_index is required"))? as i32;
+    let text = require_text(params, "text")?;
+    let hwnd = hwnd_from_id(window.id);
+    if let Ok((ox, oy, _w, _h)) = window_rect(hwnd) {
+        let dpi = dpi::window_dpi(hwnd);
+        let scale = dpi::dpi_scale(dpi);
+        let _ = uia::global().dump(window.id as isize, &window.title, (ox as f64, oy as f64), scale);
+    }
+    uia::global()
+        .select_text(window.id as isize, index, &text)
+        .map_err(Error::desktop)?;
     Ok(json!({}))
 }
 
@@ -1511,6 +2437,353 @@ mod tests {
         assert_eq!(required_delta(map, "scrollY").unwrap(), -120.0);
     }
 
+    // The landing verdict is a pure function over collected signals, so the whole
+    // decision table is testable without a live window.
+    //
+    // The case that motivated it (2026-10-22, DSH composer): a Chromium
+    // `contenteditable` publishes its text through TextPattern only — its node
+    // Value/Name are empty and the window dump does not contain the typed text —
+    // so the pre-fix boolean check reported every paste as "did not land".
+    #[test]
+    fn landing_prefers_proof_over_silence() {
+        // A native edit box that exposes its value: proven landed.
+        let native = LandingSignals {
+            node_text: Some("hello world".into()),
+            after_value: Some("hello world".into()),
+            ..Default::default()
+        };
+        assert_eq!(landing_from(&native, "hello"), Some(Landing::Landed));
+
+        // A contenteditable: node text empty, but the text range carries the text.
+        let editable = LandingSignals {
+            node_text: None,
+            range_text: Some("draft: hello".into()),
+            ..Default::default()
+        };
+        assert_eq!(landing_from(&editable, "hello"), Some(Landing::Landed));
+
+        // A control that publishes nothing at all cannot witness the paste.
+        let opaque = LandingSignals::default();
+        assert_eq!(landing_from(&opaque, "hello"), Some(Landing::Unverifiable));
+
+        // A real control that publishes text, but not ours: proven absent.
+        let absent = LandingSignals {
+            node_text: Some("Copy".into()),
+            ..Default::default()
+        };
+        assert_eq!(landing_from(&absent, "hello"), Some(Landing::Absent));
+    }
+
+    // A whole-window container must never be read as a witness. This is the
+    // 2026-10-22 false positive: the focus sat on the browser's `RootWebArea`,
+    // whose TextPattern range is the entire page — and the page contained the
+    // agent's own tool-call echo (`type_text · SHOULD-NOT-LAND`), so a page-wide
+    // search "confirmed" a paste that went nowhere.
+    #[test]
+    fn a_window_container_is_not_a_landing_witness() {
+        // Container focus: publishes text (its title), no usable range, covers the
+        // window. It cannot say where the paste went.
+        let container = LandingSignals {
+            node_text: Some("My App - Document".into()),
+            range_text: None,
+            container_focus: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            landing_from(&container, "hello"),
+            Some(Landing::Unverifiable)
+        );
+
+        // The same element *without* the container flag is an ordinary control, and
+        // then absence is provable. The flag is what changes the verdict.
+        let control = LandingSignals {
+            node_text: Some("Copy".into()),
+            range_text: None,
+            container_focus: false,
+            ..Default::default()
+        };
+        assert_eq!(landing_from(&control, "hello"), Some(Landing::Absent));
+
+        // A container whose range still carried the text is landed by rule 3 only
+        // if the range was trusted — it is not, because `collect_focused_signals`
+        // drops the range for a container. Assert the ordering that makes that safe.
+        let container_with_text = LandingSignals {
+            node_text: Some("My App - Document".into()),
+            range_text: Some("hello".into()),
+            container_focus: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            landing_from(&container_with_text, "hello"),
+            Some(Landing::Landed)
+        );
+    }
+
+    // A value that appeared out of nowhere is not proof of landing: it is just
+    // focus moving to an empty control. The pre-fix check got this right and it
+    // must stay right.
+    #[test]
+    fn a_value_that_had_nothing_before_is_not_proof() {
+        let appeared = LandingSignals {
+            node_text: Some("x".into()),
+            before_value: None,
+            after_value: Some("hello".into()),
+            ..Default::default()
+        };
+        // Not `Landed`: nothing readable before means the change proves nothing.
+        assert_eq!(landing_from(&appeared, "hello"), Some(Landing::Absent));
+
+        let unchanged = LandingSignals {
+            node_text: Some("x".into()),
+            before_value: Some("old".into()),
+            after_value: Some("old".into()),
+            ..Default::default()
+        };
+        // AX-WEDGE anti-doubling (2026-10-25): an unchanged read-back is exactly what
+        // a stale Chromium read looks like, so it is "cannot tell" now, NOT a proven
+        // absence -- the old Absent verdict re-pasted and doubled the text in the
+        // QQNT search box. A genuinely missed paste is caught by the caller's own
+        // read-back instead (the false success costs a re-observe; the false failure
+        // cost corrupted field content).
+        assert_eq!(landing_from(&unchanged, "hello"), Some(Landing::Unverifiable));
+
+        let changed = LandingSignals {
+            node_text: Some("x".into()),
+            before_value: Some("old".into()),
+            after_value: Some("hello".into()),
+            ..Default::default()
+        };
+        assert_eq!(landing_from(&changed, "hello"), Some(Landing::Landed));
+    }
+
+    // A changed value that does not carry the typed text is NOT a landing: the
+    // 2026-10-23 false positive, where an IME ate the paste and left a stray `v`
+    // in a React input while type_text reported ok.
+    #[test]
+    fn a_changed_value_without_the_text_is_wrong_not_landed() {
+        // Typed "E2E-FWD-20261023", the field reads "v".
+        let mangled = LandingSignals {
+            node_text: Some("v".into()),
+            before_value: Some(String::new()),
+            after_value: Some("v".into()),
+            ..Default::default()
+        };
+        assert_eq!(landing_from(&mangled, "E2E-FWD-20261023"), Some(Landing::Wrong));
+
+        // A prefix of the text is still not the text.
+        let partial = LandingSignals {
+            node_text: Some("E2E".into()),
+            before_value: Some(String::new()),
+            after_value: Some("E2E".into()),
+            ..Default::default()
+        };
+        assert_eq!(landing_from(&partial, "E2E-FWD-20261023"), Some(Landing::Wrong));
+
+        // The text plus other content around it is a landing (the field may already
+        // have held something, or the app may append).
+        let around = LandingSignals {
+            node_text: Some("see E2E-FWD-20261023 now".into()),
+            before_value: Some("see ".into()),
+            after_value: Some("see E2E-FWD-20261023 now".into()),
+            ..Default::default()
+        };
+        assert_eq!(landing_from(&around, "E2E-FWD-20261023"), Some(Landing::Landed));
+    }
+
+    // A wrong landing must be reported as a failure and must outrank a plain
+    // absence when two passes disagree.
+    #[test]
+    fn a_wrong_landing_fails_and_outranks_absence() {
+        assert!(Landing::Wrong.failed_with(true));
+        assert!(Landing::Wrong.failed_with(false));
+        assert!(!Landing::Landed.failed_with(false));
+
+        assert_eq!(
+            Landing::Absent.max_by_confidence(Landing::Wrong),
+            Landing::Wrong
+        );
+        assert_eq!(
+            Landing::Wrong.max_by_confidence(Landing::Absent),
+            Landing::Wrong
+        );
+        // A proven landing still wins over a wrong reading from another pass.
+        assert_eq!(
+            Landing::Wrong.max_by_confidence(Landing::Landed),
+            Landing::Landed
+        );
+    }
+
+    // The write read-back used by set_value and fill_form's `set`: a control that
+    // reads back without the value is a named miss; an unreadable one is not.
+    #[test]
+    fn a_write_readback_without_the_value_is_a_miss() {
+        // Kept: the rendered text carries what we wrote.
+        assert_eq!(write_missed("1234", Some("1234")), None);
+        assert_eq!(write_missed("1234", Some("code 1234 ok")), None);
+        // Missed: the field shows something else (an IME fragment, old text).
+        assert_eq!(write_missed("E2E-FWD", Some("v")), Some("v".to_string()));
+        assert_eq!(write_missed("1234", Some("")), Some(String::new()));
+        // Unreadable, or nothing to write: never a failure.
+        assert_eq!(write_missed("1234", None), None);
+        assert_eq!(write_missed("", Some("anything")), None);
+        // Windows line endings do not count against a match: the read-back is
+        // stripped of CR, so a CRLF-carrying field still matches a plain want.
+        assert_eq!(write_missed("line1\nline2", Some("line1\r\nline2")), None);
+    }
+
+    // The landing check must never search the whole window: a window-wide text
+    // search cannot witness a paste in any app that echoes the tool call back into
+    // its UI, and it costs a full tree walk on a browser window (which is what
+    // blew the 20s tool budget). Assert the source has no window-level probe left
+    // in the landing path.
+    #[test]
+    fn the_landing_check_never_searches_the_window() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("fn landing_from(")
+            .expect("landing_from must exist");
+        let end = src
+            .find("/// Whether the paste should be reported as failed")
+            .expect("the Landing impl must follow the landing helpers");
+        let landing = &src[start..end];
+        for forbidden in ["window_landing_probe", "window_contains", "dump("] {
+            assert!(
+                !landing.contains(forbidden),
+                "the landing path must not search the window ({forbidden})"
+            );
+        }
+    }
+
+    // A paste into a surface that never publishes its text must NOT be reported as
+    // a failure. This is the general rule the tri-state verdict exists for: only a
+    // proven absence fails, and "the target cannot be read" is not proof.
+    //
+    // Regression (2026-10-22): typing into the DSH composer — a Chromium
+    // contenteditable — pasted the text correctly, saw an empty accessibility dump
+    // (accessibilityRevision 0, no node carrying the text), then retried, pasting it
+    // a second time before finally reporting
+    // "type_text did not land in the target window".
+    #[test]
+    fn an_unreadable_target_does_not_prove_absence() {
+        // Unverifiable + the focus is an editable control inside the target => ok.
+        assert!(!Landing::Unverifiable.failed_with(true));
+        // Unverifiable + the focus cannot take text => a real failure.
+        assert!(Landing::Unverifiable.failed_with(false));
+        // A readable target whose dump lacks the text is a proven miss.
+        assert!(Landing::Absent.failed_with(true));
+        // Proven landing never fails, whatever the focus looks like.
+        assert!(!Landing::Landed.failed_with(false));
+    }
+
+    /// AX-WEDGE anti-doubling (2026-10-25): a slow Chromium field commits the paste
+    /// asynchronously, so the read-back can still carry the PRE-paste value. A
+    /// readable-but-unchanged read-back that no positive signal witnessed used to
+    /// fall through to `Absent` ("proven absence"), which re-pasted and doubled the
+    /// text in the QQNT search box. Unchanged is "cannot tell", not "proven
+    /// absence"; a read-back that DID change still decides exactly as before.
+    #[test]
+    fn a_stale_unchanged_read_back_is_not_a_proven_absence() {
+        // The QQNT search box case: empty before, stale empty after.
+        let stale = LandingSignals {
+            node_text: Some(String::new()),
+            range_text: None,
+            before_value: Some(String::new()),
+            after_value: Some(String::new()),
+            container_focus: false,
+        };
+        assert_eq!(landing_from(&stale, "1018595918"), Some(Landing::Unverifiable));
+        // Non-empty stale value: same verdict.
+        let stale = LandingSignals {
+            node_text: Some("old note".to_string()),
+            range_text: None,
+            before_value: Some("old note".to_string()),
+            after_value: Some("old note".to_string()),
+            container_focus: false,
+        };
+        assert_eq!(landing_from(&stale, "1018595918"), Some(Landing::Unverifiable));
+        // A read-back that DID change still decides, unchanged behavior:
+        // carrying the text is Landed, carrying something else is Wrong.
+        let landed = LandingSignals {
+            node_text: Some(String::new()),
+            range_text: None,
+            before_value: Some(String::new()),
+            after_value: Some("1018595918".to_string()),
+            container_focus: false,
+        };
+        assert_eq!(landing_from(&landed, "1018595918"), Some(Landing::Landed));
+        let wrong = LandingSignals {
+            node_text: Some("v".to_string()),
+            range_text: None,
+            before_value: Some(String::new()),
+            after_value: Some("v".to_string()),
+            container_focus: false,
+        };
+        assert_eq!(landing_from(&wrong, "1018595918"), Some(Landing::Wrong));
+        // before=None (unreadable before) with a readable non-carrying after stays
+        // Absent: the value DID change, so the read is not stale.
+        let absent = LandingSignals {
+            node_text: Some("header".to_string()),
+            range_text: None,
+            before_value: None,
+            after_value: Some("header".to_string()),
+            container_focus: false,
+        };
+        assert_eq!(landing_from(&absent, "1018595918"), Some(Landing::Absent));
+    }
+
+    #[test]
+    fn the_settle_never_downgrades_a_proven_verdict() {
+        // A slow commit turns "not landed yet" into Landed; a second look must not
+        // turn a proven absence into "unverifiable" (that would excuse real misses).
+        assert_eq!(
+            Landing::Absent.max_by_confidence(Landing::Unverifiable),
+            Landing::Unverifiable
+        );
+        assert_eq!(
+            Landing::Unverifiable.max_by_confidence(Landing::Absent),
+            Landing::Unverifiable
+        );
+        assert_eq!(
+            Landing::Absent.max_by_confidence(Landing::Landed),
+            Landing::Landed
+        );
+        assert_eq!(
+            Landing::Absent.max_by_confidence(Landing::Absent),
+            Landing::Absent
+        );
+    }
+
+    // A batch entry that names no method must say so, and say which one. Before
+    // the guard, `dispatch("")` answered the bare official prefix
+    // `unsupported method: ` -- nothing after the colon, so the caller could not
+    // tell a malformed entry from a broken helper.
+    #[test]
+    fn a_batch_action_without_a_name_is_named_by_its_index() {
+        for nameless in [
+            json!({"action": "press_key"}),   // wrong key: the model wrote `action`
+            json!({"name": ""}),              // present but empty
+            json!({"name": "   "}),           // whitespace only
+            json!({"name": 7}),               // present but not a string
+        ] {
+            assert_eq!(
+                batch_action_name(&nameless).unwrap_err(),
+                BATCH_ACTION_NAME_REQUIRED,
+                "nameless entry must be rejected: {nameless}"
+            );
+        }
+        // A named entry still resolves, so the guard cannot swallow real work.
+        assert_eq!(
+            batch_action_name(&json!({"name": "press_key", "arguments": {}})).unwrap(),
+            "press_key"
+        );
+        // The official unknown-method string stays reserved for a *named* method
+        // (TC-14 parity): this guard must not repurpose it.
+        assert_ne!(
+            BATCH_ACTION_NAME_REQUIRED,
+            dsh_computer_use::protocol::UNSUPPORTED_METHOD_PREFIX
+        );
+    }
+
     // APS-04: computer audio has a fixed approval subject; it never falls through to
     // the window/app identity of the request.
     #[test]
@@ -1523,6 +2796,48 @@ mod tests {
         assert_eq!(request["app"], AUDIO_APP);
         assert_eq!(request["displayName"], protocol::AUDIO_DISPLAY);
         assert_eq!(request["allowPersistentApproval"], false);
+    }
+
+    /// Regression for the 2026-10-20 TapTap login run.
+    ///
+    /// `fill_form` re-observes before running its steps, and that walk renumbers
+    /// every node from zero. A page that inserts a sibling after the first write
+    /// (the resend countdown the login form grows, a clear button, an error line)
+    /// shifts the numbering, so the caller's index for the *second* field then
+    /// names whatever slid into that slot. On TapTap that wrote the SMS code into
+    /// the phone-number box while both steps reported `ok`.
+    ///
+    /// The contract this pins down: an index is only meaningful inside one
+    /// snapshot; a runtime id is the handle that survives renumbering.
+    #[test]
+    fn renumbering_between_steps_must_be_resolved_by_runtime_id_not_index() {
+        // Snapshot A: what the model saw, indices off the caller's observation.
+        let before: Vec<(i32, Vec<i32>)> = vec![(19, vec![42, 91]), (20, vec![42, 92])];
+        // Snapshot B: the page inserted a node ("重新发送 57s") *between* the two
+        // fields, so every node below it shifted down by one. Index 20 now names
+        // the countdown instead of the verification-code box.
+        let after: Vec<(i32, Vec<i32>)> = vec![(19, vec![42, 91]), (20, vec![42, 2088]), (21, vec![42, 92])];
+
+        let index_of = |runtime_id: &Vec<i32>| -> Option<i32> {
+            after.iter().find(|(_, id)| id == runtime_id).map(|(i, _)| *i)
+        };
+        let runtime_id_at = |index: i32| -> Option<Vec<i32>> {
+            after.iter().find(|(i, _)| *i == index).map(|(_, id)| id.clone())
+        };
+
+        // The flattened index the caller passed for the code field no longer
+        // names the code field.
+        let caller_index_for_code = 20;
+        assert_eq!(runtime_id_at(caller_index_for_code), Some(vec![42, 2088]));
+        assert_ne!(runtime_id_at(caller_index_for_code), Some(before[1].1.clone()));
+
+        // Carrying the runtime id finds it again.
+        let caller_runtime_id_for_code = before[1].1.clone();
+        assert_eq!(index_of(&caller_runtime_id_for_code), Some(21));
+
+        // And a control the page dropped is reported as gone, never retargeted.
+        let vanished = vec![42, 999];
+        assert_eq!(index_of(&vanished), None);
     }
 }
 

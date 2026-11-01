@@ -45,10 +45,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetForegroundWindow, GetSystemMetrics, GetTopWindow, GetWindow, GetWindowLongW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, PeekMessageW, PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    SwitchToThisWindow, SystemParametersInfoW, GA_ROOT, GW_ENABLEDPOPUP, GW_HWNDNEXT, GW_OWNER,
-    GWL_EXSTYLE, GWL_STYLE, MSG, PM_NOREMOVE, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SYSCOMMAND,
+    SwitchToThisWindow, SystemParametersInfoW, WindowFromPoint, GA_ROOT, GW_ENABLEDPOPUP, GW_HWNDNEXT,
+    GW_OWNER,
+    GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST, MSG, PM_NOREMOVE, SM_CXSCREEN,
+    SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SYSCOMMAND,
 };
 
 pub const ACTIVATE_CAPTURED_FAILED: &str = "failed to activate captured window";
@@ -860,7 +862,10 @@ pub fn enum_windows() -> Result<Vec<WindowRef>, Error> {
 }
 
 pub fn missing_window_message(id: u64, windows: &[WindowRef]) -> String {
-    format!("window id {id:?} was not found. Current windows: {windows:?}")
+    // Keep the official "window id … was not found. Current windows: …" prefix intact
+    // (parity checks match it) and append an actionable hint so a model knows to
+    // re-locate the window instead of retrying blindly.
+    format!("window id {id:?} was not found. Current windows: {windows:?} — the target window appears CLOSED or gone; call list_windows to re-locate it, then retry.")
 }
 
 pub fn owner_changed_message(id: u64, expected: &str, actual: &str) -> String {
@@ -951,6 +956,94 @@ pub fn is_window_visible(hwnd: HWND) -> bool {
     unsafe { IsWindowVisible(hwnd).as_bool() }
 }
 
+/// Whether the visible part of `hwnd` is currently covered by another window.
+///
+/// Why this exists (2026-10-20, TapTap desktop client): an Electron window is
+/// `WS_EX_NOREDIRECTIONBITMAP`, so `uses_redirected_composition` routes it to the
+/// screen-DC `BitBlt` path. A screen-DC BitBlt samples whatever is *on screen* at
+/// those coordinates, so when the target sat behind the Harness window the
+/// captured JPEG showed the Harness chat instead of TapTap — while the tool still
+/// reported `ok`. Feeding a different window's pixels to the model is worse than
+/// failing: it reads as a successful observation and every later decision is
+/// made against the wrong screen.
+///
+/// The check samples the corners and centre of the client rect with
+/// `WindowFromPoint`, which returns the topmost window at a point regardless of
+/// which thread owns it. A target that owns every sample is unobstructed. Windows
+/// belonging to the target's own process count as the target, so child controls,
+/// popups and overlays do not register as occlusion.
+pub fn is_covered(hwnd: HWND) -> bool {
+    is_covered_detail(hwnd)["covered"].as_bool().unwrap_or(false)
+}
+
+/// Same check as [`is_covered`], but reports every sample so a disagreement
+/// between "the window looks covered" and "the check says clear" can be read off
+/// the payload instead of guessed at.
+pub fn is_covered_detail(hwnd: HWND) -> Value {
+    let Ok((left, top, width, height)) = window_rect(hwnd) else {
+        return json!({"covered": false, "error": "window_rect failed"});
+    };
+    if width <= 0 || height <= 0 {
+        return json!({"covered": false, "error": "empty rect"});
+    }
+    let mut target_pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut target_pid)) };
+    let target_root = root_hwnd(hwnd);
+    // Corners sit just inside the frame; the centre catches a window parked over
+    // the middle. Sampling the exact edge would hit the resize border.
+    // Audit P2-6 (2026-10-25): five samples let a small popup (a captcha
+    // overlay, a dropdown) slip between them while WGC crops its pixels into
+    // the shot. Add a 3x3 interior grid on top of the classic five points so
+    // anything larger than a third of the window in either dimension must
+    // cover a sample. Still point-sampling, so a tiny tooltip can pass — but
+    // small enough to be cheap (14 WindowFromPoint calls).
+    let inset_x = (width / 20).max(1);
+    let inset_y = (height / 20).max(1);
+    let mut samples = vec![
+        (left + inset_x, top + inset_y),
+        (left + width - inset_x, top + inset_y),
+        (left + inset_x, top + height - inset_y),
+        (left + width - inset_x, top + height - inset_y),
+        (left + width / 2, top + height / 2),
+    ];
+    for fy in [4, 2, 1] {
+        for fx in [4, 2, 1] {
+            if fx == 2 && fy == 2 {
+                continue; // already the centre sample
+            }
+            samples.push((left + width * fx / 4, top + height * fy / 4));
+        }
+    }
+    let mut rows = Vec::new();
+    let mut covered = false;
+    for (x, y) in samples {
+        let hit = unsafe { WindowFromPoint(windows::Win32::Foundation::POINT { x, y }) };
+        let hit_pid = if hit.0.is_null() {
+            0
+        } else {
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(hit, Some(&mut pid)) };
+            pid
+        };
+        let same_window = hit == hwnd || (!hit.0.is_null() && root_hwnd(hit) == target_root);
+        let same_process = hit_pid != 0 && hit_pid == target_pid;
+        let blocked = !hit.0.is_null() && !same_window && !same_process;
+        if blocked {
+            covered = true;
+        }
+        rows.push(json!({
+            "x": x, "y": y, "hitPid": hit_pid, "sameWindow": same_window,
+            "sameProcess": same_process, "covered": blocked,
+        }));
+    }
+    json!({
+        "covered": covered,
+        "targetPid": target_pid,
+        "rect": {"x": left, "y": top, "width": width, "height": height},
+        "samples": rows,
+    })
+}
+
 pub fn root_hwnd(hwnd: HWND) -> HWND {
     if hwnd.0.is_null() {
         return hwnd;
@@ -989,6 +1082,14 @@ fn foreground_is_target(hwnd: HWND) -> bool {
 }
 
 fn steal_foreground(hwnd: HWND) -> bool {
+    // Z-order before focus — but only when something actually covers the
+    // target (audit P2-7, 2026-10-25): the unconditional TOPMOST flash ran on
+    // every activation, permanently reshuffling the user's z-order and waking
+    // tray-hidden windows. When nothing occludes the target, focus alone is
+    // enough and the z-order must stay untouched.
+    if is_covered(hwnd) {
+        bump_to_top(hwnd);
+    }
     unsafe {
         let fg = GetForegroundWindow();
         let mut fg_pid = 0u32;
@@ -1080,6 +1181,85 @@ pub fn is_already_foreground(hwnd: HWND) -> bool {
     is_window(hwnd) && foreground_is_target(hwnd)
 }
 
+/// Bounded budget for the post-restore UIA warm-up; `0` disables it.
+const RESTORE_WARM_UP_BUDGET_MS: u64 = 12_000;
+/// Space between warm-up probe attempts.
+const RESTORE_WARM_UP_RETRY_MS: u64 = 250;
+
+/// `Some(ms)` for a well-formed override, `None` for absent or malformed.
+/// `Some(0)` is the operator's explicit disable and is honored, not defaulted.
+fn parse_warm_up_budget(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|v| v.parse().ok())
+}
+
+fn restore_warm_up_budget_ms() -> u64 {
+    parse_warm_up_budget(std::env::var("DSH_CU_AX_RESTORE_WARMUP_MS").ok().as_deref())
+        .unwrap_or(RESTORE_WARM_UP_BUDGET_MS)
+}
+
+/// A long-minimized window's UIA provider can stay silent long after the window
+/// itself is back on screen: v2rayN 7.x (Avalonia) minimized for ~1h answered
+/// two 15s dump waits 65s apart with `activate_window` long since returned, and
+/// the stale monitor job then wedged the window into a 60s cooldown. A real UIA
+/// read is exactly what wakes such a provider, so while the budget lasts, retry
+/// one cheap read (`window_contains` with an empty needle — any node answers) on
+/// the monitor machinery until it succeeds. Failures are ignored here: the
+/// caller's next dump reports a genuinely dead provider through the normal
+/// paths, and the cooldown the failed probes earned is dropped when the loop
+/// ends (`clear_probe_cooldown`).
+fn warm_up_uia_after_restore(hwnd: HWND) {
+    let budget_ms = restore_warm_up_budget_ms();
+    if budget_ms == 0 {
+        return; // the operator disabled the warm-up via DSH_CU_AX_RESTORE_WARMUP_MS
+    }
+    if crate::uia::integrity_blocked(hwnd.0 as isize).is_some() {
+        return; // reads cannot succeed here; do not spend the budget
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+    let woke = loop {
+        if crate::uia::global().window_contains(hwnd.0 as isize, "").is_ok() {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(RESTORE_WARM_UP_RETRY_MS));
+    };
+    crate::uia::clear_probe_cooldown(hwnd.0 as isize);
+    let _ = woke;
+}
+
+/// `HWND_TOPMOST` bump: raise the window above everything, then drop the TOPMOST
+/// flag so it stays a normal window. This is the documented way to beat a
+/// maximized sibling that visually covers the target: `SetForegroundWindow`
+/// alone can report success while the covering window is still on top in
+/// Z-order, which is exactly the "activate_window returned ok but the screenshot
+/// shows another app" failure.
+fn bump_to_top(hwnd: HWND) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            // No SWP_SHOWWINDOW (audit P2-7): showing is not this bump's
+            // business, and it woke tray-hidden windows on every activation.
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+}
+
 /// Restore + foreground the captured HWND. Official error: `failed to activate captured window`.
 pub fn activate_hwnd(hwnd: HWND) -> Result<(), Error> {
     if !is_window(hwnd) {
@@ -1103,6 +1283,7 @@ pub fn activate_hwnd(hwnd: HWND) -> Result<(), Error> {
         if is_minimized(hwnd) {
             post_restore(hwnd);
             std::thread::sleep(std::time::Duration::from_millis(100));
+            warm_up_uia_after_restore(hwnd);
         }
         // A hidden window can be made the foreground window while staying invisible, so
         // `SetForegroundWindow` alone reported success and the caller's retry still failed
@@ -1114,6 +1295,10 @@ pub fn activate_hwnd(hwnd: HWND) -> Result<(), Error> {
         if is_window_visible(hwnd) {
             clamp_hwnd_to_work_area(hwnd);
         }
+        // Z-order first, focus second. Bumping the window above its maximized
+        // siblings *before* asking for focus is what stops the "activation
+        // succeeded but another window still covers the target" case.
+        bump_to_top(hwnd);
         if SetForegroundWindow(hwnd).as_bool() || foreground_is_target(hwnd) {
             return Ok(());
         }
@@ -1283,6 +1468,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn restore_warm_up_budget_parses_override_disable_and_garbage() {
+        // Absent or malformed → the caller falls back to the built-in budget.
+        assert_eq!(parse_warm_up_budget(None), None);
+        assert_eq!(parse_warm_up_budget(Some("abc")), None);
+        assert_eq!(parse_warm_up_budget(Some("-5")), None);
+        assert_eq!(parse_warm_up_budget(Some("12000")), Some(12000));
+        // Some(0) is the operator's explicit disable, honored not defaulted.
+        assert_eq!(parse_warm_up_budget(Some("0")), Some(0));
+    }
+
+    #[test]
     fn missing_id_lists_current_windows_with_official_window_debug() {
         let current = vec![WindowRef {
             app: "notepad.exe".into(),
@@ -1291,7 +1487,7 @@ mod tests {
         }];
         assert_eq!(
             missing_window_message(99, &current),
-            "window id 99 was not found. Current windows: [Window { app: \"notepad.exe\", id: 42, title: \"Untitled\" }]"
+            "window id 99 was not found. Current windows: [Window { app: \"notepad.exe\", id: 42, title: \"Untitled\" }] — the target window appears CLOSED or gone; call list_windows to re-locate it, then retry."
         );
         assert_eq!(
             owner_changed_message(42, "chrome.exe", "notepad.exe"),
@@ -1310,7 +1506,7 @@ mod tests {
             err.message
         );
         assert!(
-            err.message.contains("Current windows: [") || err.message.ends_with("Current windows: []"),
+            err.message.contains("Current windows: ["),
             "{}",
             err.message
         );
