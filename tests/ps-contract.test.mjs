@@ -14,6 +14,7 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
@@ -88,4 +89,14 @@ test('uia-act.ps1 : invalid handle -> valid JSON, ok:false, exit 1 (no empty std
   assert.equal(parsed.ok, false)
   assert.equal(r.code, 1, 'no automation element -> exit 1')
   assert.match(String(parsed.error || ''), /automation element/i)
+})
+
+test('crop-image.ps1 : missing input -> valid JSON ok:false, non-zero exit', () => {
+  // The caller (cropImageBase64 in tool.js) keys on the non-zero exit to return null; the
+  // JSON is informational. Both must hold: valid JSON stdout AND a non-zero exit.
+  const out = path.join(os.tmpdir(), `cu-crop-${process.pid}.png`)
+  const r = runOne('crop-image.ps1', ['-InPath', 'C:\\definitely\\no\\such\\file.png', '-OutPath', out])
+  const parsed = assertJsonObject(r, 'crop-image')
+  assert.equal(parsed.ok, false)
+  assert.notEqual(r.code, 0, 'failure must be a non-zero exit for the caller')
 })

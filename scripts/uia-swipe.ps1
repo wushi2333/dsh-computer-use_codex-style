@@ -1,6 +1,8 @@
 <#
+.SYNOPSIS
   Swipe a window WITHOUT going through the helper (P1-4 follow-up).
 
+.DESCRIPTION
   Why this exists: on a window Windows Graphics Capture can never frame (bigger than the
   desktop, static page, covered), the plugin recovers a picture with GDI PrintWindow — but
   the *helper* still has no capture session, so every coordinate action (`drag`, and the
@@ -13,12 +15,16 @@
   Coordinates are window-relative and mapped through the client area (the same space the
   helper's x/y use).
 
-  Params:
-    -Hwnd       window handle
-    -FromX/-FromY  window-relative start point (centre is a good default)
-    -ToX/-ToY      window-relative end point
-    -DurationMs    total gesture time (default 350)
-    -Steps         intermediate move events (default 12)
+CONTRACT (P1 — every fallback script declares its shape)
+  Input   : -Hwnd <long> (required)  -FromX/-FromY <int> (required, window-relative start)
+            -ToX/-ToY <int> (required, window-relative end)  -DurationMs <int> (default 350)
+            -Steps <int> (default 12, intermediate move events)
+  Output  : stdout = ONE JSON object on every path.
+              success  -> {"ok":true,"from":"x,y","to":"x,y"}
+              failure  -> {"ok":false,"error":"<reason>"}
+  Errors  : Exit 0 = swipe injected (or a handled refusal JSON written).
+            Exit 1 = hard failure before JSON could be written.
+            Stdout is ALWAYS valid JSON; diagnostics go to stderr.
 #>
 param(
   [Parameter(Mandatory = $true)][long]$Hwnd,

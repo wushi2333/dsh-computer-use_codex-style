@@ -1,6 +1,8 @@
 <#
+.SYNOPSIS
   Capture a window WITHOUT Windows.Graphics.Capture (P0-1).
 
+.DESCRIPTION
   WGC only delivers a frame when the target window repaints, so static pages
   (exam forms, stopped documents, paused video) always time out. Two remedies,
   one script:
@@ -20,10 +22,17 @@
   larger than the screen (P2-7: a window bigger than the desktop can never be
   framed by WGC and used to fail with nothing but "capture timed out").
 
-  Params:
-    -Hwnd       window handle
-    -OutPath    png output path (required unless -NudgeOnly)
-    -NudgeOnly  force a repaint only, do not grab pixels
+CONTRACT (P1 — every fallback script declares its shape)
+  Input   : -Hwnd <long> (required)  -OutPath <string> (png output; required unless
+            -NudgeOnly)  -NudgeOnly (switch, force a repaint only, do not grab pixels)
+  Output  : stdout = ONE JSON line on every path.
+              nudged / captured -> {"ok":true,...,"screen":{...},"window":{...},"oversize":bool,
+                                    ...} (geometry always present so a failure is explainable)
+              failure           -> {"ok":false,"error":"<reason>"}
+  Errors  : Exit 0 = a JSON verdict was written (nudge success).
+            Non-zero = the caller's runCaptureScript reads the JSON on stdout AND the exit
+            code, so a thrown capture surfaces as {"ok":false,...} on stdout with a non-zero
+            exit. Stdout is ALWAYS valid JSON; diagnostics go to stderr.
 #>
 param(
   [Parameter(Mandatory = $true)][long]$Hwnd,
