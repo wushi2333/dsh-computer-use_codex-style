@@ -35,7 +35,7 @@
   },
   "scripts": {
     "test:js": "node --test tests/contracts.test.mjs tests/interactive_summary.test.mjs",
-    "test:units": "node --import ./tests/resolve-hooks.mjs --test tests/tool-units.test.mjs tests/tool-names.test.mjs tests/capabilities.test.mjs tests/drivers.test.mjs",
+    "test:units": "node --import ./tests/resolve-hooks.mjs --test tests/tool-units.test.mjs tests/tool-names.test.mjs tests/capabilities.test.mjs tests/drivers.test.mjs tests/ps-contract.test.mjs",
     "test:py": "python -m pytest tests",
     "test:ci": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/ci-smoke.ps1",
     "test": "npm run test:units && npm run test:js && npm run test:py"
@@ -73,5 +73,6 @@
     }
   }
 }
+
 
 
